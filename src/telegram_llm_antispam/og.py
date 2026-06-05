@@ -95,6 +95,8 @@ class OGHTMLParser(HTMLParser):
 def should_fetch_og(features: MessageFeatures, settings: Settings) -> bool:
     if not settings.og_fetch_enabled or not features.has_preview_url:
         return False
+    if features.is_empty_or_punctuation:
+        return True
     compact_text = "".join(char for char in features.clean_text if not char.isspace())
     return len(compact_text) <= settings.og_short_text_max_chars
 

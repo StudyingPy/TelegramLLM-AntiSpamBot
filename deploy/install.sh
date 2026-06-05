@@ -311,7 +311,7 @@ write_env_file() {
     newapi_timeout="8"
   fi
 
-  enable_og="$(prompt_bool "Enable guarded OG fetch for short preview messages?" "true")"
+  enable_og="$(prompt_bool "Enable guarded OG fetch for short or punctuation-only preview messages?" "true")"
   enable_profile_bio="$(prompt_bool "Enable best-effort user bio fetch?" "true")"
 
   cat >"$ENV_FILE" <<EOF
@@ -335,6 +335,7 @@ REPEAT_MIN_DISTINCT_SENDERS=3
 LLM_FINGERPRINT_INITIAL_WEIGHT=50
 VOTE_CONFIRMED_FINGERPRINT_WEIGHT=85
 FINGERPRINT_FALSE_POSITIVE_PENALTY=30
+LLM_BAN_THRESHOLD=0.85
 
 NEWAPI_BASE_URLS=$newapi_bases
 NEWAPI_API_KEYS=$newapi_keys

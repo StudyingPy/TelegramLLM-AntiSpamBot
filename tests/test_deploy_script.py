@@ -33,6 +33,8 @@ def test_deploy_script_prompts_for_admin_and_allowlist_config():
     assert "Admin notify user IDs, comma-separated" in script
     assert "Allowed group chat IDs, comma-separated" in script
     assert "REQUIRE_ALLOWED_CHAT=$require_allowed_chat" in script
+    assert "LLM_BAN_THRESHOLD=0.85" in script
+    assert "Enable guarded OG fetch for short or punctuation-only preview messages?" in script
 
 
 def test_deploy_script_has_noninteractive_update_mode():

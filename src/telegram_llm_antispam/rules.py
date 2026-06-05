@@ -17,12 +17,26 @@ class RuleEngine:
         features: MessageFeatures,
         fingerprint: FingerprintRecord | None = None,
     ) -> LocalDecision:
-        if fingerprint is not None:
-            return self._evaluate_fingerprint(features, fingerprint)
+        fingerprint_decision = (
+            self._evaluate_fingerprint(features, fingerprint) if fingerprint is not None else None
+        )
+        if fingerprint_decision is not None and fingerprint_decision.action == DecisionAction.BAN:
+            return fingerprint_decision
 
         profile_spam = _profile_spam_decision(features)
         if profile_spam is not None:
             return profile_spam
+
+        message_spam = _hard_spam_message_decision(features)
+        if message_spam is not None:
+            return message_spam
+
+        preview_spam = _hard_spam_preview_decision(features)
+        if preview_spam is not None:
+            return preview_spam
+
+        if fingerprint_decision is not None:
+            return fingerprint_decision
 
         if features.is_empty_or_punctuation and features.has_preview_url:
             return LocalDecision(
@@ -111,20 +125,65 @@ def _profile_spam_decision(features: MessageFeatures) -> LocalDecision | None:
     )
 
 
-def _looks_like_spam_bio(value: str) -> bool:
-    normalized = normalize_text(value)
-    if not normalized:
-        return False
+def _hard_spam_message_decision(features: MessageFeatures) -> LocalDecision | None:
+    text = features.text
+    if not _looks_like_hard_spam_text(text, has_carrier=_has_message_carrier(features)):
+        return None
 
-    has_contact_or_link = bool(
-        re.search(r"https?://|t\.me/|telegram|@\w{3,}", value, flags=re.IGNORECASE)
+    return LocalDecision(
+        action=DecisionAction.BAN,
+        reason="hard_spam_message",
+        confidence=0.96,
+        should_call_llm=False,
+        metadata={"local_signal": "message_text"},
     )
-    if not has_contact_or_link:
+
+
+def _hard_spam_preview_decision(features: MessageFeatures) -> LocalDecision | None:
+    preview = features.metadata.get("og_preview")
+    if not isinstance(preview, dict):
+        return None
+
+    preview_text = " ".join(
+        str(preview.get(key) or "")
+        for key in ("title", "description", "site_name", "image_alt", "text")
+    )
+    if not _looks_like_hard_spam_text(preview_text, has_carrier=features.has_preview_url):
+        return None
+
+    return LocalDecision(
+        action=DecisionAction.BAN,
+        reason="hard_spam_link_preview",
+        confidence=0.96,
+        should_call_llm=False,
+        metadata={"local_signal": "og_preview"},
+    )
+
+
+def _has_message_carrier(features: MessageFeatures) -> bool:
+    text = features.text
+    return bool(
+        features.mention_count > 0
+        or features.links
+        or features.has_preview_url
+        or re.search(r"@\w{3,}", text, flags=re.IGNORECASE)
+        or re.search(r"\b\w{3,}bot\b", text, flags=re.IGNORECASE)
+        or re.search(r"https?://|t\.me/", text, flags=re.IGNORECASE)
+    )
+
+
+def _looks_like_hard_spam_text(value: str, *, has_carrier: bool) -> bool:
+    normalized = normalize_text(value)
+    if not normalized or not has_carrier:
         return False
 
     hard_tokens = (
         "点击进群",
         "进群了解",
+        "加群",
+        "群一个",
+        "拿码",
+        "收钱",
         "做单",
         "教程",
         "刷单",
@@ -137,8 +196,12 @@ def _looks_like_spam_bio(value: str) -> bool:
         "几千",
         "客服",
         "私聊",
+        "成人版",
+        "成人片",
         "裸聊",
         "看片",
+        "推特调教",
+        "调教",
         "反差",
         "破处",
         "博彩",
@@ -148,3 +211,17 @@ def _looks_like_spam_bio(value: str) -> bool:
         "代币",
     )
     return any(token in normalized for token in hard_tokens)
+
+
+def _looks_like_spam_bio(value: str) -> bool:
+    normalized = normalize_text(value)
+    if not normalized:
+        return False
+
+    has_contact_or_link = bool(
+        re.search(r"https?://|t\.me/|telegram|@\w{3,}", value, flags=re.IGNORECASE)
+    )
+    if not has_contact_or_link:
+        return False
+
+    return _looks_like_hard_spam_text(value, has_carrier=True)

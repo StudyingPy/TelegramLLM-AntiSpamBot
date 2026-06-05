@@ -46,7 +46,7 @@ def _settings() -> Settings:
         vote_confirmed_fingerprint_weight=85,
         fingerprint_false_positive_penalty=30,
         llm_review_threshold=0.70,
-        llm_ban_threshold=0.92,
+        llm_ban_threshold=0.85,
         newapi_base_url=None,
         newapi_api_key=None,
         newapi_model="gpt-5.4",
@@ -244,7 +244,7 @@ def test_feature_payload_contains_sender_profile_metadata():
     }
 
 
-def test_llm_spam_high_confidence_goes_to_withdraw_vote_for_normal_reputation():
+def test_llm_spam_at_ban_threshold_bans_for_normal_reputation():
     message = SimpleNamespace(
         message_id=1,
         chat=SimpleNamespace(id=-1001),
@@ -255,7 +255,27 @@ def test_llm_spam_high_confidence_goes_to_withdraw_vote_for_normal_reputation():
     features = build_message_features(message, context)
 
     decision = decision_from_llm(
-        LLMJudgement(is_spam=True, confidence=0.91, category="ads"),
+        LLMJudgement(is_spam=True, confidence=0.87, category="ads"),
+        features,
+        _settings(),
+    )
+
+    assert decision.action == DecisionAction.BAN
+    assert decision.reason == "llm_spam_high_confidence"
+
+
+def test_llm_spam_at_ban_threshold_still_votes_for_high_reputation():
+    message = SimpleNamespace(
+        message_id=1,
+        chat=SimpleNamespace(id=-1001),
+        from_user=SimpleNamespace(id=42),
+        text="join https://spam.example",
+    )
+    context = UserContext(chat_id=-1001, user_id=42, reputation_score=85, messages_seen=30)
+    features = build_message_features(message, context)
+
+    decision = decision_from_llm(
+        LLMJudgement(is_spam=True, confidence=0.87, category="ads"),
         features,
         _settings(),
     )
@@ -291,4 +311,4 @@ def test_llm_high_confidence_with_profile_and_content_signals_bans():
     )
 
     assert decision.action == DecisionAction.BAN
-    assert decision.reason == "llm_spam_high_confidence_profile_and_content"
+    assert decision.reason == "llm_spam_high_confidence"

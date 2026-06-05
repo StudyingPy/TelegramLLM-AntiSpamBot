@@ -53,6 +53,21 @@ def test_should_fetch_og_for_dot_with_preview_url():
     assert should_fetch_og(features, _settings()) is True
 
 
+def test_should_fetch_og_for_long_punctuation_with_preview_url():
+    message = SimpleNamespace(
+        message_id=1,
+        chat=SimpleNamespace(id=-1001),
+        from_user=SimpleNamespace(id=42),
+        text="! # $ % ^ & * ( ) _ +",
+        link_preview_options=SimpleNamespace(url="https://preview.example/card"),
+    )
+    context = UserContext(chat_id=-1001, user_id=42, reputation_score=50, messages_seen=0)
+    features = build_message_features(message, context)
+
+    assert features.is_empty_or_punctuation is True
+    assert should_fetch_og(features, _settings()) is True
+
+
 def test_validate_public_http_url_blocks_non_http_and_private_hosts():
     with pytest.raises(UnsafeURL):
         _validate_public_http_url("file:///etc/passwd")

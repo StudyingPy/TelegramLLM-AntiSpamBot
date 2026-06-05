@@ -144,7 +144,7 @@ class Settings:
             vote_confirmed_fingerprint_weight=_env_float("VOTE_CONFIRMED_FINGERPRINT_WEIGHT", 85),
             fingerprint_false_positive_penalty=_env_float("FINGERPRINT_FALSE_POSITIVE_PENALTY", 30),
             llm_review_threshold=_env_float("LLM_REVIEW_THRESHOLD", 0.70),
-            llm_ban_threshold=_env_float("LLM_BAN_THRESHOLD", 0.92),
+            llm_ban_threshold=_env_float("LLM_BAN_THRESHOLD", 0.85),
             newapi_base_url=os.getenv("NEWAPI_BASE_URLS") or os.getenv("NEWAPI_BASE_URL") or None,
             newapi_api_key=os.getenv("NEWAPI_API_KEYS") or os.getenv("NEWAPI_API_KEY") or None,
             newapi_model=os.getenv("NEWAPI_MODELS") or os.getenv("NEWAPI_MODEL", "gpt-5.4"),

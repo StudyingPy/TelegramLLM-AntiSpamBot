@@ -37,7 +37,7 @@ def _settings() -> Settings:
         vote_confirmed_fingerprint_weight=85,
         fingerprint_false_positive_penalty=30,
         llm_review_threshold=0.70,
-        llm_ban_threshold=0.92,
+        llm_ban_threshold=0.85,
         newapi_base_url=None,
         newapi_api_key=None,
         newapi_model="gpt-5.4",
@@ -163,3 +163,52 @@ def test_obvious_spam_bio_bans_even_when_message_text_is_benign():
 
     assert decision.action == DecisionAction.BAN
     assert decision.reason == "spam_profile_bio"
+
+
+def test_bot_contact_plus_join_offer_bans_without_llm():
+    decision = RuleEngine(_settings()).evaluate(_features("@qunji2bot   加群一个20"))
+
+    assert decision.action == DecisionAction.BAN
+    assert decision.reason == "hard_spam_message"
+    assert decision.should_call_llm is False
+
+
+def test_bot_contact_plus_payment_code_bans_without_llm():
+    decision = RuleEngine(_settings()).evaluate(_features("@daishx1bot   拿码收钱来"))
+
+    assert decision.action == DecisionAction.BAN
+    assert decision.reason == "hard_spam_message"
+    assert decision.should_call_llm is False
+
+
+def test_hard_spam_message_overrides_review_weight_fingerprint():
+    features = _features("@daishx1bot   拿码收钱来")
+    fingerprint = FingerprintRecord(
+        id=1,
+        fingerprint_type="skeleton",
+        value=features.skeleton_hash,
+        weight=45,
+        hit_count=1,
+        false_positive_count=0,
+        source="llm",
+    )
+
+    decision = RuleEngine(_settings()).evaluate(features, fingerprint=fingerprint)
+
+    assert decision.action == DecisionAction.BAN
+    assert decision.reason == "hard_spam_message"
+
+
+def test_spam_og_preview_bans_without_waiting_for_vote():
+    features = _features("! # $ % ^ & * ( ) _ +", "https://t.me/spam_preview")
+    features.metadata["og_preview"] = {
+        "title": "CRTV成人版",
+        "description": "推特调教大神 反差女大母狗",
+        "text": "看片就选择CRTV 什么片都能看都能搜 视频已更新方",
+    }
+
+    decision = RuleEngine(_settings()).evaluate(features)
+
+    assert decision.action == DecisionAction.BAN
+    assert decision.reason == "hard_spam_link_preview"
+    assert decision.should_call_llm is False
