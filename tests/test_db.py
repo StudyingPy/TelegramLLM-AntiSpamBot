@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from telegram_llm_antispam.db import Database
 from telegram_llm_antispam.feedback import (
     phrase_fingerprint_value,
+    phrase_lookup_values,
     record_llm_spam_feedback,
     record_vote_ham_feedback,
     record_vote_spam_feedback,
@@ -170,5 +171,40 @@ def test_llm_spam_feedback_creates_medium_weight_fingerprints(tmp_path):
         assert skeleton.weight == settings.llm_fingerprint_initial_weight
         assert phrase is not None
         assert phrase.source == "llm_spam_phrase"
+    finally:
+        db.close()
+
+
+def test_phrase_fingerprints_are_used_in_lookup(tmp_path):
+    db = _db(tmp_path)
+    settings = _settings()
+    learned = _features()
+    try:
+        record_llm_spam_feedback(
+            db,
+            learned,
+            LLMJudgement(
+                is_spam=True,
+                confidence=0.95,
+                category="ads",
+                signal_phrases=("日赚3000",),
+            ),
+            settings,
+        )
+
+        future_message = SimpleNamespace(
+            message_id=12,
+            chat=SimpleNamespace(id=-1001),
+            from_user=SimpleNamespace(id=44),
+            text="日赚8000，点击领取教程",
+        )
+        future_context = UserContext(chat_id=-1001, user_id=44, reputation_score=50, messages_seen=1)
+        future = build_message_features(future_message, future_context)
+        phrase_values = phrase_lookup_values(future)
+        strongest = db.get_strongest_fingerprint(tuple(("phrase", value) for value in phrase_values))
+
+        assert phrase_fingerprint_value("日赚3000") in phrase_values
+        assert strongest is not None
+        assert strongest.fingerprint_type == "phrase"
     finally:
         db.close()

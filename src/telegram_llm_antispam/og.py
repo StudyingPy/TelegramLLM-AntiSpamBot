@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import html
+import http.client
 import ipaddress
 import logging
 import re
 import socket
+import ssl
+from dataclasses import dataclass
 from html.parser import HTMLParser
-from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin, urlparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.error import URLError
+from urllib.parse import urljoin, urlparse, urlunparse
 
 from .config import Settings
 from .models import MessageFeatures, OGPreview
@@ -22,9 +24,43 @@ class UnsafeURL(ValueError):
     """Raised when a URL violates SSRF guardrails."""
 
 
-class NoRedirectHandler(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
-        return None
+@dataclass(frozen=True, slots=True)
+class ResolvedEndpoint:
+    url: str
+    scheme: str
+    host: str
+    connect_host: str
+    port: int
+    path: str
+
+
+class PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, connect_host: str, host: str, port: int, timeout: float) -> None:
+        super().__init__(host, port=port, timeout=timeout)
+        self._connect_host = connect_host
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection(
+            (self._connect_host, self.port),
+            self.timeout,
+            self.source_address,
+        )
+        _validate_public_ip(ipaddress.ip_address(self.sock.getpeername()[0]))
+
+
+class PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, connect_host: str, host: str, port: int, timeout: float) -> None:
+        super().__init__(host, port=port, timeout=timeout, context=ssl.create_default_context())
+        self._connect_host = connect_host
+
+    def connect(self) -> None:
+        sock = socket.create_connection(
+            (self._connect_host, self.port),
+            self.timeout,
+            self.source_address,
+        )
+        _validate_public_ip(ipaddress.ip_address(sock.getpeername()[0]))
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
 
 
 class OGHTMLParser(HTMLParser):
@@ -80,7 +116,7 @@ async def fetch_og_for_features(
             max_text_chars=settings.og_fetch_max_text_chars,
             max_redirects=settings.og_fetch_max_redirects,
         )
-    except (UnsafeURL, HTTPError, URLError, OSError, UnicodeError) as exc:
+    except (UnsafeURL, URLError, OSError, UnicodeError, http.client.HTTPException) as exc:
         logger.info("OG fetch skipped or failed for preview URL: %s", exc)
         return None
 
@@ -93,43 +129,118 @@ def fetch_og_preview(
     max_redirects: int,
 ) -> OGPreview:
     original_url = url
-    current_url = _validate_public_http_url(url)
-    opener = build_opener(NoRedirectHandler)
+    current_url = url
 
     for redirect_count in range(max_redirects + 1):
-        request = Request(
-            current_url,
-            headers={
-                "Accept": "text/html,application/xhtml+xml",
-                "User-Agent": "TelegramLLMAntiSpamBot/0.1",
-            },
-            method="GET",
-        )
+        endpoint = _resolve_public_endpoint(current_url)
+        connection = _pinned_connection(endpoint, timeout=timeout)
         try:
-            with opener.open(request, timeout=timeout) as response:
-                content_type = response.headers.get("Content-Type", "")
-                if not _is_html_content_type(content_type):
-                    return OGPreview(url=original_url, final_url=current_url)
+            connection.request(
+                "GET",
+                endpoint.path,
+                headers={
+                    "Host": endpoint.host,
+                    "Accept": "text/html,application/xhtml+xml",
+                    "User-Agent": "TelegramLLMAntiSpamBot/0.1",
+                },
+            )
+            response = connection.getresponse()
+            if response.status in {301, 302, 303, 307, 308}:
+                location = response.getheader("Location")
+                response.read(1024)
+                if not location or redirect_count >= max_redirects:
+                    raise UnsafeURL("redirect limit exceeded or location missing")
+                current_url = urljoin(current_url, location)
+                continue
 
-                body = response.read(max_bytes + 1)
-                truncated = len(body) > max_bytes
-                html_text = body[:max_bytes].decode(_charset_from_content_type(content_type), "replace")
-                return parse_og_html(
-                    html_text,
-                    original_url=original_url,
-                    final_url=current_url,
-                    max_text_chars=max_text_chars,
-                    truncated=truncated,
-                )
-        except HTTPError as exc:
-            if exc.code not in {301, 302, 303, 307, 308}:
-                raise
-            location = exc.headers.get("Location")
-            if not location or redirect_count >= max_redirects:
-                raise UnsafeURL("redirect limit exceeded or location missing")
-            current_url = _validate_public_http_url(urljoin(current_url, location))
+            if response.status >= 400:
+                raise URLError(f"unexpected OG fetch status {response.status}")
+
+            content_type = response.getheader("Content-Type", "")
+            if not _is_html_content_type(content_type):
+                return OGPreview(url=original_url, final_url=endpoint.url)
+
+            body = response.read(max_bytes + 1)
+            truncated = len(body) > max_bytes
+            html_text = body[:max_bytes].decode(_charset_from_content_type(content_type), "replace")
+            return parse_og_html(
+                html_text,
+                original_url=original_url,
+                final_url=endpoint.url,
+                max_text_chars=max_text_chars,
+                truncated=truncated,
+            )
+        finally:
+            connection.close()
 
     raise UnsafeURL("redirect limit exceeded")
+
+
+def _pinned_connection(endpoint: ResolvedEndpoint, timeout: float) -> http.client.HTTPConnection:
+    if endpoint.scheme == "https":
+        return PinnedHTTPSConnection(endpoint.connect_host, endpoint.host, endpoint.port, timeout)
+    return PinnedHTTPConnection(endpoint.connect_host, endpoint.host, endpoint.port, timeout)
+
+
+def _resolve_public_endpoint(url: str) -> ResolvedEndpoint:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise UnsafeURL("only http(s) preview URLs are allowed")
+    if not parsed.hostname:
+        raise UnsafeURL("preview URL host is required")
+    if parsed.username or parsed.password:
+        raise UnsafeURL("userinfo in preview URL is not allowed")
+
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    if port not in {80, 443}:
+        raise UnsafeURL("non-standard preview URL ports are not allowed")
+
+    connect_host = _resolve_public_host(parsed.hostname, port)
+    path = urlunparse(("", "", parsed.path or "/", parsed.params, parsed.query, ""))
+    normalized_url = urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path or "/",
+            parsed.params,
+            parsed.query,
+            "",
+        )
+    )
+    return ResolvedEndpoint(
+        url=normalized_url,
+        scheme=parsed.scheme,
+        host=parsed.hostname,
+        connect_host=connect_host,
+        port=port,
+        path=path,
+    )
+
+
+def _validate_public_http_url(url: str) -> str:
+    return _resolve_public_endpoint(url).url
+
+
+def _resolve_public_host(host: str, port: int) -> str:
+    try:
+        ip = ipaddress.ip_address(host)
+        _validate_public_ip(ip)
+        return str(ip)
+    except ValueError:
+        pass
+
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    if not infos:
+        raise UnsafeURL("preview URL host cannot be resolved")
+
+    public_addresses: list[str] = []
+    for info in infos:
+        address = info[4][0]
+        ip = ipaddress.ip_address(address)
+        _validate_public_ip(ip)
+        public_addresses.append(address)
+
+    return public_addresses[0]
 
 
 def parse_og_html(
@@ -159,37 +270,6 @@ def parse_og_html(
         text=text,
         truncated=truncated or len(text) >= max_text_chars,
     )
-
-
-def _validate_public_http_url(url: str) -> str:
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"}:
-        raise UnsafeURL("only http(s) preview URLs are allowed")
-    if not parsed.hostname:
-        raise UnsafeURL("preview URL host is required")
-    if parsed.username or parsed.password:
-        raise UnsafeURL("userinfo in preview URL is not allowed")
-    if parsed.port and parsed.port not in {80, 443}:
-        raise UnsafeURL("non-standard preview URL ports are not allowed")
-
-    _validate_public_host(parsed.hostname)
-    return url
-
-
-def _validate_public_host(host: str) -> None:
-    try:
-        ip = ipaddress.ip_address(host)
-        _validate_public_ip(ip)
-        return
-    except ValueError:
-        pass
-
-    infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-    if not infos:
-        raise UnsafeURL("preview URL host cannot be resolved")
-    for info in infos:
-        address = info[4][0]
-        _validate_public_ip(ipaddress.ip_address(address))
 
 
 def _validate_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> None:

@@ -34,8 +34,10 @@
   timeout default release are active. Message restoration remains a future admin workflow
   because Telegram Bot API cannot undelete the original message in place.
 - Phase 4 is wired for core feedback: LLM/vote fingerprint updates, false-positive downgrades,
-  reputation changes, and repeat-window fast bans for link-bearing messages from new/low-rep senders.
+  reputation changes, learned phrase fingerprint lookup, and repeat-window fast bans for
+  link-bearing messages from new/low-rep senders.
 - Phase 5 is wired for the high-value OG case: short text plus preview URL. Broader OG fetching
-  can be enabled later after observing cost and abuse patterns.
+  can be enabled later after observing cost and abuse patterns. OG requests pin the already
+  validated public IP for the actual connection to avoid DNS rebinding between validation and fetch.
 - Sender profile context is wired: username/display name is stable from each message, while bio
   is best-effort and cached because Bot API may not expose it for ordinary group users.

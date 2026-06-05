@@ -57,6 +57,40 @@ antispam-bot
 
 机器人需要在目标群组拥有删除消息权限；如果要自动封禁，还需要封禁/限制成员权限。
 
+## Linux 一键部署
+
+在 VPS 上可以用 GitHub 仓库部署 systemd 服务。仓库是私有仓库时，推荐先把
+`deploy/install.sh` 上传到服务器，然后执行：
+
+```bash
+sudo bash install.sh
+```
+
+脚本会交互式生成 `.env`、创建应用用户、安装虚拟环境、初始化 SQLite，并启用
+`telegram-llm-antispam-bot.service`。默认会创建专用系统用户 `antispambot`，
+并在 `/var/lib/telegram-llm-antispam-bot/.ssh/deploy_key` 生成 SSH deploy key；
+脚本会打印公钥并暂停，等你把它添加到 GitHub 仓库的只读 Deploy key 后再继续拉取。
+
+如果你用 GitHub token 下载私有仓库里的安装脚本，也可以这样启动：
+
+```bash
+curl -fsSL \
+  -H "Authorization: Bearer $GITHUB_TOKEN" \
+  https://raw.githubusercontent.com/StudyingPy/TelegramLLM-AntiSpamBot/main/deploy/install.sh \
+  | sudo bash
+```
+
+可用环境变量覆盖默认值：
+
+```bash
+APP_DIR=/opt/telegram-llm-antispam-bot \
+APP_USER=antispambot \
+BRANCH=main \
+REPO_URL=git@github.com:StudyingPy/TelegramLLM-AntiSpamBot.git \
+SERVICE_NAME=telegram-llm-antispam-bot \
+sudo -E bash deploy/install.sh
+```
+
 ## 当前阶段边界
 
 Telegram Bot API 删除消息后不能原样恢复到原消息位。当前投票“放行”会记录为假阳性并恢复用户信用，后续可以补“重发原消息快照/申诉面板”来贴近可恢复体验。

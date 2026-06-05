@@ -6,7 +6,14 @@ import pytest
 
 from telegram_llm_antispam.features import build_message_features
 from telegram_llm_antispam.models import UserContext
-from telegram_llm_antispam.og import UnsafeURL, _validate_public_http_url, parse_og_html, should_fetch_og
+from telegram_llm_antispam.og import (
+    UnsafeURL,
+    _pinned_connection,
+    _resolve_public_endpoint,
+    _validate_public_http_url,
+    parse_og_html,
+    should_fetch_og,
+)
 from test_llm import _settings
 
 
@@ -55,3 +62,34 @@ def test_validate_public_http_url_blocks_non_http_and_private_hosts():
 
     with pytest.raises(UnsafeURL):
         _validate_public_http_url("http://localhost/")
+
+
+def test_og_connection_uses_pinned_resolved_ip(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def fake_getaddrinfo(host, port, type):  # noqa: A002, ANN001
+        assert host == "example.com"
+        return [(None, None, None, "", ("93.184.216.34", port))]
+
+    class FakeSocket:
+        def getpeername(self):
+            return ("93.184.216.34", 80)
+
+    def fake_create_connection(address, timeout, source_address=None):  # noqa: ANN001
+        captured["address"] = address
+        captured["timeout"] = timeout
+        captured["source_address"] = source_address
+        return FakeSocket()
+
+    monkeypatch.setattr("telegram_llm_antispam.og.socket.getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(
+        "telegram_llm_antispam.og.socket.create_connection",
+        fake_create_connection,
+    )
+
+    endpoint = _resolve_public_endpoint("http://example.com/path?q=1")
+    connection = _pinned_connection(endpoint, timeout=2)
+    connection.connect()
+
+    assert endpoint.connect_host == "93.184.216.34"
+    assert captured["address"] == ("93.184.216.34", 80)
