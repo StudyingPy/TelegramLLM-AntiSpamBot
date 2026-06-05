@@ -11,6 +11,8 @@ def test_deploy_script_defaults_to_private_repo_deploy_key_flow():
     assert "Deploy keys -> Add deploy key" in script
     assert "Leave \"Allow write access\" unchecked." in script
     assert "GIT_SSH_COMMAND" in script
+    assert "git_as_user -C \"$APP_DIR\" pull --ff-only origin \"$BRANCH\"" in script
+    assert "git_as_user clone --branch \"$BRANCH\" \"$REPO_URL\" \"$APP_DIR\"" in script
     assert "ReadWritePaths=$APP_DIR" in script
 
 

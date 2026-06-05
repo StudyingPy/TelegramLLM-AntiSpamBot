@@ -120,6 +120,16 @@ run_as_user() {
   fi
 }
 
+git_as_user() {
+  local ssh_command
+  ssh_command="$(git_ssh_command)"
+  if [[ -n "$ssh_command" ]]; then
+    run_as_user env GIT_SSH_COMMAND="$ssh_command" git "$@"
+  else
+    run_as_user git "$@"
+  fi
+}
+
 configure_deploy_key() {
   if ! uses_ssh_repo; then
     log "Repository URL is not SSH; skipping deploy key setup."
@@ -144,7 +154,7 @@ configure_deploy_key() {
   chown "$APP_USER:$APP_USER" "$APP_HOME/.ssh/known_hosts" || true
   chmod 600 "$APP_HOME/.ssh/known_hosts" || true
 
-  if GIT_SSH_COMMAND="$(git_ssh_command)" git ls-remote "$REPO_URL" "$BRANCH" >/dev/null 2>&1; then
+  if git_as_user ls-remote "$REPO_URL" "$BRANCH" >/dev/null 2>&1; then
     log "Deploy key already has access to the repository."
     return
   fi
@@ -157,7 +167,7 @@ configure_deploy_key() {
   read -r -p "Press Enter after adding the deploy key to GitHub..."
 
   log "Testing deploy key access"
-  if ! GIT_SSH_COMMAND="$(git_ssh_command)" git ls-remote "$REPO_URL" "$BRANCH" >/dev/null; then
+  if ! git_as_user ls-remote "$REPO_URL" "$BRANCH" >/dev/null; then
     printf 'Could not access %s branch %s with the deploy key.\n' "$REPO_URL" "$BRANCH" >&2
     printf 'Check that the key was added to the private repo and try again.\n' >&2
     exit 1
@@ -166,12 +176,22 @@ configure_deploy_key() {
 
 sync_repo() {
   mkdir -p "$(dirname "$APP_DIR")"
-  if [[ -d "$APP_DIR/.git" ]]; then
-    GIT_SSH_COMMAND="$(git_ssh_command)" git -C "$APP_DIR" fetch origin "$BRANCH"
-    GIT_SSH_COMMAND="$(git_ssh_command)" git -C "$APP_DIR" checkout "$BRANCH"
-    GIT_SSH_COMMAND="$(git_ssh_command)" git -C "$APP_DIR" pull --ff-only origin "$BRANCH"
+  if [[ -d "$APP_DIR" ]]; then
+    chown -R "$APP_USER:$APP_USER" "$APP_DIR"
   else
-    GIT_SSH_COMMAND="$(git_ssh_command)" git clone --branch "$BRANCH" "$REPO_URL" "$APP_DIR"
+    install -d -m 755 -o "$APP_USER" -g "$APP_USER" "$APP_DIR"
+  fi
+
+  if [[ -d "$APP_DIR/.git" ]]; then
+    git_as_user -C "$APP_DIR" fetch origin "$BRANCH"
+    git_as_user -C "$APP_DIR" checkout "$BRANCH"
+    git_as_user -C "$APP_DIR" pull --ff-only origin "$BRANCH"
+  else
+    if [[ -n "$(find "$APP_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+      printf '%s exists but is not a git checkout. Move it aside or set APP_DIR.\n' "$APP_DIR" >&2
+      exit 1
+    fi
+    git_as_user clone --branch "$BRANCH" "$REPO_URL" "$APP_DIR"
   fi
   chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 }
