@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
+from typing import Any
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -129,26 +131,52 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
         await _process_group_message(message, is_edit=True)
 
     async def _process_group_message(message: Message, *, is_edit: bool) -> None:
-        if not message.from_user or message.from_user.is_bot:
-            return
-
         chat_type = _chat_type(message)
         if chat_type not in {"group", "supergroup"}:
-            return
-        if (message.text or "").strip().startswith("/"):
             return
         if not is_chat_allowed(settings, db, message.chat.id):
             return
 
-        user_context = db.get_user_context(message.chat.id, message.from_user.id)
-        sender_profile = await get_sender_profile(message.bot, db, message.from_user, settings)
-        features = build_message_features(
+        new_members = _new_chat_members(message)
+        if new_members and not is_edit:
+            for user in new_members:
+                if not getattr(user, "is_bot", False):
+                    await _process_features_for_user(
+                        message,
+                        user,
+                        update_type="new_chat_member",
+                        is_edit=False,
+                    )
+            return
+
+        if not message.from_user or message.from_user.is_bot:
+            return
+        if (message.text or "").strip().startswith("/"):
+            return
+
+        await _process_features_for_user(
             message,
+            message.from_user,
+            update_type="edited_message" if is_edit else "message",
+            is_edit=is_edit,
+        )
+
+    async def _process_features_for_user(
+        message: Message,
+        user: Any,
+        *,
+        update_type: str,
+        is_edit: bool,
+    ) -> None:
+        user_context = db.get_user_context(message.chat.id, user.id)
+        sender_profile = await get_sender_profile(message.bot, db, user, settings)
+        features = build_message_features(
+            _feature_message_for_user(message, user),
             user_context=user_context,
             sender_profile=sender_profile,
             default_reputation=settings.default_reputation,
         )
-        features.metadata["update_type"] = "edited_message" if is_edit else "message"
+        features.metadata["update_type"] = update_type
         if should_fetch_og(features, settings):
             og_preview = await fetch_og_for_features(features, settings)
             if og_preview is not None:
@@ -158,8 +186,13 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
         if fingerprint is not None:
             db.record_fingerprint_hit(fingerprint.id)
 
+        same_user_repeat_decision = _same_user_open_vote_repeat_decision(settings, db, features)
         repeat_decision = _repeat_decision(settings, db, features)
-        decision = repeat_decision or rule_engine.evaluate(features, fingerprint=fingerprint)
+        decision = (
+            same_user_repeat_decision
+            or repeat_decision
+            or rule_engine.evaluate(features, fingerprint=fingerprint)
+        )
 
         if decision.should_call_llm:
             try:
@@ -362,6 +395,73 @@ def _parse_chat_id(value: str) -> int | None:
         return int(value.strip())
     except ValueError:
         return None
+
+
+def _new_chat_members(message: Message) -> tuple[Any, ...]:
+    members = getattr(message, "new_chat_members", None)
+    if members:
+        return tuple(members)
+
+    action = getattr(message, "action", None)
+    action_users = getattr(action, "users", None)
+    if not action_users:
+        return ()
+
+    users: list[Any] = []
+    for user_id in action_users:
+        try:
+            users.append(SimpleNamespace(id=int(user_id), is_bot=False))
+        except (TypeError, ValueError):
+            continue
+    return tuple(users)
+
+
+def _feature_message_for_user(message: Message, user: Any) -> Any:
+    return SimpleNamespace(
+        message_id=getattr(message, "message_id", None),
+        chat=getattr(message, "chat", None),
+        from_user=user,
+        text=getattr(message, "text", None),
+        caption=getattr(message, "caption", None),
+        entities=getattr(message, "entities", None),
+        caption_entities=getattr(message, "caption_entities", None),
+        link_preview_options=getattr(message, "link_preview_options", None),
+    )
+
+
+def _same_user_open_vote_repeat_decision(
+    settings: Settings,
+    db: Database,
+    features: MessageFeatures,
+) -> LocalDecision | None:
+    if features.user_id is None:
+        return None
+    if features.sender_reputation >= settings.high_reputation_threshold:
+        return None
+
+    sessions = db.list_vote_sessions_for_user(
+        features.chat_id,
+        features.user_id,
+        statuses=("open",),
+    )
+    matching_session_ids = [
+        session.id
+        for session in sessions
+        if (
+            (session.content_hash and session.content_hash == features.content_hash)
+            or (session.skeleton_hash and session.skeleton_hash == features.skeleton_hash)
+        )
+    ]
+    if not matching_session_ids:
+        return None
+
+    return LocalDecision(
+        action=DecisionAction.BAN,
+        reason="repeated_open_vote_message_same_user",
+        confidence=0.97,
+        should_call_llm=False,
+        metadata={"open_vote_session_ids": matching_session_ids[:10]},
+    )
 
 
 def _repeat_decision(

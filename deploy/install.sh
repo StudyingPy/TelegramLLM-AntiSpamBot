@@ -8,8 +8,24 @@ APP_USER="${APP_USER:-antispambot}"
 SERVICE_NAME="${SERVICE_NAME:-telegram-llm-antispam-bot}"
 APP_HOME="${APP_HOME:-/var/lib/$SERVICE_NAME}"
 DEPLOY_KEY_PATH="${DEPLOY_KEY_PATH:-}"
+MODE="${1:-${DEPLOY_MODE:-install}}"
 ENV_FILE="$APP_DIR/.env"
 SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME.service"
+DEPENDENCY_FINGERPRINT_FILE="$APP_DIR/.venv/.dependency-fingerprint"
+
+case "$MODE" in
+  install|update) ;;
+  -h|--help|help)
+    printf 'Usage: %s [install|update]\n' "${0##*/}"
+    printf '  install: first-time interactive deployment\n'
+    printf '  update: pull latest code, keep .env, skip Python reinstall when dependencies are unchanged\n'
+    exit 0
+    ;;
+  *)
+    printf 'Usage: %s [install|update]\n' "${0##*/}" >&2
+    exit 2
+    ;;
+esac
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   if [[ -f "$0" ]]; then
@@ -130,6 +146,30 @@ git_as_user() {
   fi
 }
 
+prepare_deploy_key() {
+  if [[ "$MODE" == "install" ]]; then
+    configure_deploy_key
+    return
+  fi
+
+  if ! uses_ssh_repo; then
+    log "Update mode: repository URL is not SSH; skipping deploy key setup."
+    return
+  fi
+
+  if [[ ! -f "$DEPLOY_KEY_PATH" ]]; then
+    printf 'Update mode requires an existing deploy key at %s for SSH repositories.\n' "$DEPLOY_KEY_PATH" >&2
+    printf 'Run install mode first, set DEPLOY_KEY_PATH, or set REPO_URL to an HTTPS remote.\n' >&2
+    exit 1
+  fi
+
+  log "Update mode: using existing deploy key at $DEPLOY_KEY_PATH"
+  run_as_user mkdir -p "$APP_HOME/.ssh"
+  run_as_user ssh-keyscan -H github.com >>"$APP_HOME/.ssh/known_hosts" 2>/dev/null || true
+  chown "$APP_USER:$APP_USER" "$APP_HOME/.ssh/known_hosts" || true
+  chmod 600 "$APP_HOME/.ssh/known_hosts" || true
+}
+
 configure_deploy_key() {
   if ! uses_ssh_repo; then
     log "Repository URL is not SSH; skipping deploy key setup."
@@ -176,6 +216,13 @@ configure_deploy_key() {
 
 sync_repo() {
   mkdir -p "$(dirname "$APP_DIR")"
+
+  if [[ "$MODE" == "update" && ! -d "$APP_DIR/.git" ]]; then
+    printf 'Update mode requires an existing git checkout at %s.\n' "$APP_DIR" >&2
+    printf 'Run install mode first, or choose install mode to create a new checkout.\n' >&2
+    exit 1
+  fi
+
   if [[ -d "$APP_DIR" ]]; then
     chown -R "$APP_USER:$APP_USER" "$APP_DIR"
   else
@@ -196,6 +243,15 @@ sync_repo() {
   chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 }
 
+hash_file() {
+  local path="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" | awk '{print $1}'
+  else
+    shasum -a 256 "$path" | awk '{print $1}'
+  fi
+}
+
 run_as_app() {
   if command -v runuser >/dev/null 2>&1; then
     runuser -u "$APP_USER" -- bash -c 'cd "$1" && shift && "$@"' bash "$APP_DIR" "$@"
@@ -205,6 +261,15 @@ run_as_app() {
 }
 
 write_env_file() {
+  if [[ "$MODE" == "update" ]]; then
+    if [[ -f "$ENV_FILE" ]]; then
+      log "Update mode: keeping existing $ENV_FILE"
+      return
+    fi
+    printf 'Update mode requires an existing %s. Run install mode first.\n' "$ENV_FILE" >&2
+    exit 1
+  fi
+
   if [[ -f "$ENV_FILE" ]]; then
     local overwrite
     overwrite="$(prompt_bool "Existing .env found. Regenerate it?" "false")"
@@ -218,7 +283,7 @@ write_env_file() {
   local telegram_token database_path whitelist_domains log_level
   local admin_user_ids admin_notify_user_ids allowed_chat_ids require_allowed_chat
   local vote_min vote_timeout vote_sweep
-  local enable_newapi newapi_base newapi_key newapi_model newapi_timeout
+  local enable_newapi newapi_bases newapi_keys newapi_models newapi_timeout
   local enable_og enable_profile_bio
 
   telegram_token="$(prompt_required_secret "Telegram bot token")"
@@ -235,14 +300,14 @@ write_env_file() {
 
   enable_newapi="$(prompt_bool "Enable NewAPI LLM judgement?" "false")"
   if [[ "$enable_newapi" == "true" ]]; then
-    newapi_base="$(sanitize_env "$(prompt "NewAPI base URL" "https://your-newapi-host")")"
-    newapi_key="$(prompt_secret "NewAPI API key")"
-    newapi_model="$(sanitize_env "$(prompt "NewAPI model" "gpt-5.4")")"
+    newapi_bases="$(sanitize_env "$(prompt "NewAPI base URLs, comma-separated" "https://your-newapi-host")")"
+    newapi_keys="$(prompt_secret "NewAPI API keys, comma-separated")"
+    newapi_models="$(sanitize_env "$(prompt "NewAPI models, comma-separated" "gpt-5.4")")"
     newapi_timeout="$(sanitize_env "$(prompt "NewAPI timeout seconds" "8")")"
   else
-    newapi_base=""
-    newapi_key=""
-    newapi_model="gpt-5.4"
+    newapi_bases=""
+    newapi_keys=""
+    newapi_models="gpt-5.4"
     newapi_timeout="8"
   fi
 
@@ -271,9 +336,9 @@ LLM_FINGERPRINT_INITIAL_WEIGHT=50
 VOTE_CONFIRMED_FINGERPRINT_WEIGHT=85
 FINGERPRINT_FALSE_POSITIVE_PENALTY=30
 
-NEWAPI_BASE_URL=$newapi_base
-NEWAPI_API_KEY=$newapi_key
-NEWAPI_MODEL=$newapi_model
+NEWAPI_BASE_URLS=$newapi_bases
+NEWAPI_API_KEYS=$newapi_keys
+NEWAPI_MODELS=$newapi_models
 NEWAPI_TIMEOUT_SECONDS=$newapi_timeout
 NEWAPI_TEMPERATURE=0
 NEWAPI_MAX_TOKENS=600
@@ -294,9 +359,27 @@ EOF
 }
 
 install_python_app() {
+  local dependency_fingerprint stored_fingerprint
+  dependency_fingerprint="$(hash_file "$APP_DIR/pyproject.toml")"
+
+  if [[ "$MODE" == "update" \
+    && -x "$APP_DIR/.venv/bin/python" \
+    && -x "$APP_DIR/.venv/bin/antispam-admin" \
+    && -f "$DEPENDENCY_FINGERPRINT_FILE" ]]; then
+    stored_fingerprint="$(cat "$DEPENDENCY_FINGERPRINT_FILE")"
+    if [[ "$stored_fingerprint" == "$dependency_fingerprint" ]]; then
+      log "Dependencies unchanged; skipping Python reinstall."
+      run_as_app .venv/bin/antispam-admin init-db
+      return
+    fi
+  fi
+
   run_as_app python3 -m venv .venv
   run_as_app .venv/bin/python -m pip install --upgrade pip
   run_as_app .venv/bin/python -m pip install -e .
+  printf '%s\n' "$dependency_fingerprint" >"$DEPENDENCY_FINGERPRINT_FILE"
+  chown "$APP_USER:$APP_USER" "$DEPENDENCY_FINGERPRINT_FILE"
+  chmod 600 "$DEPENDENCY_FINGERPRINT_FILE"
   run_as_app .venv/bin/antispam-admin init-db
 }
 
@@ -327,17 +410,26 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now "$SERVICE_NAME"
+  if [[ "$MODE" == "update" ]]; then
+    systemctl restart "$SERVICE_NAME"
+  else
+    systemctl enable --now "$SERVICE_NAME"
+  fi
 }
 
 main() {
-  log "Installing dependencies"
-  install_packages
+  log "Deploy mode: $MODE"
+  if [[ "$MODE" == "update" ]]; then
+    log "Update mode: skipping OS package install."
+  else
+    log "Installing dependencies"
+    install_packages
+  fi
 
   log "Preparing service user"
   ensure_app_user
 
-  configure_deploy_key
+  prepare_deploy_key
 
   log "Syncing repository $REPO_URL ($BRANCH)"
   sync_repo
@@ -350,11 +442,12 @@ main() {
   log "Installing systemd service"
   install_systemd_service
 
-  log "Deployment complete"
+  log "Deployment complete ($MODE)"
   systemctl --no-pager --full status "$SERVICE_NAME" || true
   printf '\nUseful commands:\n'
   printf '  journalctl -u %s -f\n' "$SERVICE_NAME"
   printf '  systemctl restart %s\n' "$SERVICE_NAME"
+  printf '  sudo bash %s/deploy/install.sh update\n' "$APP_DIR"
   printf '  cd %s && sudo -u %s .venv/bin/antispam-admin show-config\n' "$APP_DIR" "$APP_USER"
 }
 

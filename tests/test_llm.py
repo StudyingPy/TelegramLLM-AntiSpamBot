@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 from telegram_llm_antispam.config import Settings
 from telegram_llm_antispam.features import build_message_features
 from telegram_llm_antispam.llm import (
+    NewAPIJudge,
     _chat_completions_url,
     _feature_payload,
     _loads_json_object,
+    _newapi_providers_from_settings,
     _parse_judgement,
     decision_from_llm,
 )
@@ -72,6 +76,88 @@ def test_chat_completions_url_accepts_host_or_v1():
     assert _chat_completions_url("https://api.example/v1/chat/completions") == (
         "https://api.example/v1/chat/completions"
     )
+
+
+def test_newapi_providers_support_multiple_urls_keys_and_models():
+    settings = replace(
+        _settings(),
+        newapi_base_url="https://api-a.example,https://api-b.example/v1",
+        newapi_api_key="key-a,key-b",
+        newapi_model="model-a,model-b",
+    )
+
+    providers = _newapi_providers_from_settings(settings)
+
+    assert [(item.endpoint, item.api_key, item.model) for item in providers] == [
+        ("https://api-a.example/v1/chat/completions", "key-a", "model-a"),
+        ("https://api-b.example/v1/chat/completions", "key-b", "model-b"),
+    ]
+
+
+def test_newapi_provider_parser_reuses_single_key_and_model():
+    settings = replace(
+        _settings(),
+        newapi_base_url="https://api-a.example,https://api-b.example",
+        newapi_api_key="shared-key",
+        newapi_model="shared-model",
+    )
+
+    providers = _newapi_providers_from_settings(settings)
+
+    assert [(item.endpoint, item.api_key, item.model) for item in providers] == [
+        ("https://api-a.example/v1/chat/completions", "shared-key", "shared-model"),
+        ("https://api-b.example/v1/chat/completions", "shared-key", "shared-model"),
+    ]
+
+
+def test_newapi_judge_falls_back_to_next_provider_after_error():
+    class FallbackJudge(NewAPIJudge):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.called_endpoints: list[str] = []
+
+        def _post_chat_completion(self, provider, payload):  # noqa: ANN001
+            self.called_endpoints.append(provider.endpoint)
+            if len(self.called_endpoints) == 1:
+                raise OSError("primary failed")
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"is_spam": true, "confidence": 0.93, '
+                                '"category": "ads", "signal_phrases": ["赚钱"]}'
+                            )
+                        }
+                    }
+                ]
+            }
+
+    settings = replace(
+        _settings(),
+        newapi_base_url="https://api-a.example,https://api-b.example",
+        newapi_api_key="key-a,key-b",
+        newapi_model="model-a,model-b",
+    )
+    message = SimpleNamespace(
+        message_id=1,
+        chat=SimpleNamespace(id=-1001),
+        from_user=SimpleNamespace(id=42),
+        text="来这里几分钟赚几百 @baurpc",
+    )
+    context = UserContext(chat_id=-1001, user_id=42, reputation_score=50, messages_seen=1)
+    features = build_message_features(message, context)
+    judge = FallbackJudge(settings)
+
+    judgement = asyncio.run(judge.judge(features))
+
+    assert judgement is not None
+    assert judgement.is_spam is True
+    assert judgement.confidence == 0.93
+    assert judge.called_endpoints == [
+        "https://api-a.example/v1/chat/completions",
+        "https://api-b.example/v1/chat/completions",
+    ]
 
 
 def test_loads_json_object_handles_fenced_json():

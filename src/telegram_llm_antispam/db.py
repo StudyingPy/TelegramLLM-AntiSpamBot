@@ -701,6 +701,36 @@ class Database:
             ).fetchone()
         return _vote_session_from_row(row) if row is not None else None
 
+    def list_vote_sessions_for_user(
+        self,
+        chat_id: int,
+        user_id: int,
+        *,
+        statuses: tuple[str, ...] | None = None,
+        limit: int = 50,
+    ) -> tuple[VoteSession, ...]:
+        params: list[Any] = [chat_id, user_id]
+        status_clause = ""
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            status_clause = f" AND status IN ({placeholders})"
+            params.extend(statuses)
+        params.append(limit)
+
+        with self._locked_conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM vote_sessions
+                WHERE chat_id = ? AND suspect_user_id = ?
+                    {status_clause}
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        return tuple(_vote_session_from_row(row) for row in rows)
+
     def expire_open_vote_sessions(self, limit: int = 100) -> tuple[VoteSession, ...]:
         now = _now()
         with self._locked_conn() as conn:

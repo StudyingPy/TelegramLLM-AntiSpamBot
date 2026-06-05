@@ -5,6 +5,7 @@ import argparse
 from .config import Settings
 from .db import Database
 from .logging_config import configure_logging
+from .llm import newapi_provider_count
 
 
 def main() -> None:
@@ -41,6 +42,7 @@ def main() -> None:
         print(f"REPEAT_WINDOW_SECONDS={settings.repeat_window_seconds}")
         print(f"REPEAT_MIN_DISTINCT_SENDERS={settings.repeat_min_distinct_senders}")
         print(f"NEWAPI_ENABLED={settings.has_newapi}")
+        print(f"NEWAPI_PROVIDER_COUNT={newapi_provider_count(settings)}")
         print(f"NEWAPI_BASE_URL={'set' if settings.newapi_base_url else 'unset'}")
         print(f"NEWAPI_MODEL={settings.newapi_model}")
         print(f"OG_FETCH_ENABLED={settings.og_fetch_enabled}")

@@ -131,3 +131,35 @@ def test_high_weight_fingerprint_and_low_reputation_bans():
     decision = RuleEngine(_settings()).evaluate(features, fingerprint=fingerprint)
 
     assert decision.action == DecisionAction.BAN
+
+
+def test_high_weight_fingerprint_and_normal_reputation_bans_without_vote():
+    features = _features("不稳不推 来这里几分钟赚几百 @baurpc", messages_seen=2)
+    fingerprint = FingerprintRecord(
+        id=1,
+        fingerprint_type="content",
+        value=features.content_hash,
+        weight=85,
+        hit_count=3,
+        false_positive_count=0,
+        source="vote_confirmed",
+    )
+
+    decision = RuleEngine(_settings()).evaluate(features, fingerprint=fingerprint)
+
+    assert decision.action == DecisionAction.BAN
+    assert decision.reason == "known_high_weight_fingerprint"
+
+
+def test_obvious_spam_bio_bans_even_when_message_text_is_benign():
+    features = _features("签到", messages_seen=0)
+    features.metadata["sender_profile"] = {
+        "display_name": "Snsb",
+        "username": None,
+        "bio": "https://t.me/+LmgOTZ_i-G00ODFk 点击进群了解详细做单教程",
+    }
+
+    decision = RuleEngine(_settings()).evaluate(features)
+
+    assert decision.action == DecisionAction.BAN
+    assert decision.reason == "spam_profile_bio"

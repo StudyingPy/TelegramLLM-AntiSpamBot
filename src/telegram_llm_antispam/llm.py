@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import string
+from dataclasses import dataclass
 from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
@@ -28,68 +29,96 @@ class NullLLMJudge:
         return None
 
 
+@dataclass(frozen=True, slots=True)
+class NewAPIProvider:
+    endpoint: str
+    api_key: str
+    model: str
+
+
 class NewAPIJudge:
     def __init__(self, settings: Settings) -> None:
-        if not settings.newapi_base_url or not settings.newapi_api_key:
-            raise ValueError("NEWAPI_BASE_URL and NEWAPI_API_KEY are required")
+        providers = _newapi_providers_from_settings(settings)
+        if not providers:
+            raise ValueError("At least one NewAPI base URL and API key are required")
 
-        self._endpoint = _chat_completions_url(settings.newapi_base_url)
-        self._api_key = settings.newapi_api_key
-        self._model = settings.newapi_model
+        self._providers = providers
         self._timeout = settings.newapi_timeout_seconds
         self._temperature = settings.newapi_temperature
         self._max_tokens = settings.newapi_max_tokens
 
     async def judge(self, features: MessageFeatures) -> LLMJudgement | None:
-        payload = {
-            "model": self._model,
-            "messages": [
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        _feature_payload(features),
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ),
-                },
-            ],
-            "temperature": self._temperature,
-            "max_tokens": self._max_tokens,
-            "response_format": {"type": "json_object"},
-        }
+        feature_payload = _feature_payload(features)
+        for index, provider in enumerate(self._providers, start=1):
+            judgement = await self._judge_with_provider(provider, feature_payload, index)
+            if judgement is not None:
+                return judgement
+
+        logger.warning("All %s NewAPI provider(s) failed; using local fallback", len(self._providers))
+        return None
+
+    async def _judge_with_provider(
+        self,
+        provider: NewAPIProvider,
+        feature_payload: dict[str, object],
+        index: int,
+    ) -> LLMJudgement | None:
+        payload = _chat_payload(
+            model=provider.model,
+            feature_payload=feature_payload,
+            temperature=self._temperature,
+            max_tokens=self._max_tokens,
+        )
 
         try:
             response = await asyncio.wait_for(
-                asyncio.to_thread(self._post_chat_completion, payload),
+                asyncio.to_thread(self._post_chat_completion, provider, payload),
                 timeout=self._timeout + 1,
             )
         except TimeoutError:
-            logger.warning("NewAPI judgement timed out after %.1fs", self._timeout)
+            logger.warning(
+                "NewAPI provider %s timed out after %.1fs: %s",
+                index,
+                self._timeout,
+                provider.endpoint,
+            )
             return None
         except (HTTPError, URLError, OSError, ValueError, json.JSONDecodeError) as exc:
-            logger.warning("NewAPI judgement failed: %s", exc)
+            logger.warning("NewAPI provider %s failed (%s): %s", index, provider.endpoint, exc)
             return None
 
         content = _extract_message_content(response)
         if not content:
-            logger.warning("NewAPI response did not contain message content")
+            logger.warning(
+                "NewAPI provider %s returned no message content: %s",
+                index,
+                provider.endpoint,
+            )
             return None
 
         try:
             data = _loads_json_object(content)
             return _parse_judgement(data)
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            logger.warning("Failed to parse NewAPI judgement JSON: %s", exc)
+            logger.warning(
+                "NewAPI provider %s returned invalid judgement JSON (%s): %s",
+                index,
+                provider.endpoint,
+                exc,
+            )
             return None
 
-    def _post_chat_completion(self, payload: dict[str, object]) -> dict[str, object]:
+    def _post_chat_completion(
+        self,
+        provider: NewAPIProvider,
+        payload: dict[str, object],
+    ) -> dict[str, object]:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = Request(
-            self._endpoint,
+            provider.endpoint,
             data=body,
             headers={
-                "Authorization": f"Bearer {self._api_key}",
+                "Authorization": f"Bearer {provider.api_key}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
                 "User-Agent": "TelegramLLMAntiSpamBot/0.1",
@@ -158,9 +187,15 @@ def decision_from_llm(
 
 def create_llm_judge(settings: Settings) -> LLMJudge:
     if settings.has_newapi:
-        logger.info("NewAPI LLM judge enabled with model %s", settings.newapi_model)
-        return NewAPIJudge(settings)
+        providers = _newapi_providers_from_settings(settings)
+        if providers:
+            logger.info("NewAPI LLM judge enabled with %s provider(s)", len(providers))
+            return NewAPIJudge(settings)
     return NullLLMJudge()
+
+
+def newapi_provider_count(settings: Settings) -> int:
+    return len(_newapi_providers_from_settings(settings))
 
 
 def _chat_completions_url(base_url: str) -> str:
@@ -170,6 +205,79 @@ def _chat_completions_url(base_url: str) -> str:
     if normalized.endswith("/v1/"):
         return urljoin(normalized, "chat/completions")
     return urljoin(normalized, "v1/chat/completions")
+
+
+def _newapi_providers_from_settings(settings: Settings) -> tuple[NewAPIProvider, ...]:
+    base_urls = _split_config_values(settings.newapi_base_url)
+    api_keys = _split_config_values(settings.newapi_api_key)
+    models = _split_config_values(settings.newapi_model) or ("gpt-5.4",)
+    if not base_urls or not api_keys:
+        return ()
+
+    provider_count = max(len(base_urls), len(api_keys), len(models))
+    providers: list[NewAPIProvider] = []
+    for index in range(provider_count):
+        base_url = _value_at_or_single(base_urls, index)
+        api_key = _value_at_or_single(api_keys, index)
+        model = _value_at_or_single(models, index)
+        if base_url is None or api_key is None or model is None:
+            logger.warning(
+                "Skipping incomplete NewAPI provider at position %s "
+                "(base_urls=%s, api_keys=%s, models=%s)",
+                index + 1,
+                len(base_urls),
+                len(api_keys),
+                len(models),
+            )
+            continue
+        providers.append(
+            NewAPIProvider(
+                endpoint=_chat_completions_url(base_url),
+                api_key=api_key,
+                model=model,
+            )
+        )
+    return tuple(providers)
+
+
+def _split_config_values(value: str | None) -> tuple[str, ...]:
+    if not value:
+        return ()
+    return tuple(part.strip() for part in value.split(",") if part.strip())
+
+
+def _value_at_or_single(values: tuple[str, ...], index: int) -> str | None:
+    if len(values) == 1:
+        return values[0]
+    if index < len(values):
+        return values[index]
+    return None
+
+
+def _chat_payload(
+    *,
+    model: str,
+    feature_payload: dict[str, object],
+    temperature: float,
+    max_tokens: int,
+) -> dict[str, object]:
+    return {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    feature_payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            },
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+    }
 
 
 def _feature_payload(features: MessageFeatures) -> dict[str, object]:
