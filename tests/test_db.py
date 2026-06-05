@@ -147,6 +147,23 @@ def test_recent_skeleton_senders_counts_distinct_users(tmp_path):
         db.close()
 
 
+def test_allowed_chat_can_come_from_env_or_database(tmp_path):
+    db = _db(tmp_path)
+    try:
+        assert db.is_chat_allowed(-1001, (-1001,)) is True
+        assert db.is_chat_allowed(-1002, ()) is False
+
+        db.allow_chat(-1002, "Allowed", added_by_user_id=42)
+
+        assert db.is_chat_allowed(-1002, ()) is True
+
+        db.disallow_chat(-1002)
+
+        assert db.is_chat_allowed(-1002, ()) is False
+    finally:
+        db.close()
+
+
 def test_llm_spam_feedback_creates_medium_weight_fingerprints(tmp_path):
     db = _db(tmp_path)
     settings = _settings()

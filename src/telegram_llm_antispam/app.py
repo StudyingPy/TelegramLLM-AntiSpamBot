@@ -7,6 +7,7 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.types import BotCommand
 
 from .actions import ModerationActions
 from .config import Settings
@@ -36,6 +37,15 @@ async def run() -> None:
     )
     dispatcher = Dispatcher()
     dispatcher.include_router(create_router(settings, db, llm=create_llm_judge(settings)))
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="显示帮助"),
+            BotCommand(command="help", description="显示帮助"),
+            BotCommand(command="status", description="查看机器人状态"),
+            BotCommand(command="allow_chat", description="允许当前群组使用机器人"),
+            BotCommand(command="deny_chat", description="禁用当前群组"),
+        ]
+    )
     vote_sweeper = asyncio.create_task(
         _sweep_expired_votes(settings, bot, ModerationActions(settings, db))
     )

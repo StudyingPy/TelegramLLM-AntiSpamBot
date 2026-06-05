@@ -3,15 +3,18 @@ from __future__ import annotations
 import logging
 
 from aiogram import F, Router
+from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
 from .actions import ModerationActions
+from .admin import can_manage_chat, is_chat_allowed, is_global_admin
 from .config import Settings
 from .db import Database
 from .feedback import fingerprint_lookup_values, record_llm_spam_feedback
 from .features import build_message_features
 from .llm import LLMJudge, NullLLMJudge, decision_from_llm
 from .models import DecisionAction, LLMJudgement, LocalDecision, MessageFeatures
+from .notifications import notify_admins
 from .og import fetch_og_for_features, should_fetch_og
 from .profile import get_sender_profile
 from .rules import RuleEngine
@@ -26,13 +29,102 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
     llm_judge = llm or NullLLMJudge()
     actions = ModerationActions(settings, db)
 
+    @router.message(Command("start", "help"))
+    async def on_help(message: Message) -> None:
+        await message.answer(
+            "Telegram 反广告机器人已运行。\n"
+            "/status 查看状态\n"
+            "/allow_chat 允许当前群组使用机器人\n"
+            "/deny_chat 禁用当前群组"
+        )
+
+    @router.message(Command("status"))
+    async def on_status(message: Message) -> None:
+        if _chat_type(message) in {"group", "supergroup"}:
+            allowed = is_chat_allowed(settings, db, message.chat.id)
+            can_manage = await can_manage_chat(
+                message.bot,
+                settings,
+                message.chat.id,
+                message.from_user.id if message.from_user else None,
+            )
+            if not can_manage:
+                await message.answer("只有群管理员可以查看此状态。")
+                return
+            await message.answer(
+                f"群组：<code>{message.chat.id}</code>\n"
+                f"允许使用：{'是' if allowed else '否'}\n"
+                f"需要 allow：{'是' if settings.require_allowed_chat else '否'}"
+            )
+            return
+
+        user_id = message.from_user.id if message.from_user else None
+        await message.answer(
+            f"全局管理员：{'是' if is_global_admin(settings, user_id) else '否'}\n"
+            f"通知接收者：{', '.join(str(item) for item in settings.notify_user_ids) or '-'}"
+        )
+
+    @router.message(Command("allow_chat"))
+    async def on_allow_chat(message: Message) -> None:
+        if _chat_type(message) in {"group", "supergroup"}:
+            user_id = message.from_user.id if message.from_user else None
+            if not await can_manage_chat(message.bot, settings, message.chat.id, user_id):
+                await message.answer("只有群管理员可以允许当前群组。")
+                return
+            db.allow_chat(message.chat.id, message.chat.title, user_id)
+            await message.answer(f"已允许当前群组使用机器人：<code>{message.chat.id}</code>")
+            return
+
+        if not is_global_admin(settings, message.from_user.id if message.from_user else None):
+            await message.answer("只有全局管理员可以在私聊中管理 allowlist。")
+            return
+        args = (message.text or "").split(maxsplit=1)
+        if len(args) != 2:
+            await message.answer("用法：/allow_chat -1001234567890")
+            return
+        chat_id = _parse_chat_id(args[1])
+        if chat_id is None:
+            await message.answer("群组 ID 必须是数字，例如：/allow_chat -1001234567890")
+            return
+        db.allow_chat(chat_id, None, message.from_user.id if message.from_user else None)
+        await message.answer(f"已允许群组：<code>{chat_id}</code>")
+
+    @router.message(Command("deny_chat"))
+    async def on_deny_chat(message: Message) -> None:
+        if _chat_type(message) in {"group", "supergroup"}:
+            user_id = message.from_user.id if message.from_user else None
+            if not await can_manage_chat(message.bot, settings, message.chat.id, user_id):
+                await message.answer("只有群管理员可以禁用当前群组。")
+                return
+            db.disallow_chat(message.chat.id)
+            await message.answer(f"已禁用当前群组：<code>{message.chat.id}</code>")
+            return
+
+        if not is_global_admin(settings, message.from_user.id if message.from_user else None):
+            await message.answer("只有全局管理员可以在私聊中管理 allowlist。")
+            return
+        args = (message.text or "").split(maxsplit=1)
+        if len(args) != 2:
+            await message.answer("用法：/deny_chat -1001234567890")
+            return
+        chat_id = _parse_chat_id(args[1])
+        if chat_id is None:
+            await message.answer("群组 ID 必须是数字，例如：/deny_chat -1001234567890")
+            return
+        db.disallow_chat(chat_id)
+        await message.answer(f"已禁用群组：<code>{chat_id}</code>")
+
     @router.message()
     async def on_message(message: Message) -> None:
         if not message.from_user or message.from_user.is_bot:
             return
 
-        chat_type = getattr(message.chat.type, "value", str(message.chat.type))
+        chat_type = _chat_type(message)
         if chat_type not in {"group", "supergroup"}:
+            return
+        if (message.text or "").strip().startswith("/"):
+            return
+        if not is_chat_allowed(settings, db, message.chat.id):
             return
 
         user_context = db.get_user_context(message.chat.id, message.from_user.id)
@@ -65,9 +157,10 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
                 record_llm_spam_feedback(db, features, judgement, settings)
                 decision = _merge_llm_decision(decision, judgement, features, settings)
 
-        await actions.apply(message, features, decision)
+        result = await actions.apply(message, features, decision)
         db.record_message_seen(features)
         db.record_observation(features)
+        await notify_admins(message.bot, settings, features, decision, result)
 
     @router.callback_query(F.data.startswith("vote:"))
     async def on_vote(callback: CallbackQuery) -> None:
@@ -98,7 +191,46 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
         if not closed:
             await actions.render_vote_result(callback.message, tally)
 
+    @router.callback_query(F.data.startswith("admin_ban:"))
+    async def on_admin_ban(callback: CallbackQuery) -> None:
+        if not callback.data or not callback.from_user:
+            return
+
+        try:
+            _, session_id_raw = callback.data.split(":", 1)
+            session_id = int(session_id_raw)
+        except ValueError:
+            await callback.answer("操作数据无效", show_alert=False)
+            return
+
+        session = db.get_vote_session(session_id)
+        if session is None:
+            await callback.answer("投票不存在", show_alert=False)
+            return
+        if not await can_manage_chat(callback.bot, settings, session.chat_id, callback.from_user.id):
+            await callback.answer("只有管理员可以跳过投票封禁", show_alert=True)
+            return
+
+        ok, text = await actions.admin_ban_vote_session(callback.bot, session_id, callback.from_user.id)
+        await callback.answer(text, show_alert=not ok)
+        if callback.message is not None and ok:
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+
     return router
+
+
+def _chat_type(message: Message) -> str:
+    return str(getattr(message.chat.type, "value", message.chat.type))
+
+
+def _parse_chat_id(value: str) -> int | None:
+    try:
+        return int(value.strip())
+    except ValueError:
+        return None
 
 
 def _repeat_decision(

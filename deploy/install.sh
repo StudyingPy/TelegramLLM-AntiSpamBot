@@ -196,12 +196,17 @@ write_env_file() {
 
   log "Generating $ENV_FILE"
   local telegram_token database_path whitelist_domains log_level
+  local admin_user_ids admin_notify_user_ids allowed_chat_ids require_allowed_chat
   local vote_min vote_timeout vote_sweep
   local enable_newapi newapi_base newapi_key newapi_model newapi_timeout
   local enable_og enable_profile_bio
 
   telegram_token="$(prompt_required_secret "Telegram bot token")"
   database_path="$(sanitize_env "$(prompt "SQLite database path" "data/bot.db")")"
+  admin_user_ids="$(sanitize_env "$(prompt "Admin user IDs, comma-separated" "")")"
+  admin_notify_user_ids="$(sanitize_env "$(prompt "Admin notify user IDs, comma-separated (empty = admin IDs)" "")")"
+  allowed_chat_ids="$(sanitize_env "$(prompt "Allowed group chat IDs, comma-separated" "")")"
+  require_allowed_chat="$(prompt_bool "Require /allow_chat before moderating groups?" "true")"
   whitelist_domains="$(sanitize_env "$(prompt "Whitelist domains, comma-separated" "")")"
   log_level="$(sanitize_env "$(prompt "Log level" "INFO")")"
   vote_min="$(sanitize_env "$(prompt "Vote minimum confirmations" "3")")"
@@ -228,6 +233,10 @@ write_env_file() {
 TELEGRAM_BOT_TOKEN=$telegram_token
 DATABASE_PATH=$database_path
 LOG_LEVEL=$log_level
+ADMIN_USER_IDS=$admin_user_ids
+ADMIN_NOTIFY_USER_IDS=$admin_notify_user_ids
+ALLOWED_CHAT_IDS=$allowed_chat_ids
+REQUIRE_ALLOWED_CHAT=$require_allowed_chat
 WHITELIST_DOMAINS=$whitelist_domains
 
 VOTE_MIN_CONFIRMATIONS=$vote_min

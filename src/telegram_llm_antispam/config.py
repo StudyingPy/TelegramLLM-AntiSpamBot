@@ -46,11 +46,24 @@ def _env_list(name: str) -> tuple[str, ...]:
     return tuple(part.strip().lower() for part in value.split(",") if part.strip())
 
 
+def _env_int_tuple(name: str) -> tuple[int, ...]:
+    values: list[int] = []
+    for item in os.getenv(name, "").split(","):
+        item = item.strip()
+        if item:
+            values.append(int(item))
+    return tuple(values)
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     bot_token: str | None
     database_path: Path
     log_level: str
+    admin_user_ids: tuple[int, ...]
+    admin_notify_user_ids: tuple[int, ...]
+    allowed_chat_ids: tuple[int, ...]
+    require_allowed_chat: bool
     whitelist_domains: tuple[str, ...]
 
     vote_min_confirmations: int
@@ -98,6 +111,10 @@ class Settings:
     def has_newapi(self) -> bool:
         return bool(self.newapi_base_url and self.newapi_api_key and self.newapi_model)
 
+    @property
+    def notify_user_ids(self) -> tuple[int, ...]:
+        return self.admin_notify_user_ids or self.admin_user_ids
+
     @classmethod
     def from_env(cls, env_file: Path | str = ".env") -> "Settings":
         _load_env_file(Path(env_file))
@@ -105,6 +122,10 @@ class Settings:
             bot_token=os.getenv("TELEGRAM_BOT_TOKEN") or None,
             database_path=Path(os.getenv("DATABASE_PATH", "data/bot.db")),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
+            admin_user_ids=_env_int_tuple("ADMIN_USER_IDS"),
+            admin_notify_user_ids=_env_int_tuple("ADMIN_NOTIFY_USER_IDS"),
+            allowed_chat_ids=_env_int_tuple("ALLOWED_CHAT_IDS"),
+            require_allowed_chat=_env_bool("REQUIRE_ALLOWED_CHAT", True),
             whitelist_domains=_env_list("WHITELIST_DOMAINS"),
             vote_min_confirmations=_env_int("VOTE_MIN_CONFIRMATIONS", 3),
             vote_timeout_seconds=_env_int("VOTE_TIMEOUT_SECONDS", 1800),

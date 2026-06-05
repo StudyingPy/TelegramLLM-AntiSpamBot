@@ -110,6 +110,15 @@ class LocalDecision:
 
 
 @dataclass(frozen=True, slots=True)
+class ActionResult:
+    action_log_id: int | None = None
+    vote_session_id: int | None = None
+    deleted: bool | None = None
+    banned: bool | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class LLMJudgement:
     is_spam: bool
     confidence: float

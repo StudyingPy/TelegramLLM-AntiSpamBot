@@ -28,6 +28,10 @@ def main() -> None:
     if args.command == "show-config":
         print(f"DATABASE_PATH={settings.database_path}")
         print(f"LOG_LEVEL={settings.log_level}")
+        print(f"ADMIN_USER_IDS={','.join(str(item) for item in settings.admin_user_ids)}")
+        print(f"ADMIN_NOTIFY_USER_IDS={','.join(str(item) for item in settings.admin_notify_user_ids)}")
+        print(f"ALLOWED_CHAT_IDS={','.join(str(item) for item in settings.allowed_chat_ids)}")
+        print(f"REQUIRE_ALLOWED_CHAT={settings.require_allowed_chat}")
         print(f"WHITELIST_DOMAINS={','.join(settings.whitelist_domains)}")
         print(f"VOTE_MIN_CONFIRMATIONS={settings.vote_min_confirmations}")
         print(f"VOTE_TIMEOUT_SECONDS={settings.vote_timeout_seconds}")

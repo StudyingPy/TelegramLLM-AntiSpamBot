@@ -48,6 +48,13 @@ CREATE TABLE IF NOT EXISTS user_profiles (
     updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS allowed_chats (
+    chat_id INTEGER PRIMARY KEY,
+    title TEXT,
+    added_by_user_id INTEGER,
+    added_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS fingerprints (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     fingerprint_type TEXT NOT NULL,
@@ -114,6 +121,7 @@ CREATE TABLE IF NOT EXISTS message_observations (
 CREATE INDEX IF NOT EXISTS idx_fingerprints_value ON fingerprints(value);
 CREATE INDEX IF NOT EXISTS idx_fingerprints_type_value ON fingerprints(fingerprint_type, value);
 CREATE INDEX IF NOT EXISTS idx_user_profiles_updated_at ON user_profiles(updated_at);
+CREATE INDEX IF NOT EXISTS idx_allowed_chats_added_at ON allowed_chats(added_at);
 CREATE INDEX IF NOT EXISTS idx_vote_sessions_status ON vote_sessions(status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_observations_skeleton_time
     ON message_observations(skeleton_hash, created_at);
@@ -146,6 +154,36 @@ class Database:
         with self._locked_conn() as conn:
             conn.executescript(SCHEMA_SQL)
             conn.commit()
+
+    def allow_chat(self, chat_id: int, title: str | None, added_by_user_id: int | None) -> None:
+        with self._locked_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO allowed_chats (chat_id, title, added_by_user_id, added_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    title = excluded.title,
+                    added_by_user_id = excluded.added_by_user_id,
+                    added_at = excluded.added_at
+                """,
+                (chat_id, title, added_by_user_id, _now()),
+            )
+            conn.commit()
+
+    def disallow_chat(self, chat_id: int) -> None:
+        with self._locked_conn() as conn:
+            conn.execute("DELETE FROM allowed_chats WHERE chat_id = ?", (chat_id,))
+            conn.commit()
+
+    def is_chat_allowed(self, chat_id: int, configured_chat_ids: tuple[int, ...]) -> bool:
+        if chat_id in configured_chat_ids:
+            return True
+        with self._locked_conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM allowed_chats WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+        return row is not None
 
     def get_user_profile(self, user_id: int) -> SenderProfile | None:
         with self._locked_conn() as conn:
@@ -444,13 +482,13 @@ class Database:
         features: MessageFeatures,
         decision: LocalDecision,
         metadata: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> int:
         payload = dict(decision.metadata)
         if metadata:
             payload.update(metadata)
 
         with self._locked_conn() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 INSERT INTO action_log (
                     chat_id, message_id, user_id, action, reason, confidence,
@@ -470,6 +508,7 @@ class Database:
                 ),
             )
             conn.commit()
+            return int(cursor.lastrowid)
 
     def create_vote_session(
         self,
@@ -663,14 +702,14 @@ class Database:
         reason: str,
         confidence: float = 0.0,
         metadata: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> int | None:
         with self._locked_conn() as conn:
             row = conn.execute(
                 "SELECT * FROM vote_sessions WHERE id = ?",
                 (session_id,),
             ).fetchone()
             if row is None:
-                return
+                return None
 
             payload = {
                 "vote_session_id": row["id"],
@@ -682,7 +721,7 @@ class Database:
             if metadata:
                 payload.update(metadata)
 
-            conn.execute(
+            cursor = conn.execute(
                 """
                 INSERT INTO action_log (
                     chat_id, message_id, user_id, action, reason, confidence,
@@ -702,6 +741,7 @@ class Database:
                 ),
             )
             conn.commit()
+            return int(cursor.lastrowid)
 
     def adjust_reputation(self, chat_id: int, user_id: int, delta: float) -> None:
         now = _now()

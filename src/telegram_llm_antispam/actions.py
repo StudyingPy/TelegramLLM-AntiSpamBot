@@ -10,7 +10,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from .config import Settings
 from .db import Database
 from .feedback import record_vote_ham_feedback, record_vote_spam_feedback
-from .models import DecisionAction, LocalDecision, MessageFeatures, VoteSession, VoteTally
+from .models import ActionResult, DecisionAction, LocalDecision, MessageFeatures, VoteSession, VoteTally
 from .permissions import check_permissions
 
 
@@ -22,19 +22,24 @@ class ModerationActions:
         self._settings = settings
         self._db = db
 
-    async def apply(self, message: Message, features: MessageFeatures, decision: LocalDecision) -> None:
+    async def apply(
+        self,
+        message: Message,
+        features: MessageFeatures,
+        decision: LocalDecision,
+    ) -> ActionResult:
         if decision.action in {DecisionAction.ALLOW, DecisionAction.REVIEW}:
-            self._db.record_action(features, decision)
-            return
+            action_log_id = self._db.record_action(features, decision)
+            return ActionResult(action_log_id=action_log_id)
 
         permissions = await check_permissions(message.bot, features.chat_id, features.user_id)
         if decision.action == DecisionAction.WITHDRAW_VOTE:
-            await self._withdraw_and_vote(message, features, decision, permissions)
-            return
+            return await self._withdraw_and_vote(message, features, decision, permissions)
 
         if decision.action == DecisionAction.BAN:
-            await self._ban(message, features, decision, permissions)
-            return
+            return await self._ban(message, features, decision, permissions)
+
+        return ActionResult(error="unknown_action")
 
     async def render_vote_result(self, callback_message: Message, tally: VoteTally) -> None:
         text = (
@@ -112,18 +117,85 @@ class ModerationActions:
             await self._edit_expired_vote_message(bot, session)
         return len(sessions)
 
+    async def admin_ban_vote_session(
+        self,
+        bot: Any,
+        session_id: int,
+        moderator_user_id: int,
+    ) -> tuple[bool, str]:
+        session = self._db.get_vote_session(session_id)
+        if session is None:
+            return False, "投票会话不存在"
+        if session.status != "open":
+            return False, "投票已经结束"
+        if session.suspect_user_id is None:
+            return False, "没有可封禁的用户"
+
+        permissions = await check_permissions(bot, session.chat_id, session.suspect_user_id)
+        metadata: dict[str, Any] = {"moderator_user_id": moderator_user_id}
+        if not (permissions.can_restrict and permissions.target_is_restrictable):
+            metadata["banned"] = False
+            metadata["ban_error"] = permissions.reason or "missing_restrict_permission"
+            self._db.record_vote_session_action(
+                session.id,
+                action="admin_ban_failed",
+                reason="admin_skip_vote_ban_failed",
+                confidence=1.0,
+                metadata=metadata,
+            )
+            return False, "Bot 没有封禁权限，或目标不可封禁"
+
+        try:
+            await bot.ban_chat_member(session.chat_id, session.suspect_user_id)
+            metadata["banned"] = True
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
+            metadata["banned"] = False
+            metadata["ban_error"] = str(exc)
+            self._db.record_vote_session_action(
+                session.id,
+                action="admin_ban_failed",
+                reason="admin_skip_vote_ban_failed",
+                confidence=1.0,
+                metadata=metadata,
+            )
+            return False, f"封禁失败：{exc}"
+
+        self._db.close_vote_session(session.id, "admin_banned")
+        closed_session = self._db.get_vote_session(session.id)
+        if closed_session is not None:
+            record_vote_spam_feedback(self._db, closed_session, self._settings)
+        self._db.adjust_reputation(
+            session.chat_id,
+            session.suspect_user_id,
+            -self._settings.spam_reputation_penalty,
+        )
+        self._db.record_vote_session_action(
+            session.id,
+            action="admin_banned_user",
+            reason="admin_skip_vote_ban",
+            confidence=1.0,
+            metadata=metadata,
+        )
+        await self._edit_vote_message_text(
+            bot,
+            session,
+            f"管理员已跳过投票并封禁用户。广告 {session.spam_votes} / 放行 {session.ham_votes}",
+        )
+        return True, "已封禁"
+
     async def _withdraw_and_vote(
         self,
         message: Message,
         features: MessageFeatures,
         decision: LocalDecision,
         permissions: Any,
-    ) -> None:
+    ) -> ActionResult:
         metadata: dict[str, Any] = {
             "text_snapshot": features.text[:500],
             "links": [link.url for link in features.links],
         }
 
+        deleted = False
         if permissions.can_delete:
             deleted, error = await self._delete_message(message)
             metadata["deleted"] = deleted
@@ -143,7 +215,12 @@ class ModerationActions:
             reply_markup=self._vote_keyboard(session_id),
         )
         self._db.set_vote_message_id(session_id, vote_message.message_id)
-        self._db.record_action(features, decision, metadata)
+        action_log_id = self._db.record_action(features, decision, metadata)
+        return ActionResult(
+            action_log_id=action_log_id,
+            vote_session_id=session_id,
+            deleted=deleted,
+        )
 
     async def _ban(
         self,
@@ -151,12 +228,13 @@ class ModerationActions:
         features: MessageFeatures,
         decision: LocalDecision,
         permissions: Any,
-    ) -> None:
+    ) -> ActionResult:
         metadata: dict[str, Any] = {
             "text_snapshot": features.text[:500],
             "links": [link.url for link in features.links],
         }
 
+        deleted = False
         if permissions.can_delete:
             deleted, error = await self._delete_message(message)
             metadata["deleted"] = deleted
@@ -178,7 +256,13 @@ class ModerationActions:
             metadata["banned"] = False
             metadata["ban_error"] = permissions.reason or "missing_restrict_permission"
 
-        self._db.record_action(features, decision, metadata)
+        action_log_id = self._db.record_action(features, decision, metadata)
+        return ActionResult(
+            action_log_id=action_log_id,
+            deleted=deleted,
+            banned=bool(metadata["banned"]),
+            error=metadata.get("ban_error"),
+        )
 
     async def _delete_message(self, message: Message) -> tuple[bool, str | None]:
         try:
@@ -196,13 +280,18 @@ class ModerationActions:
             f"广告 {session.spam_votes} / 放行 {session.ham_votes}"
         )
         try:
-            await bot.edit_message_text(
-                text=text,
-                chat_id=session.chat_id,
-                message_id=session.vote_message_id,
-            )
+            await self._edit_vote_message_text(bot, session, text)
         except TelegramAPIError as exc:  # pragma: no cover - depends on Telegram API state.
             logger.warning("Failed to edit expired vote message %s: %s", session.id, exc)
+
+    async def _edit_vote_message_text(self, bot: Any, session: VoteSession, text: str) -> None:
+        if session.vote_message_id is None:
+            return
+        await bot.edit_message_text(
+            text=text,
+            chat_id=session.chat_id,
+            message_id=session.vote_message_id,
+        )
 
     async def _safe_edit_message(self, message: Message, text: str) -> None:
         try:
@@ -230,6 +319,10 @@ class ModerationActions:
                     InlineKeyboardButton(
                         text="放行",
                         callback_data=f"vote:{session_id}:ham",
+                    ),
+                    InlineKeyboardButton(
+                        text="管理员封禁",
+                        callback_data=f"admin_ban:{session_id}",
                     ),
                 ]
             ]

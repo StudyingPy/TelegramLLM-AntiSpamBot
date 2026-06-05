@@ -21,3 +21,12 @@ def test_secret_prompts_keep_formatting_out_of_stdout():
     assert "printf 'Value is required.\\n' >&2" in script
     assert "telegram_token=\"$(prompt_required_secret" in script
     assert "newapi_key=\"$(prompt_secret" in script
+
+
+def test_deploy_script_prompts_for_admin_and_allowlist_config():
+    script = Path("deploy/install.sh").read_text(encoding="utf-8")
+
+    assert "Admin user IDs, comma-separated" in script
+    assert "Admin notify user IDs, comma-separated" in script
+    assert "Allowed group chat IDs, comma-separated" in script
+    assert "REQUIRE_ALLOWED_CHAT=$require_allowed_chat" in script
