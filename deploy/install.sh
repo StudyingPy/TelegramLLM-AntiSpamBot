@@ -45,10 +45,10 @@ prompt_required_secret() {
   local value=""
   while [[ -z "$value" ]]; do
     read -r -s -p "$name: " value
-    printf '\n'
+    printf '\n' >&2
     value="$(sanitize_env "$value")"
     if [[ -z "$value" ]]; then
-      printf 'Value is required.\n'
+      printf 'Value is required.\n' >&2
     fi
   done
   printf '%s' "$value"
@@ -58,7 +58,7 @@ prompt_secret() {
   local name="$1"
   local value
   read -r -s -p "$name (leave empty to disable): " value
-  printf '\n'
+  printf '\n' >&2
   sanitize_env "$value"
 }
 
