@@ -119,6 +119,18 @@ class ActionResult:
 
 
 @dataclass(frozen=True, slots=True)
+class AdminNotification:
+    id: int
+    vote_session_id: int | None
+    action_log_id: int | None
+    notify_user_id: int
+    message_id: int
+    base_text: str
+    created_at: int
+    updated_at: int
+
+
+@dataclass(frozen=True, slots=True)
 class LLMJudgement:
     is_spam: bool
     confidence: float
@@ -136,6 +148,14 @@ class VoteTally:
     ham_votes: int
     status: str
     changed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class VoteRecord:
+    voter_user_id: int
+    vote: str
+    created_at: int
+    updated_at: int
 
 
 @dataclass(frozen=True, slots=True)

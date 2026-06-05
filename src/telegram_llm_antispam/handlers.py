@@ -122,6 +122,13 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
 
     @router.message()
     async def on_message(message: Message) -> None:
+        await _process_group_message(message, is_edit=False)
+
+    @router.edited_message()
+    async def on_edited_message(message: Message) -> None:
+        await _process_group_message(message, is_edit=True)
+
+    async def _process_group_message(message: Message, *, is_edit: bool) -> None:
         if not message.from_user or message.from_user.is_bot:
             return
 
@@ -141,6 +148,7 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
             sender_profile=sender_profile,
             default_reputation=settings.default_reputation,
         )
+        features.metadata["update_type"] = "edited_message" if is_edit else "message"
         if should_fetch_og(features, settings):
             og_preview = await fetch_og_for_features(features, settings)
             if og_preview is not None:
@@ -164,9 +172,10 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
                 decision = _merge_llm_decision(decision, judgement, features, settings)
 
         result = await actions.apply(message, features, decision)
-        db.record_message_seen(features)
+        if not is_edit:
+            db.record_message_seen(features)
         db.record_observation(features)
-        await notify_admins(message.bot, settings, features, decision, result)
+        await notify_admins(message.bot, db, settings, features, decision, result)
 
     @router.callback_query(F.data.startswith("vote:"))
     async def on_vote(callback: CallbackQuery) -> None:
@@ -362,7 +371,7 @@ def _repeat_decision(
 ) -> LocalDecision | None:
     if not features.links:
         return None
-    if not (features.is_first_message or features.sender_reputation <= settings.low_reputation_threshold):
+    if features.sender_reputation >= settings.high_reputation_threshold:
         return None
 
     prior_senders = db.count_recent_skeleton_senders(

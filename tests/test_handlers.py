@@ -8,6 +8,7 @@ from telegram_llm_antispam.handlers import (
     _admin_verify_keyboard,
     _apply_verified_admin_action,
     _is_anonymous_admin_message,
+    create_router,
 )
 from test_llm import _settings
 
@@ -71,5 +72,15 @@ def test_verified_admin_allow_and_deny_actions_update_allowlist(tmp_path):
 
         assert "已禁用当前群组" in denied_text
         assert db.is_chat_allowed(-100123, ()) is False
+    finally:
+        db.close()
+
+
+def test_router_registers_edited_message_moderation_handler(tmp_path):
+    db = _db(tmp_path)
+    try:
+        router = create_router(_settings(), db)
+
+        assert len(router.edited_message.handlers) == 1
     finally:
         db.close()

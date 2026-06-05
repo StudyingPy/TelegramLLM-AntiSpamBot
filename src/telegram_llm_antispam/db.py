@@ -9,11 +9,13 @@ from typing import Any
 
 from .config import Settings
 from .models import (
+    AdminNotification,
     FingerprintRecord,
     LocalDecision,
     MessageFeatures,
     SenderProfile,
     UserContext,
+    VoteRecord,
     VoteSession,
     VoteTally,
 )
@@ -106,6 +108,17 @@ CREATE TABLE IF NOT EXISTS action_log (
     created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS admin_notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    vote_session_id INTEGER,
+    action_log_id INTEGER,
+    notify_user_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    base_text TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS message_observations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id INTEGER NOT NULL,
@@ -123,6 +136,8 @@ CREATE INDEX IF NOT EXISTS idx_fingerprints_type_value ON fingerprints(fingerpri
 CREATE INDEX IF NOT EXISTS idx_user_profiles_updated_at ON user_profiles(updated_at);
 CREATE INDEX IF NOT EXISTS idx_allowed_chats_added_at ON allowed_chats(added_at);
 CREATE INDEX IF NOT EXISTS idx_vote_sessions_status ON vote_sessions(status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_admin_notifications_vote_session
+    ON admin_notifications(vote_session_id);
 CREATE INDEX IF NOT EXISTS idx_observations_skeleton_time
     ON message_observations(skeleton_hash, created_at);
 """
@@ -643,6 +658,29 @@ class Database:
             changed=changed,
         )
 
+    def list_vote_records(self, session_id: int, limit: int = 20) -> tuple[VoteRecord, ...]:
+        with self._locked_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT voter_user_id, vote, created_at, updated_at
+                FROM vote_session_votes
+                WHERE session_id = ?
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT ?
+                """,
+                (session_id, limit),
+            ).fetchall()
+
+        return tuple(
+            VoteRecord(
+                voter_user_id=row["voter_user_id"],
+                vote=row["vote"],
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
+            for row in rows
+        )
+
     def close_vote_session(self, session_id: int, status: str) -> None:
         with self._locked_conn() as conn:
             conn.execute(
@@ -743,6 +781,61 @@ class Database:
             conn.commit()
             return int(cursor.lastrowid)
 
+    def record_admin_notification(
+        self,
+        *,
+        vote_session_id: int | None,
+        action_log_id: int | None,
+        notify_user_id: int,
+        message_id: int,
+        base_text: str,
+    ) -> int:
+        now = _now()
+        with self._locked_conn() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO admin_notifications (
+                    vote_session_id, action_log_id, notify_user_id, message_id,
+                    base_text, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    vote_session_id,
+                    action_log_id,
+                    notify_user_id,
+                    message_id,
+                    base_text,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+            return int(cursor.lastrowid)
+
+    def list_admin_notifications(self, vote_session_id: int) -> tuple[AdminNotification, ...]:
+        with self._locked_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, vote_session_id, action_log_id, notify_user_id, message_id,
+                    base_text, created_at, updated_at
+                FROM admin_notifications
+                WHERE vote_session_id = ?
+                ORDER BY id ASC
+                """,
+                (vote_session_id,),
+            ).fetchall()
+
+        return tuple(_admin_notification_from_row(row) for row in rows)
+
+    def touch_admin_notification(self, notification_id: int) -> None:
+        with self._locked_conn() as conn:
+            conn.execute(
+                "UPDATE admin_notifications SET updated_at = ? WHERE id = ?",
+                (_now(), notification_id),
+            )
+            conn.commit()
+
     def adjust_reputation(self, chat_id: int, user_id: int, delta: float) -> None:
         now = _now()
         with self._locked_conn() as conn:
@@ -810,6 +903,19 @@ def _vote_session_from_row(
         created_at=row["created_at"],
         expires_at=row["expires_at"],
         closed_at=closed_at if closed_at is not None else row["closed_at"],
+    )
+
+
+def _admin_notification_from_row(row: sqlite3.Row) -> AdminNotification:
+    return AdminNotification(
+        id=row["id"],
+        vote_session_id=row["vote_session_id"],
+        action_log_id=row["action_log_id"],
+        notify_user_id=row["notify_user_id"],
+        message_id=row["message_id"],
+        base_text=row["base_text"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
     )
 
 

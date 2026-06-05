@@ -87,13 +87,13 @@ def test_punctuation_preview_goes_to_withdraw_vote():
     assert decision.should_call_llm is True
 
 
-def test_first_message_external_link_goes_to_withdraw_vote():
+def test_external_link_goes_to_llm_review_without_first_message_signal():
     decision = RuleEngine(_settings()).evaluate(
         _features("hello https://spam.example/a"),
     )
 
-    assert decision.action == DecisionAction.WITHDRAW_VOTE
-    assert decision.reason == "first_message_with_external_link"
+    assert decision.action == DecisionAction.REVIEW
+    assert decision.reason == "link_message_needs_llm"
     assert decision.should_call_llm is True
 
 
@@ -103,6 +103,7 @@ def test_first_message_whitelisted_link_goes_to_llm_review():
     )
 
     assert decision.action == DecisionAction.REVIEW
+    assert decision.reason == "link_message_needs_llm"
     assert decision.should_call_llm is True
 
 

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import string
 from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
@@ -115,10 +116,17 @@ def decision_from_llm(
         )
 
     low_rep = features.sender_reputation <= settings.reputation_ban_threshold
-    if judgement.confidence >= settings.llm_ban_threshold and low_rep:
+    should_ban = judgement.confidence >= settings.llm_ban_threshold and (
+        low_rep or _has_immediate_ban_context(judgement, features, settings)
+    )
+    if should_ban:
         return LocalDecision(
             action=DecisionAction.BAN,
-            reason="llm_spam_high_confidence_low_reputation",
+            reason=(
+                "llm_spam_high_confidence_low_reputation"
+                if low_rep
+                else "llm_spam_high_confidence_profile_and_content"
+            ),
             confidence=judgement.confidence,
             should_call_llm=False,
             metadata={
@@ -173,7 +181,6 @@ def _feature_payload(features: MessageFeatures) -> dict[str, object]:
         "skeleton_hash": features.skeleton_hash,
         "content_hash": features.content_hash,
         "sender_reputation": features.sender_reputation,
-        "is_first_message": features.is_first_message,
         "mention_count": features.mention_count,
         "is_empty_or_punctuation": features.is_empty_or_punctuation,
         "has_preview_url": features.has_preview_url,
@@ -260,12 +267,96 @@ def _parse_judgement(data: dict[str, object]) -> LLMJudgement:
     )
 
 
+def _has_immediate_ban_context(
+    judgement: LLMJudgement,
+    features: MessageFeatures,
+    settings: Settings,
+) -> bool:
+    if features.sender_reputation >= settings.high_reputation_threshold:
+        return False
+    if judgement.confidence < max(settings.llm_ban_threshold, 0.95):
+        return False
+    if not _has_strong_content_signal(judgement, features):
+        return False
+    return _has_suspicious_profile_signal(features)
+
+
+def _has_strong_content_signal(judgement: LLMJudgement, features: MessageFeatures) -> bool:
+    category = judgement.category or ""
+    if category not in {"ads", "scam", "porn", "gambling", "crypto", "traffic_diversion"}:
+        return False
+
+    text = f"{features.clean_text} {' '.join(judgement.signal_phrases)}".lower()
+    has_contact = features.mention_count > 0 or any(
+        token in text for token in ("@", "t.me", "telegram", "私聊", "客服", "联系")
+    )
+    has_hard_signal = any(
+        token in text
+        for token in (
+            "洗钱",
+            "博彩",
+            "盘口",
+            "下注",
+            "成人",
+            "看片",
+            "裸聊",
+            "刷单",
+            "日结",
+            "小时",
+            "返利",
+            "空投",
+            "代币",
+            "赚钱",
+        )
+    )
+    return has_contact and has_hard_signal
+
+
+def _has_suspicious_profile_signal(features: MessageFeatures) -> bool:
+    profile = features.metadata.get("sender_profile")
+    if not isinstance(profile, dict):
+        return False
+
+    username = str(profile.get("username") or "")
+    display_name = str(profile.get("display_name") or "")
+    bio = str(profile.get("bio") or "")
+
+    score = 0
+    if not username:
+        score += 1
+    elif re.fullmatch(r"[a-z]{5,}\d{2,}|[a-z]+_[a-z]+_\d+", username.lower()):
+        score += 1
+    if _looks_like_generated_english_bio(bio):
+        score += 2
+    if _looks_like_generic_latin_name(display_name) and score:
+        score += 1
+    return score >= 2
+
+
+def _looks_like_generated_english_bio(value: str) -> bool:
+    stripped = value.strip()
+    if not stripped or any("\u4e00" <= char <= "\u9fff" for char in stripped):
+        return False
+    words = re.findall(r"[A-Za-z]+", stripped)
+    if not (5 <= len(words) <= 14):
+        return False
+    alpha_chars = sum(1 for char in stripped if char in string.ascii_letters)
+    if alpha_chars < max(12, len(stripped.replace(" ", "")) * 0.7):
+        return False
+    return not any(token in stripped.lower() for token in ("http", "t.me", "@", "github"))
+
+
+def _looks_like_generic_latin_name(value: str) -> bool:
+    words = re.findall(r"[A-Z][a-z]{2,}", value)
+    return len(words) == 2 and " " in value.strip()
+
+
 _SYSTEM_PROMPT = """你是 Telegram 群组反广告审核器。你的目标是判断单条消息是否为广告、诈骗、引流、拉人进群、色情/博彩推广或恶意营销。
 
 判定原则：
 - 误封真人的代价远高于漏放广告；只有证据明确时才给高置信度。
 - 正常讨论、玩笑、引用广告文案、技术链接、开源项目链接，不应判为广告。
-- 新号、首条消息、外链、预览卡、联系方式、诱导私聊、博彩/色情/返利/空投/刷单等都是信号，但不是单独定罪理由。
+- 低信誉、外链、预览卡、联系方式、诱导私聊、博彩/色情/返利/空投/刷单等都是信号，但不是单独定罪理由。
 - 用户名、昵称、bio 都是用户可控的弱信号；只能与消息内容、链接、行为信号合并判断。
 - 如果正文为空或只有标点但有 preview URL，通常更可疑。
 - 你只输出 JSON，不输出解释文本。

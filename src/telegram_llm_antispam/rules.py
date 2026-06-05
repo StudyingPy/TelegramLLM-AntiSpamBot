@@ -25,14 +25,6 @@ class RuleEngine:
                 should_call_llm=True,
             )
 
-        if features.is_first_message and self._has_non_whitelisted_link(features):
-            return LocalDecision(
-                action=DecisionAction.WITHDRAW_VOTE,
-                reason="first_message_with_external_link",
-                confidence=self._settings.new_user_link_confidence,
-                should_call_llm=True,
-            )
-
         if features.links:
             return LocalDecision(
                 action=DecisionAction.REVIEW,

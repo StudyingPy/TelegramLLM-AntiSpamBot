@@ -176,3 +176,33 @@ def test_llm_spam_high_confidence_goes_to_withdraw_vote_for_normal_reputation():
 
     assert decision.action == DecisionAction.WITHDRAW_VOTE
     assert decision.reason == "llm_spam"
+
+
+def test_llm_high_confidence_with_profile_and_content_signals_bans():
+    message = SimpleNamespace(
+        message_id=1,
+        chat=SimpleNamespace(id=-1001),
+        from_user=SimpleNamespace(id=42),
+        text="做洗钱的来 一小时两千 @mkoplcn",
+    )
+    context = UserContext(chat_id=-1001, user_id=42, reputation_score=50, messages_seen=3)
+    features = build_message_features(message, context)
+    features.metadata["sender_profile"] = {
+        "username": None,
+        "display_name": "Nicole Hernandez",
+        "bio": "Fill good skill ago happy message.",
+    }
+
+    decision = decision_from_llm(
+        LLMJudgement(
+            is_spam=True,
+            confidence=0.98,
+            category="scam",
+            signal_phrases=("做洗钱的来", "一小时两千", "@mkoplcn"),
+        ),
+        features,
+        _settings(),
+    )
+
+    assert decision.action == DecisionAction.BAN
+    assert decision.reason == "llm_spam_high_confidence_profile_and_content"

@@ -11,6 +11,7 @@ from .config import Settings
 from .db import Database
 from .feedback import record_vote_ham_feedback, record_vote_spam_feedback
 from .models import ActionResult, DecisionAction, LocalDecision, MessageFeatures, VoteSession, VoteTally
+from .notifications import update_vote_notifications, vote_status_text
 from .permissions import check_permissions
 
 
@@ -32,11 +33,11 @@ class ModerationActions:
             action_log_id = self._db.record_action(features, decision)
             return ActionResult(action_log_id=action_log_id)
 
-        permissions = await check_permissions(message.bot, features.chat_id, features.user_id)
         if decision.action == DecisionAction.WITHDRAW_VOTE:
-            return await self._withdraw_and_vote(message, features, decision, permissions)
+            return await self._withdraw_and_vote(message, features, decision)
 
         if decision.action == DecisionAction.BAN:
+            permissions = await check_permissions(message.bot, features.chat_id, features.user_id)
             return await self._ban(message, features, decision, permissions)
 
         return ActionResult(error="unknown_action")
@@ -50,6 +51,13 @@ class ModerationActions:
             await callback_message.edit_text(text, reply_markup=self._vote_keyboard(tally.session_id))
         except TelegramBadRequest:
             logger.debug("Vote message was not modified")
+        await update_vote_notifications(
+            callback_message.bot,
+            self._db,
+            tally.session_id,
+            vote_status_text(self._db, tally),
+            is_open=True,
+        )
 
     async def close_vote_if_threshold_reached(
         self,
@@ -77,6 +85,14 @@ class ModerationActions:
                 callback_message,
                 f"投票结束：确认广告。广告 {tally.spam_votes} / 放行 {tally.ham_votes}"
             )
+            if session is not None:
+                await update_vote_notifications(
+                    callback_message.bot,
+                    self._db,
+                    tally.session_id,
+                    vote_status_text(self._db, session),
+                    is_open=False,
+                )
             return True
 
         if tally.ham_votes >= self._settings.vote_min_confirmations:
@@ -100,6 +116,14 @@ class ModerationActions:
                 callback_message,
                 f"投票结束：放行。广告 {tally.spam_votes} / 放行 {tally.ham_votes}"
             )
+            if session is not None:
+                await update_vote_notifications(
+                    callback_message.bot,
+                    self._db,
+                    tally.session_id,
+                    vote_status_text(self._db, session),
+                    is_open=False,
+                )
             return True
 
         return False
@@ -115,6 +139,13 @@ class ModerationActions:
                 metadata={"expires_at": session.expires_at},
             )
             await self._edit_expired_vote_message(bot, session)
+            await update_vote_notifications(
+                bot,
+                self._db,
+                session.id,
+                vote_status_text(self._db, session),
+                is_open=False,
+            )
         return len(sessions)
 
     async def admin_ban_vote_session(
@@ -181,6 +212,14 @@ class ModerationActions:
             session,
             f"管理员已跳过投票并封禁用户。广告 {session.spam_votes} / 放行 {session.ham_votes}",
         )
+        if closed_session is not None:
+            await update_vote_notifications(
+                bot,
+                self._db,
+                session.id,
+                vote_status_text(self._db, closed_session),
+                is_open=False,
+            )
         return True, "已封禁"
 
     async def _withdraw_and_vote(
@@ -188,22 +227,12 @@ class ModerationActions:
         message: Message,
         features: MessageFeatures,
         decision: LocalDecision,
-        permissions: Any,
     ) -> ActionResult:
         metadata: dict[str, Any] = {
             "text_snapshot": features.text[:500],
             "links": [link.url for link in features.links],
+            "deleted": False,
         }
-
-        deleted = False
-        if permissions.can_delete:
-            deleted, error = await self._delete_message(message)
-            metadata["deleted"] = deleted
-            if error:
-                metadata["delete_error"] = error
-        else:
-            metadata["deleted"] = False
-            metadata["delete_error"] = permissions.reason or "missing_delete_permission"
 
         session_id = self._db.create_vote_session(
             features,
@@ -213,13 +242,15 @@ class ModerationActions:
         vote_message = await message.answer(
             self._vote_text(decision),
             reply_markup=self._vote_keyboard(session_id),
+            reply_to_message_id=message.message_id,
+            allow_sending_without_reply=True,
         )
         self._db.set_vote_message_id(session_id, vote_message.message_id)
         action_log_id = self._db.record_action(features, decision, metadata)
         return ActionResult(
             action_log_id=action_log_id,
             vote_session_id=session_id,
-            deleted=deleted,
+            deleted=False,
         )
 
     async def _ban(
@@ -303,7 +334,7 @@ class ModerationActions:
         reason = html.escape(decision.reason)
         confidence = f"{decision.confidence:.0%}"
         return (
-            "疑似广告已临时撤回，请投票确认。\n"
+            "疑似广告，请根据被回复的原消息投票确认。\n"
             f"原因：<code>{reason}</code>\n"
             f"置信度：{confidence}"
         )
