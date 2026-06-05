@@ -4,7 +4,7 @@ import logging
 
 from aiogram import F, Router
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from .actions import ModerationActions
 from .admin import can_manage_chat, is_chat_allowed, is_global_admin
@@ -21,6 +21,8 @@ from .rules import RuleEngine
 
 
 logger = logging.getLogger(__name__)
+
+ADMIN_VERIFY_ACTIONS = {"status", "allow_chat", "deny_chat"}
 
 
 def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None) -> Router:
@@ -41,7 +43,9 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
     @router.message(Command("status"))
     async def on_status(message: Message) -> None:
         if _chat_type(message) in {"group", "supergroup"}:
-            allowed = is_chat_allowed(settings, db, message.chat.id)
+            if _is_anonymous_admin_message(message):
+                await _ask_anonymous_admin_to_verify(message, "status")
+                return
             can_manage = await can_manage_chat(
                 message.bot,
                 settings,
@@ -51,11 +55,7 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
             if not can_manage:
                 await message.answer("只有群管理员可以查看此状态。")
                 return
-            await message.answer(
-                f"群组：<code>{message.chat.id}</code>\n"
-                f"允许使用：{'是' if allowed else '否'}\n"
-                f"需要 allow：{'是' if settings.require_allowed_chat else '否'}"
-            )
+            await message.answer(_group_status_text(settings, db, message.chat.id))
             return
 
         user_id = message.from_user.id if message.from_user else None
@@ -67,6 +67,9 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
     @router.message(Command("allow_chat"))
     async def on_allow_chat(message: Message) -> None:
         if _chat_type(message) in {"group", "supergroup"}:
+            if _is_anonymous_admin_message(message):
+                await _ask_anonymous_admin_to_verify(message, "allow_chat")
+                return
             user_id = message.from_user.id if message.from_user else None
             if not await can_manage_chat(message.bot, settings, message.chat.id, user_id):
                 await message.answer("只有群管理员可以允许当前群组。")
@@ -92,6 +95,9 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
     @router.message(Command("deny_chat"))
     async def on_deny_chat(message: Message) -> None:
         if _chat_type(message) in {"group", "supergroup"}:
+            if _is_anonymous_admin_message(message):
+                await _ask_anonymous_admin_to_verify(message, "deny_chat")
+                return
             user_id = message.from_user.id if message.from_user else None
             if not await can_manage_chat(message.bot, settings, message.chat.id, user_id):
                 await message.answer("只有群管理员可以禁用当前群组。")
@@ -191,6 +197,49 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
         if not closed:
             await actions.render_vote_result(callback.message, tally)
 
+    @router.callback_query(F.data.startswith("admin_verify:"))
+    async def on_admin_verify(callback: CallbackQuery) -> None:
+        if not callback.data or not callback.from_user:
+            return
+
+        try:
+            _, action, chat_id_raw = callback.data.split(":", 2)
+            chat_id = int(chat_id_raw)
+        except ValueError:
+            await callback.answer("验证数据无效", show_alert=False)
+            return
+
+        if action not in ADMIN_VERIFY_ACTIONS:
+            await callback.answer("验证操作无效", show_alert=False)
+            return
+
+        if callback.message is not None:
+            callback_chat_id = _message_chat_id(callback.message)
+            if callback_chat_id is not None and callback_chat_id != chat_id:
+                await callback.answer("验证来源不匹配", show_alert=True)
+                return
+
+        if not await can_manage_chat(callback.bot, settings, chat_id, callback.from_user.id):
+            await callback.answer("只有群管理员可以确认此操作", show_alert=True)
+            return
+
+        text = _apply_verified_admin_action(
+            action,
+            settings=settings,
+            db=db,
+            chat_id=chat_id,
+            title=_message_chat_title(callback.message),
+            user_id=callback.from_user.id,
+        )
+        await callback.answer("已确认")
+        if callback.message is not None and hasattr(callback.message, "edit_text"):
+            try:
+                await callback.message.edit_text(text)
+                return
+            except Exception:
+                logger.debug("Failed to edit admin verification message", exc_info=True)
+        await callback.bot.send_message(chat_id, text)
+
     @router.callback_query(F.data.startswith("admin_ban:"))
     async def on_admin_ban(callback: CallbackQuery) -> None:
         if not callback.data or not callback.from_user:
@@ -224,6 +273,79 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
 
 def _chat_type(message: Message) -> str:
     return str(getattr(message.chat.type, "value", message.chat.type))
+
+
+def _is_anonymous_admin_message(message: Message) -> bool:
+    sender_chat = getattr(message, "sender_chat", None)
+    sender_chat_id = getattr(sender_chat, "id", None)
+    chat_id = getattr(message.chat, "id", None)
+    return (
+        _chat_type(message) in {"group", "supergroup"}
+        and sender_chat_id is not None
+        and chat_id is not None
+        and int(sender_chat_id) == int(chat_id)
+    )
+
+
+async def _ask_anonymous_admin_to_verify(message: Message, action: str) -> None:
+    await message.answer(
+        "匿名管理员身份无法直接校验，请点击按钮确认真实管理员身份。",
+        reply_markup=_admin_verify_keyboard(action, message.chat.id),
+    )
+
+
+def _admin_verify_keyboard(action: str, chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="确认管理员身份",
+                    callback_data=f"admin_verify:{action}:{chat_id}",
+                )
+            ]
+        ]
+    )
+
+
+def _apply_verified_admin_action(
+    action: str,
+    *,
+    settings: Settings,
+    db: Database,
+    chat_id: int,
+    title: str | None,
+    user_id: int,
+) -> str:
+    if action == "status":
+        return _group_status_text(settings, db, chat_id)
+    if action == "allow_chat":
+        db.allow_chat(chat_id, title, user_id)
+        return f"已允许当前群组使用机器人：<code>{chat_id}</code>"
+    if action == "deny_chat":
+        db.disallow_chat(chat_id)
+        return f"已禁用当前群组：<code>{chat_id}</code>"
+    return "验证操作无效"
+
+
+def _group_status_text(settings: Settings, db: Database, chat_id: int) -> str:
+    allowed = is_chat_allowed(settings, db, chat_id)
+    return (
+        f"群组：<code>{chat_id}</code>\n"
+        f"允许使用：{'是' if allowed else '否'}\n"
+        f"需要 allow：{'是' if settings.require_allowed_chat else '否'}"
+    )
+
+
+def _message_chat_id(message: Message | None) -> int | None:
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    return int(chat_id) if chat_id is not None else None
+
+
+def _message_chat_title(message: Message | None) -> str | None:
+    chat = getattr(message, "chat", None)
+    title = getattr(chat, "title", None)
+    return str(title) if title else None
 
 
 def _parse_chat_id(value: str) -> int | None:
