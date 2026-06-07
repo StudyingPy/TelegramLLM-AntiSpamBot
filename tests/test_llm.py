@@ -162,6 +162,50 @@ def test_newapi_judge_falls_back_to_next_provider_after_error():
     ]
 
 
+def test_newapi_uses_no_proxy_opener_so_system_proxies_are_ignored(monkeypatch):
+    """Regression: urllib.request.urlopen() reads HTTP_PROXY/HTTPS_PROXY from os.environ
+    every call. A misconfigured proxy on the host would silently route every NewAPI call
+    through a slow hop while curl from the same host (no proxy honored) returned in ~1s,
+    making "all providers timed out" reports look like a network or model issue when in
+    fact our urllib was just going through molasses. We now bind the requests to an
+    opener that ignores environment proxies entirely.
+
+    Tested by observing the actual socket address the opener connects to — with a bogus
+    proxy in env, a default urlopen would dial the proxy host; our opener dials the
+    target host directly.
+    """
+
+    import socket
+    from urllib.request import Request
+
+    from telegram_llm_antispam.llm import _NO_PROXY_OPENER
+
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:1")
+
+    captured: list[tuple[str, int]] = []
+
+    real_create_connection = socket.create_connection
+
+    def fake(address, *args, **kwargs):
+        captured.append(address)
+        raise OSError("synthetic abort — only capturing the dial target")
+
+    monkeypatch.setattr(socket, "create_connection", fake)
+
+    req = Request("https://example.invalid/path", method="GET")
+    try:
+        _NO_PROXY_OPENER.open(req, timeout=2)
+    except OSError:
+        pass  # expected — fake connect aborts
+
+    assert captured, "opener never reached socket.create_connection"
+    host, _port = captured[0]
+    assert host == "example.invalid", (
+        f"opener dialed {host!r}; expected the target host, not the proxy"
+    )
+
+
 def test_newapi_judge_returns_failed_outcome_when_all_providers_fail():
     class AlwaysFailJudge(NewAPIJudge):
         def _post_chat_completion(self, provider, payload):  # noqa: ANN001

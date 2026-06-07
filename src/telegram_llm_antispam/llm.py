@@ -4,11 +4,12 @@ import asyncio
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
-from urllib.request import Request, urlopen
+from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 
 from .config import Settings
 from .models import (
@@ -46,6 +47,15 @@ class NewAPIProvider:
     endpoint: str
     api_key: str
     model: str
+
+
+# Build a single opener with proxy explicitly disabled. urllib.request.urlopen() reads
+# HTTP_PROXY/HTTPS_PROXY from the process env every call by default, which has burned us
+# before: curl from the same VPS returned in 1.2s while our Python path timed out at 45s
+# because a misconfigured/stale proxy env was silently bending the connection through a
+# slow hop. NewAPI is a direct public endpoint — there is no scenario where we want a
+# proxy here. ProxyHandler({}) with an empty dict means "no proxies, for any scheme".
+_NO_PROXY_OPENER = build_opener(ProxyHandler({}), HTTPSHandler())
 
 
 class NewAPIJudge:
@@ -93,23 +103,44 @@ class NewAPIJudge:
             max_tokens=self._max_tokens,
         )
 
+        # Two timeout layers stack here. The inner urlopen() timeout is a per-socket-op
+        # idle limit (resets on every chunk received), not a total-time limit. The outer
+        # asyncio.wait_for is the true wall-clock ceiling. We report whichever fires
+        # along with the actual elapsed time, so when this lands in admin notifications
+        # we can immediately tell "client cap hit" from "network was actually slow".
+        start = time.monotonic()
         try:
             response = await asyncio.wait_for(
                 asyncio.to_thread(self._post_chat_completion, provider, payload),
                 timeout=self._timeout + 1,
             )
         except TimeoutError:
-            error = f"timeout after {self._timeout:.1f}s"
+            elapsed = time.monotonic() - start
+            error = (
+                f"wait_for_timeout after {elapsed:.1f}s "
+                f"(limit {self._timeout + 1:.1f}s, configured NEWAPI_TIMEOUT_SECONDS={self._timeout:.1f}s)"
+            )
             logger.warning(
-                "NewAPI provider %s timed out after %.1fs: %s",
+                "NewAPI provider %s timed out after %.1fs (wait_for): %s",
                 index,
-                self._timeout,
+                elapsed,
                 provider.endpoint,
             )
             return None, error
         except (HTTPError, URLError, OSError, ValueError, json.JSONDecodeError) as exc:
-            logger.warning("NewAPI provider %s failed (%s): %s", index, provider.endpoint, exc)
-            return None, f"{type(exc).__name__}: {exc}"
+            elapsed = time.monotonic() - start
+            # urllib raises URLError(socket.timeout) on the per-op idle timeout. Surface
+            # that as a distinct error so operators don't conflate it with wall-clock.
+            is_socket_timeout = isinstance(exc, URLError) and "timed out" in str(exc).lower()
+            kind = "socket_idle_timeout" if is_socket_timeout else f"{type(exc).__name__}"
+            logger.warning(
+                "NewAPI provider %s failed after %.1fs (%s): %s",
+                index,
+                elapsed,
+                kind,
+                exc,
+            )
+            return None, f"{kind} after {elapsed:.1f}s: {exc}"
 
         content = _extract_message_content(response)
         if not content:
@@ -150,7 +181,7 @@ class NewAPIJudge:
             },
             method="POST",
         )
-        with urlopen(request, timeout=self._timeout) as response:
+        with _NO_PROXY_OPENER.open(request, timeout=self._timeout) as response:
             raw = response.read(2_000_000)
         return json.loads(raw.decode("utf-8"))
 
