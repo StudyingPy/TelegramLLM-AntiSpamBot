@@ -69,8 +69,13 @@ class RuleEngine:
         high_weight = fingerprint.weight >= self._settings.fingerprint_ban_weight
         low_rep = features.sender_reputation <= self._settings.reputation_ban_threshold
         high_rep = features.sender_reputation >= self._settings.high_reputation_threshold
+        # Only the strictest fingerprint type (full normalized-content hash) is allowed
+        # to escalate to BAN. Skeleton/phrase types over-generalize by construction,
+        # so a single misclassified ad would otherwise auto-ban every later message
+        # that shares its shape. Keep them at WITHDRAW_VOTE so the chat can dispute.
+        ban_eligible_type = fingerprint.fingerprint_type == "content"
 
-        if high_weight and not high_rep:
+        if high_weight and ban_eligible_type and not high_rep:
             return LocalDecision(
                 action=DecisionAction.BAN,
                 reason=(
@@ -80,16 +85,26 @@ class RuleEngine:
                 ),
                 confidence=0.95,
                 should_call_llm=False,
-                metadata={"fingerprint_id": fingerprint.id},
+                metadata={
+                    "fingerprint_id": fingerprint.id,
+                    "fingerprint_type": fingerprint.fingerprint_type,
+                },
             )
 
         if fingerprint.weight >= self._settings.fingerprint_review_weight:
             return LocalDecision(
                 action=DecisionAction.WITHDRAW_VOTE,
-                reason="known_fingerprint",
+                reason=(
+                    "known_high_weight_fingerprint_generalized"
+                    if high_weight
+                    else "known_fingerprint"
+                ),
                 confidence=min(0.90, fingerprint.weight / 100),
                 should_call_llm=False,
-                metadata={"fingerprint_id": fingerprint.id},
+                metadata={
+                    "fingerprint_id": fingerprint.id,
+                    "fingerprint_type": fingerprint.fingerprint_type,
+                },
             )
 
         return LocalDecision(
@@ -97,7 +112,10 @@ class RuleEngine:
             reason="weak_fingerprint_needs_llm",
             confidence=min(0.55, fingerprint.weight / 100),
             should_call_llm=True,
-            metadata={"fingerprint_id": fingerprint.id},
+            metadata={
+                "fingerprint_id": fingerprint.id,
+                "fingerprint_type": fingerprint.fingerprint_type,
+            },
         )
 
     def _has_non_whitelisted_link(self, features: MessageFeatures) -> bool:
@@ -189,6 +207,9 @@ def _looks_like_hard_spam_text(value: str, *, has_carrier: bool) -> bool:
         "刷单",
         "返利",
         "日结",
+        "日入",
+        "日赚",
+        "稳赚",
         "兼职",
         "赚钱",
         "几分钟赚",

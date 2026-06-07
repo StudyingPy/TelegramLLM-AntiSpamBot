@@ -115,7 +115,32 @@ def test_unmatched_message_goes_to_llm_review():
     assert decision.should_call_llm is True
 
 
-def test_high_weight_fingerprint_and_low_reputation_bans():
+def test_high_weight_content_fingerprint_and_low_reputation_bans():
+    """Content-type fingerprints are still allowed to escalate to BAN — they capture
+    full-message-hash repeat, which is the strictest signal we have."""
+    features = _features("hello")
+    features = replace(features, sender_reputation=10)
+    fingerprint = FingerprintRecord(
+        id=1,
+        fingerprint_type="content",
+        value=features.content_hash,
+        weight=90,
+        hit_count=10,
+        false_positive_count=0,
+        source="vote_confirmed",
+    )
+
+    decision = RuleEngine(_settings()).evaluate(features, fingerprint=fingerprint)
+
+    assert decision.action == DecisionAction.BAN
+    assert decision.metadata["fingerprint_type"] == "content"
+
+
+def test_high_weight_skeleton_fingerprint_only_votes_no_auto_ban():
+    """Skeleton fingerprints over-generalize by construction — they capture shape, not
+    content. A misclassified ad must not auto-ban every later message that shares the
+    same shape; force vote escalation instead. This is the guard against the original
+    skeleton-collapse incident."""
     features = _features("hello")
     features = replace(features, sender_reputation=10)
     fingerprint = FingerprintRecord(
@@ -130,7 +155,30 @@ def test_high_weight_fingerprint_and_low_reputation_bans():
 
     decision = RuleEngine(_settings()).evaluate(features, fingerprint=fingerprint)
 
-    assert decision.action == DecisionAction.BAN
+    assert decision.action == DecisionAction.WITHDRAW_VOTE
+    assert decision.reason == "known_high_weight_fingerprint_generalized"
+    assert decision.metadata["fingerprint_type"] == "skeleton"
+
+
+def test_high_weight_phrase_fingerprint_only_votes_no_auto_ban():
+    """Same guard as skeleton — phrase fingerprints are extracted from n-grams and
+    over-match by design."""
+    features = _features("hello")
+    features = replace(features, sender_reputation=10)
+    fingerprint = FingerprintRecord(
+        id=1,
+        fingerprint_type="phrase",
+        value="phrase-hash",
+        weight=90,
+        hit_count=10,
+        false_positive_count=0,
+        source="llm_spam_phrase",
+    )
+
+    decision = RuleEngine(_settings()).evaluate(features, fingerprint=fingerprint)
+
+    assert decision.action == DecisionAction.WITHDRAW_VOTE
+    assert decision.metadata["fingerprint_type"] == "phrase"
 
 
 def test_high_weight_fingerprint_and_normal_reputation_bans_without_vote():
@@ -157,6 +205,26 @@ def test_obvious_spam_bio_bans_even_when_message_text_is_benign():
         "display_name": "Snsb",
         "username": None,
         "bio": "https://t.me/+LmgOTZ_i-G00ODFk 点击进群了解详细做单教程",
+    }
+
+    decision = RuleEngine(_settings()).evaluate(features)
+
+    assert decision.action == DecisionAction.BAN
+    assert decision.reason == "spam_profile_bio"
+
+
+def test_riru_guowan_bio_with_invite_link_bans_via_local_rules():
+    """Regression: the bio '轻松日入过万： https://t.me/+...' was leaking through to
+    the LLM hop (and then through to no decision when the LLM failed). The hard-token
+    table was missing the 日入/日赚 family. Without that, '轻松日入过万' has no token
+    overlap with our bio rule, so _looks_like_spam_bio() returns False even though
+    the bio is a textbook引流 line.
+    """
+    features = _features("1", messages_seen=0)
+    features.metadata["sender_profile"] = {
+        "display_name": "郦天林",
+        "username": None,
+        "bio": "轻松日入过万： https://t.me/+WkKhZXWQHe0yM2Vk",
     }
 
     decision = RuleEngine(_settings()).evaluate(features)

@@ -471,6 +471,42 @@ class Database:
             )
             conn.commit()
 
+    def list_fingerprints(
+        self,
+        *,
+        fingerprint_type: str | None = None,
+        min_weight: float = 0.0,
+        limit: int = 50,
+    ) -> tuple[dict[str, Any], ...]:
+        params: list[Any] = [min_weight]
+        type_clause = ""
+        if fingerprint_type:
+            type_clause = " AND fingerprint_type = ?"
+            params.append(fingerprint_type)
+        params.append(limit)
+        with self._locked_conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, fingerprint_type, value, weight, hit_count, false_positive_count,
+                    source, last_hit_at, created_at
+                FROM fingerprints
+                WHERE weight >= ?{type_clause}
+                ORDER BY weight DESC, hit_count DESC, id ASC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        return tuple(dict(row) for row in rows)
+
+    def delete_fingerprint(self, fingerprint_id: int) -> bool:
+        with self._locked_conn() as conn:
+            cursor = conn.execute(
+                "DELETE FROM fingerprints WHERE id = ?",
+                (fingerprint_id,),
+            )
+            conn.commit()
+        return cursor.rowcount > 0
+
     def count_recent_skeleton_senders(
         self,
         skeleton_hash: str,

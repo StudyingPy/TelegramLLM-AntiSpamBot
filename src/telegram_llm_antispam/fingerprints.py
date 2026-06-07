@@ -23,6 +23,18 @@ def stable_hash(value: str, length: int = 32) -> str:
 
 
 def skeletonize(text: str) -> str:
+    """Build a structure-preserving fingerprint for repeat detection.
+
+    Carriers (URL/email/@mention) and Latin word tokens are replaced with placeholders
+    so paraphrased advertisements with the same skeleton still collide. CJK characters
+    are KEPT verbatim \u2014 they're the actual content, not the structure. Folding every
+    Chinese token into a single `<zh>` placeholder catastrophically over-generalizes
+    short messages: any two unrelated zh-only sentences (e.g. "\u4e0d\u6e05\u695a" and "\u597d\u7684") end
+    up sharing the same skeleton hash. Once such a hash gets upgraded to a high-weight
+    fingerprint via vote-confirmed spam, every short Chinese sentence by a normal-rep
+    user is auto-banned. That bug is what we're fixing here.
+    """
+
     base = strip_zero_width(text).lower()
     base = URL_RE.sub(" <url> ", base)
     base = EMAIL_RE.sub(" <email> ", base)
@@ -37,12 +49,14 @@ def skeletonize(text: str) -> str:
         if token in {"<url>", "<email>", "<mention>"}:
             mapped = token
         elif re.fullmatch(r"[\u4e00-\u9fff]+", token):
-            mapped = "<zh>"
+            mapped = token  # keep CJK verbatim \u2014 it IS the content
         elif re.fullmatch(r"[a-z_]+", token):
             mapped = "<w>"
         else:
             mapped = token
 
+        # Collapse runs of identical placeholders ("<url> <url>" \u2192 "<url>") but keep
+        # CJK runs separate so the structure of the original message stays observable.
         if mapped == previous and mapped.startswith("<"):
             continue
         skeleton_tokens.append(mapped)
