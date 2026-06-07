@@ -145,17 +145,7 @@ def _notification_text(
             f"{_esc(str(og_preview.get('description') or '-'))}"
         )
 
-    llm_text = ""
-    if "llm_confidence" in decision.metadata or "category" in decision.metadata:
-        phrases = decision.metadata.get("llm_signal_phrases") or decision.metadata.get("signal_phrases")
-        phrase_text = ""
-        if isinstance(phrases, list | tuple) and phrases:
-            phrase_text = f"\n信号：{_esc(', '.join(str(item) for item in phrases[:8]))}"
-        llm_text = (
-            f"\nLLM：{_esc(str(decision.metadata.get('llm_category') or decision.metadata.get('category') or '-'))}"
-            f" / {decision.metadata.get('llm_confidence', decision.confidence):.0%}"
-            f"{phrase_text}"
-        )
+    llm_text = _format_llm_section(decision)
 
     links = ", ".join(link.url for link in features.links) or "-"
     snapshot = features.text[:800] or "(empty)"
@@ -200,6 +190,56 @@ def _status_label(status: str) -> str:
         "expired_released": "投票超时：默认放行",
         "admin_banned": "管理员已跳过投票并封禁",
     }.get(status, f"状态更新：{status}")
+
+
+def _format_llm_section(decision: LocalDecision) -> str:
+    """Render the LLM hop section. Always emits a line when the LLM was attempted.
+
+    Three shapes:
+    - outcome=disabled              → "LLM：未配置"
+    - outcome=failed                → "LLM：调用失败（N 个 provider） / <error>"
+    - outcome=ok                    → "LLM：<category> / <confidence>" + 可选信号短语
+    Legacy code paths that wrote llm_confidence/category without an outcome still render.
+    """
+
+    outcome = decision.metadata.get("llm_outcome")
+    if isinstance(outcome, dict):
+        status = str(outcome.get("status") or "")
+        provider_count = outcome.get("provider_count") or 0
+        if status == "disabled":
+            return "\nLLM：未配置"
+        if status == "failed":
+            error = str(outcome.get("error") or "未知错误")
+            return f"\nLLM：调用失败（{provider_count} 个 provider） / {_esc(error)}"
+        if status == "ok":
+            category = str(outcome.get("category") or "-")
+            confidence = float(outcome.get("confidence") or 0.0)
+            verdict = "广告" if outcome.get("is_spam") else "正常"
+            phrases = outcome.get("signal_phrases")
+            phrase_text = ""
+            if isinstance(phrases, list | tuple) and phrases:
+                phrase_text = (
+                    f"\n信号：{_esc(', '.join(str(item) for item in phrases[:8]))}"
+                )
+            return (
+                f"\nLLM：{verdict} / {_esc(category)} / {confidence:.0%}"
+                f"{phrase_text}"
+            )
+
+    if "llm_confidence" in decision.metadata or "category" in decision.metadata:
+        phrases = decision.metadata.get("llm_signal_phrases") or decision.metadata.get(
+            "signal_phrases"
+        )
+        phrase_text = ""
+        if isinstance(phrases, list | tuple) and phrases:
+            phrase_text = f"\n信号：{_esc(', '.join(str(item) for item in phrases[:8]))}"
+        category = (
+            decision.metadata.get("llm_category") or decision.metadata.get("category") or "-"
+        )
+        confidence = decision.metadata.get("llm_confidence", decision.confidence)
+        return f"\nLLM：{_esc(str(category))} / {float(confidence):.0%}{phrase_text}"
+
+    return ""
 
 
 def _esc(value: str) -> str:

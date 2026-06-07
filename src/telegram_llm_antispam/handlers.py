@@ -15,7 +15,14 @@ from .db import Database
 from .feedback import fingerprint_lookup_values, record_llm_spam_feedback
 from .features import build_message_features
 from .llm import LLMJudge, NullLLMJudge, decision_from_llm
-from .models import DecisionAction, LLMJudgement, LocalDecision, MessageFeatures
+from .models import (
+    DecisionAction,
+    LLMJudgement,
+    LLMOutcome,
+    LLMOutcomeStatus,
+    LocalDecision,
+    MessageFeatures,
+)
 from .notifications import notify_admins
 from .og import fetch_og_for_features, should_fetch_og
 from .profile import get_sender_profile
@@ -196,13 +203,18 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
 
         if decision.should_call_llm:
             try:
-                judgement = await llm_judge.judge(features)
-            except Exception as exc:  # pragma: no cover - external integration hook.
-                logger.warning("LLM judgement failed, using local fallback: %s", exc)
-                judgement = None
-            if judgement is not None:
-                record_llm_spam_feedback(db, features, judgement, settings)
-                decision = _merge_llm_decision(decision, judgement, features, settings)
+                outcome = await llm_judge.judge(features)
+            except Exception as exc:  # defense-in-depth: judge() should not raise.
+                logger.warning("LLM judgement raised unexpectedly, treating as failure: %s", exc)
+                outcome = LLMOutcome(
+                    status=LLMOutcomeStatus.FAILED,
+                    provider_count=0,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            if outcome.status == LLMOutcomeStatus.OK and outcome.judgement is not None:
+                record_llm_spam_feedback(db, features, outcome.judgement, settings)
+                decision = _merge_llm_decision(decision, outcome.judgement, features, settings)
+            decision = _annotate_with_llm_outcome(decision, outcome)
 
         result = await actions.apply(message, features, decision)
         if not is_edit:
@@ -517,6 +529,38 @@ def _merge_llm_decision(
         action=local_decision.action,
         reason=local_decision.reason,
         confidence=local_decision.confidence,
+        should_call_llm=False,
+        metadata=metadata,
+    )
+
+
+def _annotate_with_llm_outcome(decision: LocalDecision, outcome: LLMOutcome) -> LocalDecision:
+    """Attach the LLM hop outcome to decision metadata regardless of final action.
+
+    This keeps notifications and the action_log honest: "review / 0%" with no LLM
+    section used to mean any of {LLM disabled, all providers failed, LLM returned
+    not_spam}. After this pass, the notification always shows what actually happened.
+    """
+
+    metadata = dict(decision.metadata)
+    metadata["llm_outcome"] = {
+        "status": outcome.status.value,
+        "provider_count": outcome.provider_count,
+        "error": outcome.error,
+    }
+    if outcome.judgement is not None:
+        metadata["llm_outcome"].update(
+            {
+                "is_spam": outcome.judgement.is_spam,
+                "confidence": outcome.judgement.confidence,
+                "category": outcome.judgement.category,
+                "signal_phrases": list(outcome.judgement.signal_phrases),
+            }
+        )
+    return LocalDecision(
+        action=decision.action,
+        reason=decision.reason,
+        confidence=decision.confidence,
         should_call_llm=False,
         metadata=metadata,
     )

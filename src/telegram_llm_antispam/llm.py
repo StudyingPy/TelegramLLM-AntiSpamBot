@@ -11,21 +11,34 @@ from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 from .config import Settings
-from .models import DecisionAction, LLMJudgement, LocalDecision, MessageFeatures
+from .models import (
+    DecisionAction,
+    LLMJudgement,
+    LLMOutcome,
+    LLMOutcomeStatus,
+    LocalDecision,
+    MessageFeatures,
+)
 
 
 logger = logging.getLogger(__name__)
 
 
 class LLMJudge(Protocol):
-    async def judge(self, features: MessageFeatures) -> LLMJudgement | None:
-        """Return a structured judgement, or None when the LLM path is unavailable."""
+    async def judge(self, features: MessageFeatures) -> LLMOutcome:
+        """Return an always-on outcome describing the LLM hop.
+
+        Implementations must never raise — transport, timeout, and parse errors are
+        captured into LLMOutcome(status=FAILED, error=...). Callers can rely on the
+        outcome to annotate decisions for observability even when no judgement was
+        produced.
+        """
 
 
 class NullLLMJudge:
-    async def judge(self, features: MessageFeatures) -> LLMJudgement | None:
+    async def judge(self, features: MessageFeatures) -> LLMOutcome:
         logger.debug("LLM judge is not configured; falling back to local decision only")
-        return None
+        return LLMOutcome(status=LLMOutcomeStatus.DISABLED, provider_count=0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,22 +59,33 @@ class NewAPIJudge:
         self._temperature = settings.newapi_temperature
         self._max_tokens = settings.newapi_max_tokens
 
-    async def judge(self, features: MessageFeatures) -> LLMJudgement | None:
+    async def judge(self, features: MessageFeatures) -> LLMOutcome:
         feature_payload = _feature_payload(features)
+        last_error: str | None = None
         for index, provider in enumerate(self._providers, start=1):
-            judgement = await self._judge_with_provider(provider, feature_payload, index)
+            judgement, error = await self._judge_with_provider(provider, feature_payload, index)
             if judgement is not None:
-                return judgement
+                return LLMOutcome(
+                    status=LLMOutcomeStatus.OK,
+                    provider_count=len(self._providers),
+                    judgement=judgement,
+                )
+            if error is not None:
+                last_error = error
 
         logger.warning("All %s NewAPI provider(s) failed; using local fallback", len(self._providers))
-        return None
+        return LLMOutcome(
+            status=LLMOutcomeStatus.FAILED,
+            provider_count=len(self._providers),
+            error=last_error,
+        )
 
     async def _judge_with_provider(
         self,
         provider: NewAPIProvider,
         feature_payload: dict[str, object],
         index: int,
-    ) -> LLMJudgement | None:
+    ) -> tuple[LLMJudgement | None, str | None]:
         payload = _chat_payload(
             model=provider.model,
             feature_payload=feature_payload,
@@ -75,29 +99,31 @@ class NewAPIJudge:
                 timeout=self._timeout + 1,
             )
         except TimeoutError:
+            error = f"timeout after {self._timeout:.1f}s"
             logger.warning(
                 "NewAPI provider %s timed out after %.1fs: %s",
                 index,
                 self._timeout,
                 provider.endpoint,
             )
-            return None
+            return None, error
         except (HTTPError, URLError, OSError, ValueError, json.JSONDecodeError) as exc:
             logger.warning("NewAPI provider %s failed (%s): %s", index, provider.endpoint, exc)
-            return None
+            return None, f"{type(exc).__name__}: {exc}"
 
         content = _extract_message_content(response)
         if not content:
+            error = "empty content"
             logger.warning(
                 "NewAPI provider %s returned no message content: %s",
                 index,
                 provider.endpoint,
             )
-            return None
+            return None, error
 
         try:
             data = _loads_json_object(content)
-            return _parse_judgement(data)
+            return _parse_judgement(data), None
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             logger.warning(
                 "NewAPI provider %s returned invalid judgement JSON (%s): %s",
@@ -105,7 +131,7 @@ class NewAPIJudge:
                 provider.endpoint,
                 exc,
             )
-            return None
+            return None, f"parse_error: {type(exc).__name__}: {exc}"
 
     def _post_chat_completion(
         self,

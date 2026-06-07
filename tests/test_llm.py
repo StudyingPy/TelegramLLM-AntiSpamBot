@@ -16,7 +16,7 @@ from telegram_llm_antispam.llm import (
     _parse_judgement,
     decision_from_llm,
 )
-from telegram_llm_antispam.models import DecisionAction, LLMJudgement, UserContext
+from telegram_llm_antispam.models import DecisionAction, LLMJudgement, LLMOutcomeStatus, UserContext
 
 
 def _settings() -> Settings:
@@ -149,15 +149,47 @@ def test_newapi_judge_falls_back_to_next_provider_after_error():
     features = build_message_features(message, context)
     judge = FallbackJudge(settings)
 
-    judgement = asyncio.run(judge.judge(features))
+    outcome = asyncio.run(judge.judge(features))
 
-    assert judgement is not None
-    assert judgement.is_spam is True
-    assert judgement.confidence == 0.93
+    assert outcome.status == LLMOutcomeStatus.OK
+    assert outcome.judgement is not None
+    assert outcome.judgement.is_spam is True
+    assert outcome.judgement.confidence == 0.93
+    assert outcome.provider_count == 2
     assert judge.called_endpoints == [
         "https://api-a.example/v1/chat/completions",
         "https://api-b.example/v1/chat/completions",
     ]
+
+
+def test_newapi_judge_returns_failed_outcome_when_all_providers_fail():
+    class AlwaysFailJudge(NewAPIJudge):
+        def _post_chat_completion(self, provider, payload):  # noqa: ANN001
+            raise OSError("boom")
+
+    settings = replace(
+        _settings(),
+        newapi_base_url="https://api-a.example,https://api-b.example",
+        newapi_api_key="key-a,key-b",
+        newapi_model="model-a,model-b",
+    )
+    message = SimpleNamespace(
+        message_id=1,
+        chat=SimpleNamespace(id=-1001),
+        from_user=SimpleNamespace(id=42),
+        text="hi",
+    )
+    context = UserContext(chat_id=-1001, user_id=42, reputation_score=50, messages_seen=1)
+    features = build_message_features(message, context)
+    judge = AlwaysFailJudge(settings)
+
+    outcome = asyncio.run(judge.judge(features))
+
+    assert outcome.status == LLMOutcomeStatus.FAILED
+    assert outcome.provider_count == 2
+    assert outcome.judgement is None
+    assert outcome.error is not None
+    assert "OSError" in outcome.error
 
 
 def test_loads_json_object_handles_fenced_json():

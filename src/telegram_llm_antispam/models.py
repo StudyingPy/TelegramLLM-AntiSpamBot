@@ -139,6 +139,33 @@ class LLMJudgement:
     signal_phrases: tuple[str, ...] = ()
 
 
+class LLMOutcomeStatus(str, Enum):
+    DISABLED = "disabled"
+    OK = "ok"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class LLMOutcome:
+    """Always-on summary of the LLM hop, even when no judgement was produced.
+
+    `status=DISABLED` means no provider was configured.
+    `status=FAILED` means every configured provider was tried and all of them failed
+    (timeout/transport/JSON parse). `error` carries the last error string for ops triage.
+    `status=OK` means at least one provider returned a parseable judgement.
+    `provider_count` is the number of configured providers (0 when disabled).
+    """
+
+    status: LLMOutcomeStatus
+    provider_count: int = 0
+    judgement: LLMJudgement | None = None
+    error: str | None = None
+
+    @property
+    def is_spam(self) -> bool:
+        return self.judgement is not None and self.judgement.is_spam
+
+
 @dataclass(frozen=True, slots=True)
 class VoteTally:
     session_id: int

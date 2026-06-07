@@ -8,7 +8,11 @@ from telegram_llm_antispam.config import Settings
 from telegram_llm_antispam.db import Database
 from telegram_llm_antispam.features import build_message_features
 from telegram_llm_antispam.models import ActionResult, DecisionAction, LocalDecision, UserContext
-from telegram_llm_antispam.notifications import notify_admins, update_vote_notifications
+from telegram_llm_antispam.notifications import (
+    _format_llm_section,
+    notify_admins,
+    update_vote_notifications,
+)
 from test_llm import _settings
 
 
@@ -191,3 +195,76 @@ def test_update_vote_notifications_edits_existing_admin_record(tmp_path):
         assert reply_markup is not None
     finally:
         db.close()
+
+
+def test_format_llm_section_renders_disabled_state():
+    decision = LocalDecision(
+        action=DecisionAction.REVIEW,
+        reason="unmatched_message_needs_llm",
+        confidence=0.0,
+        metadata={"llm_outcome": {"status": "disabled", "provider_count": 0, "error": None}},
+    )
+
+    section = _format_llm_section(decision)
+
+    assert "LLM：未配置" in section
+
+
+def test_format_llm_section_renders_failure_with_provider_count():
+    decision = LocalDecision(
+        action=DecisionAction.REVIEW,
+        reason="unmatched_message_needs_llm",
+        confidence=0.0,
+        metadata={
+            "llm_outcome": {
+                "status": "failed",
+                "provider_count": 2,
+                "error": "TimeoutError: timeout after 8.0s",
+            }
+        },
+    )
+
+    section = _format_llm_section(decision)
+
+    assert "调用失败" in section
+    assert "2 个 provider" in section
+    assert "Timeout" in section
+
+
+def test_format_llm_section_renders_ok_with_verdict_and_phrases():
+    decision = LocalDecision(
+        action=DecisionAction.WITHDRAW_VOTE,
+        reason="llm_spam",
+        confidence=0.78,
+        metadata={
+            "llm_outcome": {
+                "status": "ok",
+                "provider_count": 1,
+                "error": None,
+                "is_spam": True,
+                "confidence": 0.78,
+                "category": "ads",
+                "signal_phrases": ["加群", "拿码"],
+            }
+        },
+    )
+
+    section = _format_llm_section(decision)
+
+    assert "LLM：广告" in section
+    assert "ads" in section
+    assert "78%" in section
+    assert "加群" in section
+    assert "拿码" in section
+
+
+def test_format_llm_section_empty_when_no_llm_hop_attempted():
+    """When the LLM hop didn't run (decision didn't request it), no LLM section."""
+    decision = LocalDecision(
+        action=DecisionAction.BAN,
+        reason="hard_spam_message",
+        confidence=0.96,
+        metadata={},
+    )
+
+    assert _format_llm_section(decision) == ""

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from telegram_llm_antispam.db import Database
 from telegram_llm_antispam.handlers import (
     _admin_verify_keyboard,
+    _annotate_with_llm_outcome,
     _apply_verified_admin_action,
     _new_chat_members,
     _same_user_open_vote_repeat_decision,
@@ -13,7 +14,14 @@ from telegram_llm_antispam.handlers import (
     create_router,
 )
 from telegram_llm_antispam.features import build_message_features
-from telegram_llm_antispam.models import DecisionAction, LocalDecision, UserContext
+from telegram_llm_antispam.models import (
+    DecisionAction,
+    LLMJudgement,
+    LLMOutcome,
+    LLMOutcomeStatus,
+    LocalDecision,
+    UserContext,
+)
 from test_llm import _settings
 
 
@@ -131,3 +139,67 @@ def test_new_chat_members_extracts_action_users_from_client_payload():
 
     assert len(members) == 1
     assert members[0].id == 7775538527
+
+
+def _stub_decision(reason: str = "unmatched_message_needs_llm") -> LocalDecision:
+    return LocalDecision(
+        action=DecisionAction.REVIEW,
+        reason=reason,
+        confidence=0.0,
+        should_call_llm=True,
+    )
+
+
+def test_annotate_with_llm_outcome_records_disabled_state():
+    """Regression: notifications previously could not distinguish 'LLM not configured'
+    from 'LLM ran and judged not-spam' — both showed 'review / 0%' with no LLM line.
+    Now disabled state is explicit in decision.metadata."""
+
+    outcome = LLMOutcome(status=LLMOutcomeStatus.DISABLED, provider_count=0)
+    annotated = _annotate_with_llm_outcome(_stub_decision(), outcome)
+
+    payload = annotated.metadata["llm_outcome"]
+    assert payload["status"] == "disabled"
+    assert payload["provider_count"] == 0
+    # action and reason are preserved — annotation is observability-only.
+    assert annotated.action == DecisionAction.REVIEW
+    assert annotated.reason == "unmatched_message_needs_llm"
+
+
+def test_annotate_with_llm_outcome_records_failure_with_error():
+    """Regression: when all providers fail (timeout / transport / parse error), the
+    incident is now visible. Before, judge() swallowed errors and returned None,
+    indistinguishable from 'LLM disabled' or 'LLM said not-spam'."""
+
+    outcome = LLMOutcome(
+        status=LLMOutcomeStatus.FAILED,
+        provider_count=2,
+        error="TimeoutError: timeout after 8.0s",
+    )
+    annotated = _annotate_with_llm_outcome(_stub_decision(), outcome)
+
+    payload = annotated.metadata["llm_outcome"]
+    assert payload["status"] == "failed"
+    assert payload["provider_count"] == 2
+    assert "Timeout" in payload["error"]
+
+
+def test_annotate_with_llm_outcome_records_ok_judgement_payload():
+    outcome = LLMOutcome(
+        status=LLMOutcomeStatus.OK,
+        provider_count=1,
+        judgement=LLMJudgement(
+            is_spam=True,
+            confidence=0.92,
+            category="ads",
+            signal_phrases=("加群", "拿码"),
+        ),
+    )
+    annotated = _annotate_with_llm_outcome(_stub_decision(), outcome)
+
+    payload = annotated.metadata["llm_outcome"]
+    assert payload["status"] == "ok"
+    assert payload["is_spam"] is True
+    assert payload["confidence"] == 0.92
+    assert payload["category"] == "ads"
+    assert payload["signal_phrases"] == ["加群", "拿码"]
