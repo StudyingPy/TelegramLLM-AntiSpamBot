@@ -45,6 +45,24 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
     llm_judge = llm or NullLLMJudge()
     actions = ModerationActions(settings, db)
 
+    # Cache our own bot id so we can distinguish "this is OUR bot replying" (skip,
+    # we don't moderate our own messages) from "this is SOME OTHER bot posting"
+    # (process normally — spammers register their own bots and post promotional
+    # content as bot users, which is a Telegram feature, not noise to skip). Filled
+    # in lazily on first message because get_me() needs an active session.
+    self_bot_id: dict[str, int] = {}
+
+    async def _get_self_bot_id(bot: Any) -> int | None:
+        if "id" in self_bot_id:
+            return self_bot_id["id"]
+        try:
+            me = await bot.get_me()
+            self_bot_id["id"] = int(me.id)
+            return self_bot_id["id"]
+        except Exception as exc:  # pragma: no cover - depends on Telegram API state.
+            logger.warning("Failed to resolve self bot id, will retry next message: %s", exc)
+            return None
+
     @router.message(Command("start", "help"))
     async def on_help(message: Message) -> None:
         await message.answer(
@@ -149,19 +167,34 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
         if not is_chat_allowed(settings, db, message.chat.id):
             return
 
+        # Only OUR own bot's messages must be skipped — replies to /help, vote prompts,
+        # ban summaries. Any OTHER bot in the group is fair game: spammers register
+        # their own bots and post promotional content under bot identities, which is
+        # a real Telegram pattern (e.g. AI-strip / porn / lottery promo bots replying
+        # to @mentions). Treating every is_bot=True as untouchable lets that bypass
+        # every rule we have.
+        self_id = await _get_self_bot_id(message.bot)
+
         new_members = _new_chat_members(message)
         if new_members and not is_edit:
             for user in new_members:
-                if not getattr(user, "is_bot", False):
-                    await _process_features_for_user(
-                        message,
-                        user,
-                        update_type="new_chat_member",
-                        is_edit=False,
-                    )
+                user_id = getattr(user, "id", None)
+                # Our own bot joining is a no-op for moderation. Other bots joining
+                # still get a profile check — their bio/name might already be spammy.
+                if self_id is not None and user_id == self_id:
+                    continue
+                await _process_features_for_user(
+                    message,
+                    user,
+                    update_type="new_chat_member",
+                    is_edit=False,
+                )
             return
 
-        if not message.from_user or message.from_user.is_bot:
+        if not message.from_user:
+            return
+        # Skip only ourselves, not every bot.
+        if self_id is not None and message.from_user.id == self_id:
             return
         if (message.text or "").strip().startswith("/"):
             return

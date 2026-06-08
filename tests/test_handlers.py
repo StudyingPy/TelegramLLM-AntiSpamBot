@@ -203,3 +203,114 @@ def test_annotate_with_llm_outcome_records_ok_judgement_payload():
     assert payload["confidence"] == 0.92
     assert payload["category"] == "ads"
     assert payload["signal_phrases"] == ["加群", "拿码"]
+
+
+def test_messages_from_other_bots_are_moderated_not_silently_skipped(tmp_path):
+    """Regression: handlers used to drop every message with from_user.is_bot=True,
+    which meant spammers registering a bot account (e.g. an 'AI strip / porn' promo
+    bot replying to @-mentions) bypassed every rule. Production sample (2026-06-08):
+
+      Al脱衣免费看片😍 (is_bot=True): [图片] ... #萝莉 #后入 #爆操 ... @gouj61 x9
+
+    The bot's own messages must still be skipped (no self-moderation loops), but
+    every other bot is fair game.
+
+    Verified end-to-end: feed two messages to the router, one from our own bot id
+    and one from another bot id. The first must be silently ignored; the second
+    must be moderated like any user message — action_log gets a row, observation
+    gets recorded.
+    """
+    import asyncio
+
+    from aiogram import Bot
+    from aiogram.dispatcher.event.bases import SkipHandler  # noqa: F401
+
+    db = _db(tmp_path)
+    settings = _settings()
+    try:
+        router = create_router(settings, db)
+
+        # Find the catch-all message handler that _process_group_message wraps.
+        handlers = router.message.handlers
+        assert handlers, "router has no message handlers registered"
+
+        # Build a fake Bot stub that pretends to be id=7777 and accepts the same
+        # method calls handlers exercise without real network I/O.
+        async def fake_get_me():
+            return SimpleNamespace(id=7777)
+
+        sent: list[tuple] = []
+
+        async def fake_send_message(*args, **kwargs):
+            sent.append(("send", args, kwargs))
+            return SimpleNamespace(message_id=999)
+
+        async def fake_get_chat(_user_id):
+            return SimpleNamespace(bio=None)
+
+        async def fake_get_chat_member(*args, **kwargs):
+            # Restrict check: not-admin → restrictable.
+            return SimpleNamespace(status=SimpleNamespace(value="member"))
+
+        bot = SimpleNamespace(
+            get_me=fake_get_me,
+            send_message=fake_send_message,
+            get_chat=fake_get_chat,
+            get_chat_member=fake_get_chat_member,
+            ban_chat_member=lambda *a, **kw: asyncio.sleep(0),
+            delete_message=lambda *a, **kw: asyncio.sleep(0),
+        )
+
+        async def run_message(user_id: int, text: str, message_id: int):
+            msg = SimpleNamespace(
+                message_id=message_id,
+                chat=SimpleNamespace(id=-1001, type="supergroup", title="t"),
+                from_user=SimpleNamespace(
+                    id=user_id, is_bot=True, username=None,
+                    first_name="x", last_name=None,
+                ),
+                text=text,
+                caption=None,
+                entities=None,
+                caption_entities=None,
+                link_preview_options=None,
+                bot=bot,
+                sender_chat=None,
+                new_chat_members=None,
+            )
+            # Find the @router.message() catch-all (last registered, no filters).
+            for handler in handlers:
+                # The catch-all handler we want has an empty filter set in aiogram.
+                if not handler.filters:
+                    await handler.callback(msg)
+                    return
+            raise AssertionError("no catch-all message handler found")
+
+        # Allow the chat for moderation.
+        db.allow_chat(-1001, "t", added_by_user_id=None)
+
+        # Run BOTH messages within one event loop so the router's self_bot_id cache
+        # is shared across calls.
+        async def _both():
+            await run_message(user_id=7777, text="hello from myself", message_id=1)
+            await run_message(
+                user_id=9999, text="加群送码 拿钱 教程 https://t.me/sca", message_id=2,
+            )
+
+        asyncio.run(_both())
+
+        # Self message (id=7777): must NOT have produced an action_log entry.
+        with db._locked_conn() as conn:  # noqa: SLF001 - test-only inspection
+            self_rows = conn.execute(
+                "SELECT id FROM action_log WHERE message_id = 1"
+            ).fetchall()
+        assert not self_rows, "our own bot message must not be moderated"
+
+        # Other bot message (id=9999): MUST have produced an action_log entry.
+        with db._locked_conn() as conn:  # noqa: SLF001
+            other_rows = conn.execute(
+                "SELECT id, action FROM action_log WHERE message_id = 2"
+            ).fetchall()
+        assert other_rows, "other bots' messages must be moderated like users'"
+    finally:
+        db.close()
