@@ -11,13 +11,36 @@ from .text import normalize_text
 
 PHRASE_CANDIDATE_LIMIT = 256
 
+# stable_hash("") and stable_hash(<any input that normalizes to empty>) collide on
+# this value (truncated SHA-256 of the empty byte string). It carries zero identifying
+# signal — every empty/whitespace/zero-width/emoji-only message produces it — so any
+# fingerprint stored under it acts as a universal trap. Production saw this hash get
+# upgraded to content-type weight 85 via vote_confirmed and start auto-banning users
+# whose messages happened to normalize to empty (vote confirmed a real spam whose
+# clean_text was empty after stripping). Block it at every layer: write, read, judge.
+_EMPTY_TEXT_HASH = stable_hash("")
+
+
+def _is_meaningful_fingerprint_value(value: str | None) -> bool:
+    """Return False for hashes that carry no identifying signal.
+
+    Empty strings, whitespace-only, zero-width-only, emoji-only, and digit-only inputs
+    all normalize to "" and produce the same hash. Treat that hash as a sentinel,
+    never as a real fingerprint.
+    """
+
+    return bool(value) and value != _EMPTY_TEXT_HASH
+
 
 def fingerprint_lookup_values(features: MessageFeatures) -> tuple[tuple[str, str], ...]:
-    values = [
-        ("skeleton", features.skeleton_hash),
-        ("content", features.content_hash),
-    ]
-    values.extend(("phrase", value) for value in phrase_lookup_values(features))
+    values: list[tuple[str, str]] = []
+    if _is_meaningful_fingerprint_value(features.skeleton_hash):
+        values.append(("skeleton", features.skeleton_hash))
+    if _is_meaningful_fingerprint_value(features.content_hash):
+        values.append(("content", features.content_hash))
+    for phrase_value in phrase_lookup_values(features):
+        if _is_meaningful_fingerprint_value(phrase_value):
+            values.append(("phrase", phrase_value))
     return tuple(dict.fromkeys(values))
 
 
@@ -30,15 +53,16 @@ def record_llm_spam_feedback(
     if not judgement.is_spam or judgement.confidence < settings.llm_review_threshold:
         return
 
-    db.upsert_fingerprint(
-        "skeleton",
-        features.skeleton_hash,
-        settings.llm_fingerprint_initial_weight,
-        "llm_spam",
-    )
+    if _is_meaningful_fingerprint_value(features.skeleton_hash):
+        db.upsert_fingerprint(
+            "skeleton",
+            features.skeleton_hash,
+            settings.llm_fingerprint_initial_weight,
+            "llm_spam",
+        )
     for phrase in judgement.signal_phrases:
         value = phrase_fingerprint_value(phrase)
-        if value:
+        if _is_meaningful_fingerprint_value(value):
             db.upsert_fingerprint(
                 "phrase",
                 value,
@@ -48,14 +72,19 @@ def record_llm_spam_feedback(
 
 
 def record_vote_spam_feedback(db: Database, session: VoteSession, settings: Settings) -> None:
-    if session.skeleton_hash:
+    # Vote-confirmed spam upgrades content/skeleton fingerprints to a high weight (85
+    # by default), so a single bad ingest here taints future enforcement. Block empty-
+    # text hashes — they have no identifying value and cause cross-content collisions
+    # against any later message whose normalized text is also empty (stickers, voice,
+    # photos with no caption, emoji-only messages, ...).
+    if _is_meaningful_fingerprint_value(session.skeleton_hash):
         db.upsert_fingerprint(
             "skeleton",
             session.skeleton_hash,
             settings.vote_confirmed_fingerprint_weight,
             "vote_confirmed",
         )
-    if session.content_hash:
+    if _is_meaningful_fingerprint_value(session.content_hash):
         db.upsert_fingerprint(
             "content",
             session.content_hash,
@@ -66,7 +95,7 @@ def record_vote_spam_feedback(db: Database, session: VoteSession, settings: Sett
 
 def record_vote_ham_feedback(db: Database, session: VoteSession, settings: Settings) -> None:
     for value in (session.skeleton_hash, session.content_hash):
-        if value:
+        if _is_meaningful_fingerprint_value(value):
             db.mark_fingerprint_false_positive(value, settings.fingerprint_false_positive_penalty)
 
 

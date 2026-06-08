@@ -286,6 +286,39 @@ def test_weak_token_in_message_body_still_bans():
     assert decision.reason == "hard_spam_message"
 
 
+def test_empty_text_hash_fingerprint_is_ignored_even_if_present_in_db():
+    """Critical regression: stable_hash('') is the same hash for every empty /
+    whitespace-only / zero-width-only / emoji-only / digit-only message. Production
+    saw vote_confirmed feedback ingest a spam whose normalized clean_text was empty,
+    upgrading the empty-text hash to content-type weight 85. After that, any user
+    posting a sticker, voice note, or photo without a caption got auto-banned at 95%.
+
+    Defense in depth: even if a stale poisoned row remains in the DB, RuleEngine must
+    discard the fingerprint and fall through to the regular hop instead of banning.
+    """
+    from telegram_llm_antispam.fingerprints import stable_hash
+
+    features = _features("", messages_seen=0)  # empty body, no profile
+    assert features.content_hash == stable_hash("")
+    assert features.skeleton_hash == stable_hash("")
+
+    poisoned = FingerprintRecord(
+        id=999,
+        fingerprint_type="content",
+        value=stable_hash(""),
+        weight=95,
+        hit_count=100,
+        false_positive_count=0,
+        source="vote_confirmed",
+    )
+
+    decision = RuleEngine(_settings()).evaluate(features, fingerprint=poisoned)
+
+    assert decision.action != DecisionAction.BAN, (
+        f"empty-text fingerprint must not auto-ban; got {decision.action.value}"
+    )
+
+
 def test_bot_contact_plus_join_offer_bans_without_llm():
     decision = RuleEngine(_settings()).evaluate(_features("@qunji2bot   加群一个20"))
 

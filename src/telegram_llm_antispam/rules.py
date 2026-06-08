@@ -3,9 +3,17 @@ from __future__ import annotations
 import re
 
 from .config import Settings
+from .fingerprints import stable_hash
 from .links import is_whitelisted_domain
 from .models import DecisionAction, FingerprintRecord, LocalDecision, MessageFeatures
 from .text import normalize_text
+
+
+# stable_hash("") — any fingerprint stored under this value is a universal trap
+# because every empty/whitespace/zero-width/emoji-only message produces the same hash.
+# rules.py defends here as a second line in case feedback.py's write-side filter is
+# bypassed (e.g. by data already in the DB from before the filter was added).
+_EMPTY_TEXT_HASH = stable_hash("")
 
 
 class RuleEngine:
@@ -17,6 +25,14 @@ class RuleEngine:
         features: MessageFeatures,
         fingerprint: FingerprintRecord | None = None,
     ) -> LocalDecision:
+        # Drop any fingerprint that points at the empty-text sentinel hash. This is
+        # the same guard feedback.fingerprint_lookup_values applies on the read path;
+        # we duplicate it here so a stale DB entry (e.g. created before the write-side
+        # filter existed) cannot leak through to produce a 95%-confidence BAN against
+        # any empty/whitespace/emoji-only message.
+        if fingerprint is not None and fingerprint.value == _EMPTY_TEXT_HASH:
+            fingerprint = None
+
         fingerprint_decision = (
             self._evaluate_fingerprint(features, fingerprint) if fingerprint is not None else None
         )

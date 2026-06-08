@@ -507,6 +507,21 @@ class Database:
             conn.commit()
         return cursor.rowcount > 0
 
+    def delete_fingerprints_by_value(self, value: str) -> int:
+        """Delete every fingerprint row whose `value` column matches `value`.
+
+        Returns the number of rows removed. Used by the purge-empty-fingerprint admin
+        command to clear stale e3b0c4... rows in one shot regardless of how many
+        fingerprint_type variants ended up sharing the same poisoned hash.
+        """
+        with self._locked_conn() as conn:
+            cursor = conn.execute(
+                "DELETE FROM fingerprints WHERE value = ?",
+                (value,),
+            )
+            conn.commit()
+        return cursor.rowcount
+
     def count_recent_skeleton_senders(
         self,
         skeleton_hash: str,

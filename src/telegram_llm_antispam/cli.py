@@ -34,6 +34,19 @@ def main() -> None:
     )
     delete_fp.add_argument("fingerprint_id", type=int)
 
+    subparsers.add_parser(
+        "purge-empty-fingerprint",
+        help=(
+            "Delete any fingerprint whose value is the empty-text sentinel hash "
+            "(stable_hash('') == e3b0c44298fc...). Such a fingerprint exists only when "
+            "vote-confirmed feedback ingested a message whose normalized text was empty, "
+            "and once it reaches weight 85 it auto-bans every later user whose message "
+            "also normalizes to empty (stickers, voice notes, photos without caption, "
+            "emoji-only). Run after deploying the empty-hash guard so the DB matches "
+            "the new write-side filter."
+        ),
+    )
+
     args = parser.parse_args()
     settings = Settings.from_env()
     configure_logging(settings.log_level)
@@ -85,6 +98,23 @@ def main() -> None:
                 f"Deleted fingerprint id={args.fingerprint_id}"
                 if removed
                 else f"No fingerprint with id={args.fingerprint_id}"
+            )
+        finally:
+            db.close()
+        return
+
+    if args.command == "purge-empty-fingerprint":
+        from .fingerprints import stable_hash
+
+        empty_hash = stable_hash("")
+        db = Database.from_settings(settings)
+        db.connect()
+        try:
+            removed = db.delete_fingerprints_by_value(empty_hash)
+            print(
+                f"Removed {removed} fingerprint row(s) with value={empty_hash}"
+                if removed
+                else f"No fingerprint with value={empty_hash} (already clean)"
             )
         finally:
             db.close()

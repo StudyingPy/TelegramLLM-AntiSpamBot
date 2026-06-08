@@ -12,7 +12,11 @@ from .actions import ModerationActions
 from .admin import can_manage_chat, is_chat_allowed, is_global_admin
 from .config import Settings
 from .db import Database
-from .feedback import fingerprint_lookup_values, record_llm_spam_feedback
+from .feedback import (
+    _EMPTY_TEXT_HASH,
+    fingerprint_lookup_values,
+    record_llm_spam_feedback,
+)
 from .features import build_message_features
 from .llm import LLMJudge, NullLLMJudge, decision_from_llm
 from .models import (
@@ -456,12 +460,22 @@ def _same_user_open_vote_repeat_decision(
         features.user_id,
         statuses=("open",),
     )
+    # Hash equality only counts when the hash actually identifies content. The empty-
+    # text hash collides for every empty/whitespace/emoji-only message; matching on it
+    # would BAN any user who sends a sticker or photo without caption right after some
+    # earlier empty-text spam session opened. Force a real-content match.
+    feature_content = (
+        features.content_hash if features.content_hash != _EMPTY_TEXT_HASH else None
+    )
+    feature_skeleton = (
+        features.skeleton_hash if features.skeleton_hash != _EMPTY_TEXT_HASH else None
+    )
     matching_session_ids = [
         session.id
         for session in sessions
         if (
-            (session.content_hash and session.content_hash == features.content_hash)
-            or (session.skeleton_hash and session.skeleton_hash == features.skeleton_hash)
+            (feature_content and session.content_hash == feature_content)
+            or (feature_skeleton and session.skeleton_hash == feature_skeleton)
         )
     ]
     if not matching_session_ids:
@@ -484,6 +498,11 @@ def _repeat_decision(
     if not features.links:
         return None
     if features.sender_reputation >= settings.high_reputation_threshold:
+        return None
+    # The empty-text hash collides across every empty/whitespace-normalized message.
+    # Counting "distinct senders of the empty-skeleton hash" is meaningless — N new
+    # users sending stickers in a row would trip the fast-ban window. Skip.
+    if features.skeleton_hash == _EMPTY_TEXT_HASH:
         return None
 
     prior_senders = db.count_recent_skeleton_senders(

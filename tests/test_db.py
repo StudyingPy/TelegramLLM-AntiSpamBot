@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from telegram_llm_antispam.db import Database
 from telegram_llm_antispam.feedback import (
+    fingerprint_lookup_values,
     phrase_fingerprint_value,
     phrase_lookup_values,
     record_llm_spam_feedback,
@@ -14,7 +15,14 @@ from telegram_llm_antispam.feedback import (
     record_vote_spam_feedback,
 )
 from telegram_llm_antispam.features import build_message_features
-from telegram_llm_antispam.models import DecisionAction, LLMJudgement, LocalDecision, UserContext
+from telegram_llm_antispam.fingerprints import stable_hash
+from telegram_llm_antispam.models import (
+    DecisionAction,
+    LLMJudgement,
+    LocalDecision,
+    UserContext,
+    VoteSession,
+)
 from test_llm import _settings
 
 
@@ -225,3 +233,66 @@ def test_phrase_fingerprints_are_used_in_lookup(tmp_path):
         assert strongest.fingerprint_type == "phrase"
     finally:
         db.close()
+
+
+def test_record_vote_spam_feedback_refuses_empty_text_hash(tmp_path):
+    """Critical regression: vote_confirmed feedback for a message whose normalized
+    text was empty used to upgrade stable_hash('') to weight 85. Once that happened
+    every empty/whitespace/emoji-only message by a normal-rep user was banned at 95%
+    confidence with reason 'known_high_weight_fingerprint'. Production hit this twice
+    (users 'hengrao' and 'Kong C7'). The write-side filter must drop the record.
+    """
+    db = _db(tmp_path)
+    settings = _settings()
+    empty_hash = stable_hash("")
+    try:
+        poisoned_session = VoteSession(
+            id=1,
+            chat_id=-1001,
+            original_message_id=100,
+            vote_message_id=None,
+            suspect_user_id=42,
+            skeleton_hash=empty_hash,
+            content_hash=empty_hash,
+            status="confirmed_spam",
+            spam_votes=3,
+            ham_votes=0,
+            reason="vote_threshold_spam",
+            created_at=0,
+            expires_at=0,
+            closed_at=0,
+        )
+
+        record_vote_spam_feedback(db, poisoned_session, settings)
+
+        # Neither a content-typed nor a skeleton-typed row should exist for the empty
+        # hash — both upserts must have been refused.
+        leaked = db.get_fingerprint(empty_hash)
+        assert leaked is None, (
+            f"empty-text hash leaked into DB as fingerprint: {leaked!r}"
+        )
+    finally:
+        db.close()
+
+
+def test_fingerprint_lookup_values_drops_empty_text_hash():
+    """Read-side defense: even if a stale e3b0c4 row exists in DB, build_message_features
+    on an empty message must not ask the DB to look it up. fingerprint_lookup_values
+    is what handlers.py passes to get_strongest_fingerprint, and it must filter."""
+    empty_message = SimpleNamespace(
+        message_id=1,
+        chat=SimpleNamespace(id=-1001),
+        from_user=SimpleNamespace(id=42),
+        text="",
+    )
+    context = UserContext(chat_id=-1001, user_id=42, reputation_score=50, messages_seen=0)
+    features = build_message_features(empty_message, context)
+    empty_hash = stable_hash("")
+    assert features.skeleton_hash == empty_hash
+    assert features.content_hash == empty_hash
+
+    lookup = fingerprint_lookup_values(features)
+
+    assert empty_hash not in [value for _kind, value in lookup], (
+        f"fingerprint_lookup_values must not emit the empty-text hash: {lookup!r}"
+    )
