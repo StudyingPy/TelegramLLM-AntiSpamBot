@@ -18,6 +18,7 @@ from .feedback import (
     record_llm_spam_feedback,
 )
 from .features import build_message_features
+from .fingerprints import is_low_entropy_skeleton
 from .llm import LLMJudge, NullLLMJudge, decision_from_llm
 from .models import (
     DecisionAction,
@@ -470,6 +471,11 @@ def _same_user_open_vote_repeat_decision(
     feature_skeleton = (
         features.skeleton_hash if features.skeleton_hash != _EMPTY_TEXT_HASH else None
     )
+    # Same defense for low-entropy skeletons. A user with an open vote session on a
+    # bare URL ("https://x") must not auto-ban for sharing a different URL — the
+    # skeleton match would happen, but the messages are unrelated.
+    if feature_skeleton is not None and is_low_entropy_skeleton(features.skeleton):
+        feature_skeleton = None
     matching_session_ids = [
         session.id
         for session in sessions
@@ -503,6 +509,11 @@ def _repeat_decision(
     # Counting "distinct senders of the empty-skeleton hash" is meaningless — N new
     # users sending stickers in a row would trip the fast-ban window. Skip.
     if features.skeleton_hash == _EMPTY_TEXT_HASH:
+        return None
+    # Generic skeletons (<url>, <mention>, <w>, ...) collide across every URL-only or
+    # mention-only message. Three different new users sharing three different URLs
+    # within the 5-minute window must NOT auto-ban the fourth innocent link-sharer.
+    if is_low_entropy_skeleton(features.skeleton):
         return None
 
     prior_senders = db.count_recent_skeleton_senders(

@@ -73,6 +73,102 @@ def skeleton_hash(text: str) -> str:
     return stable_hash(skeletonize(text))
 
 
+# --- Low-entropy fingerprint sentinels ------------------------------------------------
+#
+# A fingerprint is only useful if its hash uniquely identifies a class of related
+# messages. The original empty-text bug was the extreme case (stable_hash("") matched
+# every empty/whitespace/emoji-only message). The same shape — a hash that matches a
+# huge swath of unrelated messages — applies to any skeleton or phrase that is
+# structurally too generic to discriminate. Examples:
+#
+#   skeleton "<url>"        ← any message that is a bare URL
+#   skeleton "<mention>"    ← any "@someone" with no other content
+#   skeleton "<w>"          ← any single English word
+#   normalized "元"          ← any "300元" / "500元" / "$N元" (digits stripped)
+#
+# Each of these gets created naturally by skeletonize() / normalize_text() and is
+# perfectly legitimate as a SKELETON OF A REAL MESSAGE. The bug is letting the
+# feedback loop upgrade them to high-weight fingerprints. If one of these classes is
+# vote-confirmed as spam, every later innocent message in the same class collides.
+#
+# We block this at the fingerprint-write layer (and read layer) by treating their
+# precomputed hashes as sentinels. Kept here, next to skeletonize(), so that any
+# future change to placeholder names automatically updates this list (the eyes will
+# land on this comment when skeletonize is edited).
+
+# Single-token / two-token skeletons made up entirely of structural placeholders.
+# These are the skeletonize() outputs for messages that contain only a carrier and
+# nothing else. A real ad always has descriptive text alongside its carrier — these
+# patterns alone are not predictive.
+_LOW_ENTROPY_SKELETONS: frozenset[str] = frozenset(
+    [
+        "<url>",
+        "<mention>",
+        "<email>",
+        "<w>",
+        # common two-placeholder combinations — "send a URL with a single English
+        # word", "URL followed by URL" (extracted from multipost), etc.
+        "<url> <w>",
+        "<w> <url>",
+        "<url> <mention>",
+        "<mention> <url>",
+        "<url> <url>",
+        "<w> <mention>",
+        "<mention> <w>",
+        "<email> <w>",
+        "<w> <email>",
+    ]
+)
+
+
+def is_low_entropy_skeleton(skeleton: str) -> bool:
+    """Return True for skeletons that match too broadly to be useful fingerprints.
+
+    Two ways to qualify:
+      1. The skeleton is in the curated _LOW_ENTROPY_SKELETONS set (known patterns
+         that arise from carrier-only messages).
+      2. Heuristic backstop: after stripping placeholders/punctuation, fewer than 3
+         characters of "real" content remain. This catches future low-entropy shapes
+         we haven't enumerated yet (e.g. someone changes skeletonize() and a new
+         placeholder gets introduced), at the cost of also rejecting genuinely tiny
+         messages — which is the right trade because tiny messages aren't reliable
+         fingerprints anyway.
+    """
+
+    if skeleton in _LOW_ENTROPY_SKELETONS:
+        return True
+    stripped = re.sub(r"<\w+>|[\s\W_]+", "", skeleton, flags=re.UNICODE)
+    return len(stripped) < 3
+
+
+def is_low_entropy_normalized_text(normalized: str) -> bool:
+    """Return True for normalize_text() outputs that are too short to identify content.
+
+    normalize_text strips digits, zero-width chars, and emoji, so a message like
+    "300元" collapses to "元" — a single CJK char that appears in many unrelated
+    messages. Anything under 3 CJK characters / 4 Latin characters is a coin flip
+    rather than a fingerprint.
+    """
+
+    if not normalized:
+        return True
+    # any CJK char counts as 1; Latin words as their length
+    cjk_chars = sum(1 for c in normalized if "一" <= c <= "鿿")
+    latin_chars = sum(1 for c in normalized if c.isascii() and c.isalnum())
+    if cjk_chars >= 3:
+        return False
+    if latin_chars >= 4:
+        return False
+    return True
+
+
+# Pre-computed sentinel hash sets, so callers can do a single set membership test
+# instead of recomputing skeletonize/normalize on every lookup.
+LOW_ENTROPY_SKELETON_HASHES: frozenset[str] = frozenset(
+    stable_hash(s) for s in _LOW_ENTROPY_SKELETONS
+)
+
+
 def _ngrams(text: str, size: int = 3) -> list[str]:
     compact = WHITESPACE_RE.sub("", text)
     if not compact:

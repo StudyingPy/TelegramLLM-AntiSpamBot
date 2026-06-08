@@ -34,11 +34,16 @@ def _db(tmp_path: Path) -> Database:
 
 
 def _features():
+    """Build a MessageFeatures with a multi-word skeleton that is NOT classified as
+    low-entropy. The previous fixture text 'spam https://spam.example' produces
+    skeleton '<w> <url>' which is now correctly rejected by feedback filters as a
+    universal collider. Real spam fingerprint tests need a fixture with discriminative
+    content."""
     message = SimpleNamespace(
         message_id=10,
         chat=SimpleNamespace(id=-1001),
         from_user=SimpleNamespace(id=42),
-        text="spam https://spam.example",
+        text="加群送码拿钱 详细教程 https://spam.example",
     )
     context = UserContext(chat_id=-1001, user_id=42, reputation_score=50, messages_seen=1)
     return build_message_features(message, context)
@@ -140,11 +145,12 @@ def test_recent_skeleton_senders_counts_distinct_users(tmp_path):
     try:
         features = _features()
         db.record_observation(features)
+        # Same text → same skeleton, different sender. Counts as a second distinct user.
         other_message = SimpleNamespace(
             message_id=11,
             chat=SimpleNamespace(id=-1001),
             from_user=SimpleNamespace(id=43),
-            text="spam https://spam.example",
+            text="加群送码拿钱 详细教程 https://spam.example",
         )
         other_context = UserContext(chat_id=-1001, user_id=43, reputation_score=50, messages_seen=1)
         db.record_observation(build_message_features(other_message, other_context))
@@ -184,13 +190,15 @@ def test_llm_spam_feedback_creates_medium_weight_fingerprints(tmp_path):
                 is_spam=True,
                 confidence=0.95,
                 category="ads",
-                signal_phrases=("日赚3000",),
+                # 4-char CJK phrase clears the minimum-length guard. "日赚3000"
+                # normalizes to "日赚" (2 chars) and would be rejected.
+                signal_phrases=("日赚过万",),
             ),
             settings,
         )
 
         skeleton = db.get_fingerprint(features.skeleton_hash)
-        phrase = db.get_fingerprint(phrase_fingerprint_value("日赚3000") or "")
+        phrase = db.get_fingerprint(phrase_fingerprint_value("日赚过万") or "")
 
         assert skeleton is not None
         assert skeleton.weight == settings.llm_fingerprint_initial_weight
@@ -201,6 +209,13 @@ def test_llm_spam_feedback_creates_medium_weight_fingerprints(tmp_path):
 
 
 def test_phrase_fingerprints_are_used_in_lookup(tmp_path):
+    """LLM signal phrases of 3+ CJK chars are persisted and later matched.
+
+    Originally this test used "日赚3000" — but normalize_text strips digits, leaving
+    "日赚" (2 CJK chars), which is now below the minimum-phrase-length guard. That
+    guard exists because 2-char CJK words like "可以"/"我们" collide against every
+    Chinese conversation. Use a true 4-char CJK phrase instead, which is what we
+    want to match anyway."""
     db = _db(tmp_path)
     settings = _settings()
     learned = _features()
@@ -212,7 +227,7 @@ def test_phrase_fingerprints_are_used_in_lookup(tmp_path):
                 is_spam=True,
                 confidence=0.95,
                 category="ads",
-                signal_phrases=("日赚3000",),
+                signal_phrases=("日赚过万",),
             ),
             settings,
         )
@@ -221,14 +236,14 @@ def test_phrase_fingerprints_are_used_in_lookup(tmp_path):
             message_id=12,
             chat=SimpleNamespace(id=-1001),
             from_user=SimpleNamespace(id=44),
-            text="日赚8000，点击领取教程",
+            text="日赚过万 点击领取教程",
         )
         future_context = UserContext(chat_id=-1001, user_id=44, reputation_score=50, messages_seen=1)
         future = build_message_features(future_message, future_context)
         phrase_values = phrase_lookup_values(future)
         strongest = db.get_strongest_fingerprint(tuple(("phrase", value) for value in phrase_values))
 
-        assert phrase_fingerprint_value("日赚3000") in phrase_values
+        assert phrase_fingerprint_value("日赚过万") in phrase_values
         assert strongest is not None
         assert strongest.fingerprint_type == "phrase"
     finally:
@@ -295,4 +310,67 @@ def test_fingerprint_lookup_values_drops_empty_text_hash():
 
     assert empty_hash not in [value for _kind, value in lookup], (
         f"fingerprint_lookup_values must not emit the empty-text hash: {lookup!r}"
+    )
+
+
+def test_llm_spam_feedback_refuses_to_promote_short_phrases(tmp_path):
+    """Regression: LLM "signal phrases" like "可以" / "OK" / "我们" used to be stored as
+    weight-50 phrase fingerprints. With fingerprint_review_weight=40, weight 50 is
+    enough to trigger WITHDRAW_VOTE on every later message containing the same
+    2-char CJK word — i.e. every Chinese conversation. Minimum length: 3 CJK chars
+    or 4 Latin chars."""
+    db = _db(tmp_path)
+    settings = _settings()
+    features = _features()
+    try:
+        record_llm_spam_feedback(
+            db,
+            features,
+            LLMJudgement(
+                is_spam=True,
+                confidence=0.95,
+                category="ads",
+                # Mix of short (should be dropped) and long (should be kept) phrases.
+                signal_phrases=("可以", "OK", "see", "日赚过万", "click here"),
+            ),
+            settings,
+        )
+
+        for short in ("可以", "OK", "see"):
+            value = phrase_fingerprint_value(short)
+            if value is not None:
+                assert db.get_fingerprint(value) is None, (
+                    f"short phrase {short!r} must not be persisted as a fingerprint"
+                )
+
+        # Long phrases still get persisted as before.
+        kept = db.get_fingerprint(phrase_fingerprint_value("日赚过万") or "")
+        assert kept is not None, "long CJK phrase should still be persisted"
+        kept_latin = db.get_fingerprint(phrase_fingerprint_value("click here") or "")
+        assert kept_latin is not None, "long Latin phrase should still be persisted"
+    finally:
+        db.close()
+
+
+def test_low_entropy_skeleton_hash_is_not_emitted_for_lookup():
+    """A message that is just a URL has skeleton "<url>" and content_hash from
+    normalize_text — fingerprint_lookup_values must NOT include the skeleton
+    lookup entry (it would match every bare-URL message). It can still emit a
+    content-typed entry, which is per-URL specific."""
+    bare_url_message = SimpleNamespace(
+        message_id=1,
+        chat=SimpleNamespace(id=-1001),
+        from_user=SimpleNamespace(id=42),
+        text="https://example.com/article",
+    )
+    context = UserContext(chat_id=-1001, user_id=42, reputation_score=50, messages_seen=0)
+    features = build_message_features(bare_url_message, context)
+    assert features.skeleton == "<url>"
+
+    sentinel_skeleton_hash = stable_hash("<url>")
+    lookup = fingerprint_lookup_values(features)
+
+    skeleton_hashes_emitted = [value for kind, value in lookup if kind == "skeleton"]
+    assert sentinel_skeleton_hash not in skeleton_hashes_emitted, (
+        f"low-entropy <url> skeleton must not be looked up: {lookup!r}"
     )

@@ -140,8 +140,13 @@ def test_high_weight_skeleton_fingerprint_only_votes_no_auto_ban():
     """Skeleton fingerprints over-generalize by construction — they capture shape, not
     content. A misclassified ad must not auto-ban every later message that shares the
     same shape; force vote escalation instead. This is the guard against the original
-    skeleton-collapse incident."""
-    features = _features("hello")
+    skeleton-collapse incident.
+
+    Uses a multi-token CJK message so the skeleton isn't classified as low-entropy —
+    we want to test that BAN is downgraded to WITHDRAW_VOTE, not that low-entropy
+    skeletons are dropped (a separate path tested below). The text is deliberately
+    benign so no hard_spam_message rule fires."""
+    features = _features("今天天气真不错 大家觉得呢")
     features = replace(features, sender_reputation=10)
     fingerprint = FingerprintRecord(
         id=1,
@@ -316,6 +321,35 @@ def test_empty_text_hash_fingerprint_is_ignored_even_if_present_in_db():
 
     assert decision.action != DecisionAction.BAN, (
         f"empty-text fingerprint must not auto-ban; got {decision.action.value}"
+    )
+
+
+def test_low_entropy_skeleton_fingerprint_is_ignored_even_if_present_in_db():
+    """Same class of bug as the empty-text hash, one level up: a fingerprint stored
+    under stable_hash('<url>') matches every bare-URL message. A vote-confirmed
+    URL-only spam would otherwise upgrade this hash to weight 85 and trigger
+    WITHDRAW_VOTE on every legitimate URL share. Defense in depth: even if a stale
+    poisoned row remains in DB, RuleEngine must drop the fingerprint.
+    """
+    from telegram_llm_antispam.fingerprints import stable_hash
+
+    features = _features("https://github.com/torvalds/linux", messages_seen=2)
+    assert features.skeleton == "<url>"
+
+    poisoned = FingerprintRecord(
+        id=1000,
+        fingerprint_type="skeleton",
+        value=stable_hash("<url>"),
+        weight=95,
+        hit_count=50,
+        false_positive_count=0,
+        source="vote_confirmed",
+    )
+
+    decision = RuleEngine(_settings()).evaluate(features, fingerprint=poisoned)
+
+    assert decision.action not in {DecisionAction.BAN, DecisionAction.WITHDRAW_VOTE}, (
+        f"low-entropy skeleton sentinel must not enforce; got {decision.action.value}"
     )
 
 

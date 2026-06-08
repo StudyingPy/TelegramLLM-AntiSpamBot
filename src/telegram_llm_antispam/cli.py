@@ -47,6 +47,19 @@ def main() -> None:
         ),
     )
 
+    subparsers.add_parser(
+        "purge-low-entropy-fingerprints",
+        help=(
+            "Delete every fingerprint whose value is one of the known low-entropy "
+            "sentinel hashes (<url>, <mention>, <w>, <email>, common 2-placeholder "
+            "combinations, empty-text). These all match too many unrelated messages "
+            "to enforce on; once vote-confirmed feedback upgraded any of them to "
+            "weight 85 the bot would BAN or WITHDRAW_VOTE on every URL-only / "
+            "mention-only / single-word message. Run after deploying the low-entropy "
+            "guard so the DB matches the new write-side filter."
+        ),
+    )
+
     args = parser.parse_args()
     settings = Settings.from_env()
     configure_logging(settings.log_level)
@@ -116,6 +129,24 @@ def main() -> None:
                 if removed
                 else f"No fingerprint with value={empty_hash} (already clean)"
             )
+        finally:
+            db.close()
+        return
+
+    if args.command == "purge-low-entropy-fingerprints":
+        from .fingerprints import LOW_ENTROPY_SKELETON_HASHES, stable_hash
+
+        sentinels = sorted({stable_hash(""), *LOW_ENTROPY_SKELETON_HASHES})
+        db = Database.from_settings(settings)
+        db.connect()
+        try:
+            total = 0
+            for value in sentinels:
+                removed = db.delete_fingerprints_by_value(value)
+                if removed:
+                    print(f"  removed {removed} row(s) at value={value}")
+                    total += removed
+            print(f"Total fingerprint rows removed: {total}")
         finally:
             db.close()
         return

@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 
 from .config import Settings
-from .fingerprints import stable_hash
+from .fingerprints import LOW_ENTROPY_SKELETON_HASHES, stable_hash
 from .links import is_whitelisted_domain
 from .models import DecisionAction, FingerprintRecord, LocalDecision, MessageFeatures
 from .text import normalize_text
@@ -16,6 +16,22 @@ from .text import normalize_text
 _EMPTY_TEXT_HASH = stable_hash("")
 
 
+def _is_low_entropy_fingerprint(fingerprint: FingerprintRecord) -> bool:
+    """A fingerprint is low-entropy (and so unsafe to enforce on) if its value is
+    one of the known sentinel hashes — empty-text, <url>, <mention>, <w>, etc.
+
+    We do not have the original text on a FingerprintRecord, so we can only filter
+    by precomputed hash set membership. The write-side guards in feedback.py and the
+    purge admin command provide the rest of the protection for low-entropy content
+    hashes (single CJK char, etc.).
+    """
+
+    return (
+        fingerprint.value == _EMPTY_TEXT_HASH
+        or fingerprint.value in LOW_ENTROPY_SKELETON_HASHES
+    )
+
+
 class RuleEngine:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -25,12 +41,13 @@ class RuleEngine:
         features: MessageFeatures,
         fingerprint: FingerprintRecord | None = None,
     ) -> LocalDecision:
-        # Drop any fingerprint that points at the empty-text sentinel hash. This is
+        # Drop any fingerprint that points at a low-entropy sentinel hash. This is
         # the same guard feedback.fingerprint_lookup_values applies on the read path;
         # we duplicate it here so a stale DB entry (e.g. created before the write-side
-        # filter existed) cannot leak through to produce a 95%-confidence BAN against
-        # any empty/whitespace/emoji-only message.
-        if fingerprint is not None and fingerprint.value == _EMPTY_TEXT_HASH:
+        # filter existed) cannot leak through to produce a 95%-confidence BAN or
+        # WITHDRAW_VOTE against any empty/whitespace/emoji-only / bare-URL / bare-
+        # mention / single-word message.
+        if fingerprint is not None and _is_low_entropy_fingerprint(fingerprint):
             fingerprint = None
 
         fingerprint_decision = (
