@@ -280,15 +280,56 @@ def test_strong_token_in_bio_still_auto_bans():
     assert decision.reason == "spam_profile_bio"
 
 
-def test_weak_token_in_message_body_still_bans():
-    """The weak/strong split applies only to the BIO path. In message body the carrier
-    is the message itself, contextual signals are stronger, and our existing local rule
-    still bans '加群一个20' / '客服私聊@bot 拿码' / etc."""
+def test_weak_token_in_message_body_does_not_auto_ban():
+    """Regression: '客服' / '加群' / '私聊' / '教程' / '群一个' in a message body used
+    to trigger hard_spam_message BAN at 96%. Production sample (2026-06-08): another
+    anti-spam bot's ban notification "极搜🔍资源搜索@JISOU 被匿名管理员 客服酱 永久封禁。"
+    got auto-banned because '客服' was in the hard-token table and a t.me/@-mention
+    carrier was present.
 
-    decision = RuleEngine(_settings()).evaluate(_features("@qunji2bot   加群一个20"))
+    Body path now mirrors bio path: STRONG tokens only. Weak-token messages with a
+    carrier fall through to the LLM hop where context-aware disambiguation happens.
+    """
+
+    decision = RuleEngine(_settings()).evaluate(
+        _features("@qunji2bot   加群一个20")
+    )
+
+    assert decision.action != DecisionAction.BAN, (
+        f"weak-token body must not auto-ban; got {decision.action.value} / {decision.reason}"
+    )
+
+
+def test_strong_token_in_message_body_still_bans():
+    """Sanity: real spam ("拿码"+"收钱" + carrier) still gets caught by the local
+    rule, no regression from the body-path tightening."""
+
+    decision = RuleEngine(_settings()).evaluate(
+        _features("@daishx1bot   拿码收钱来")
+    )
 
     assert decision.action == DecisionAction.BAN
     assert decision.reason == "hard_spam_message"
+
+
+def test_other_anti_spam_bot_notification_does_not_get_auto_banned():
+    """Regression: this is the production sample that motivated the body-path
+    tightening. nmBot (a popular anti-spam bot, 客服酱) posts a moderation
+    notification when it bans someone, and our bot used to grab the message,
+    notice '客服' in it plus a t.me/@-mention carrier, and BAN nmBot itself.
+    """
+
+    notification = (
+        "极搜🔍资源搜索@JISOU 被匿名管理员 客服酱 永久封禁。\n"
+        "回复此消息可对用户进行其他操作。"
+    )
+
+    decision = RuleEngine(_settings()).evaluate(_features(notification))
+
+    assert decision.action != DecisionAction.BAN, (
+        f"another bot's anti-spam notification must not be auto-banned; "
+        f"got {decision.action.value} / {decision.reason}"
+    )
 
 
 def test_empty_text_hash_fingerprint_is_ignored_even_if_present_in_db():
@@ -353,12 +394,14 @@ def test_low_entropy_skeleton_fingerprint_is_ignored_even_if_present_in_db():
     )
 
 
-def test_bot_contact_plus_join_offer_bans_without_llm():
+def test_bot_contact_plus_join_offer_no_longer_auto_bans():
+    """Regression: "@bot 加群一个20" used to BAN at 96%. "加群" alone (a weak token)
+    is no longer enough — the message goes to LLM review. See the 客服酱 false
+    positive that motivated this change."""
     decision = RuleEngine(_settings()).evaluate(_features("@qunji2bot   加群一个20"))
 
-    assert decision.action == DecisionAction.BAN
-    assert decision.reason == "hard_spam_message"
-    assert decision.should_call_llm is False
+    assert decision.action != DecisionAction.BAN
+    assert decision.should_call_llm is True
 
 
 def test_bot_contact_plus_payment_code_bans_without_llm():

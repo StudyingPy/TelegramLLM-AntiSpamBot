@@ -213,7 +213,12 @@ _WEAK_SPAM_TOKENS = (
     "私聊",
 )
 
-_ALL_SPAM_TOKENS = _STRONG_SPAM_TOKENS + _WEAK_SPAM_TOKENS
+# NOTE: WEAK tokens are deliberately NOT used by any auto-ban path. They appear in
+# normal users' bios AND in legitimate message bodies (anti-spam bot notifications,
+# customer-service replies, tutorial posts, real invitations). Both bio and message
+# rules now use _STRONG_SPAM_TOKENS only — anything that warrants a closer look on
+# weak signals alone falls through to the LLM hop, which has the context needed to
+# disambiguate.
 
 
 def _profile_spam_decision(features: MessageFeatures) -> LocalDecision | None:
@@ -282,11 +287,29 @@ def _has_message_carrier(features: MessageFeatures) -> bool:
 
 
 def _looks_like_hard_spam_text(value: str, *, has_carrier: bool) -> bool:
+    """Local hard-signal detector used by BOTH the message-body and OG-preview paths.
+
+    Auto-ban is a heavy hammer (deletes the message, bans the user, posts a public
+    summary). Justifying it on a single keyword match means the keyword must be one
+    that practically never appears outside spam — "做单"/"拿码"/"日入"/"裸聊"/"博彩"
+    etc. Weak tokens like "客服"/"私聊"/"加群"/"教程" show up in:
+
+      - other anti-spam bots' moderation notifications ("客服酱永久封禁了 @xxx")
+      - legitimate customer-service replies ("找客服 @support")
+      - genuine event/group invitations from real organizers
+      - tutorial / how-to posts (the literal word 教程)
+
+    So the body path now mirrors the bio path: STRONG tokens only. Weak tokens are
+    no longer enough to BAN on their own; if a message with weak tokens looks
+    suspicious it falls through to the LLM hop, which can read the surrounding
+    context and decide.
+    """
+
     normalized = normalize_text(value)
     if not normalized or not has_carrier:
         return False
 
-    return any(token in normalized for token in _ALL_SPAM_TOKENS)
+    return any(token in normalized for token in _STRONG_SPAM_TOKENS)
 
 
 def _looks_like_spam_bio(value: str) -> bool:
