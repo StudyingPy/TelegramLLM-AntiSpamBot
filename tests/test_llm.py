@@ -13,6 +13,7 @@ from telegram_llm_antispam.llm import (
     _feature_payload,
     _loads_json_object,
     _newapi_providers_from_settings,
+    _normalize_base_url,
     _parse_judgement,
     decision_from_llm,
 )
@@ -66,16 +67,21 @@ def _settings() -> Settings:
     )
 
 
-def test_chat_completions_url_accepts_host_or_v1():
-    assert _chat_completions_url("https://api.example") == (
-        "https://api.example/v1/chat/completions"
+def test_normalize_base_url_accepts_host_or_v1_or_legacy_full_path():
+    """We migrated from urllib (which needed the full /v1/chat/completions URL) to the
+    OpenAI SDK (which wants the /v1 root and appends the rest itself). Operators have
+    historically configured NEWAPI_BASE_URL in all three forms — accept all three.
+    The legacy alias _chat_completions_url is kept pointing at the same function so
+    no external import breaks.
+    """
+
+    assert _normalize_base_url("https://api.example") == "https://api.example/v1"
+    assert _normalize_base_url("https://api.example/v1") == "https://api.example/v1"
+    assert _normalize_base_url("https://api.example/v1/chat/completions") == (
+        "https://api.example/v1"
     )
-    assert _chat_completions_url("https://api.example/v1") == (
-        "https://api.example/v1/chat/completions"
-    )
-    assert _chat_completions_url("https://api.example/v1/chat/completions") == (
-        "https://api.example/v1/chat/completions"
-    )
+    # Legacy alias works the same — guards against external callers / older tests.
+    assert _chat_completions_url("https://api.example") == "https://api.example/v1"
 
 
 def test_newapi_providers_support_multiple_urls_keys_and_models():
@@ -88,9 +94,9 @@ def test_newapi_providers_support_multiple_urls_keys_and_models():
 
     providers = _newapi_providers_from_settings(settings)
 
-    assert [(item.endpoint, item.api_key, item.model) for item in providers] == [
-        ("https://api-a.example/v1/chat/completions", "key-a", "model-a"),
-        ("https://api-b.example/v1/chat/completions", "key-b", "model-b"),
+    assert [(item.base_url, item.api_key, item.model) for item in providers] == [
+        ("https://api-a.example/v1", "key-a", "model-a"),
+        ("https://api-b.example/v1", "key-b", "model-b"),
     ]
 
 
@@ -104,34 +110,55 @@ def test_newapi_provider_parser_reuses_single_key_and_model():
 
     providers = _newapi_providers_from_settings(settings)
 
-    assert [(item.endpoint, item.api_key, item.model) for item in providers] == [
-        ("https://api-a.example/v1/chat/completions", "shared-key", "shared-model"),
-        ("https://api-b.example/v1/chat/completions", "shared-key", "shared-model"),
+    assert [(item.base_url, item.api_key, item.model) for item in providers] == [
+        ("https://api-a.example/v1", "shared-key", "shared-model"),
+        ("https://api-b.example/v1", "shared-key", "shared-model"),
     ]
 
 
-def test_newapi_judge_falls_back_to_next_provider_after_error():
-    class FallbackJudge(NewAPIJudge):
-        def __init__(self, settings: Settings) -> None:
-            super().__init__(settings)
-            self.called_endpoints: list[str] = []
+def _fake_completion_response(*, content: str) -> SimpleNamespace:
+    """Build a stand-in for openai.types.chat.ChatCompletion.
 
-        def _post_chat_completion(self, provider, payload):  # noqa: ANN001
-            self.called_endpoints.append(provider.endpoint)
-            if len(self.called_endpoints) == 1:
-                raise OSError("primary failed")
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": (
-                                '{"is_spam": true, "confidence": 0.93, '
-                                '"category": "ads", "signal_phrases": ["赚钱"]}'
-                            )
-                        }
-                    }
-                ]
-            }
+    The SDK returns an object exposing .choices[0].message.content. Our extractor
+    falls back to dict-style access, but using attribute access here exercises the
+    real-shape path so we don't accidentally regress to dict-only support.
+    """
+
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+    )
+
+
+class _FakeCompletions:
+    """Mimics `client.chat.completions` with a single async create() method."""
+
+    def __init__(self, behavior):
+        self._behavior = behavior
+        self.calls: list[dict] = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return await self._behavior(kwargs)
+
+
+class _FakeAsyncOpenAI:
+    """Minimal AsyncOpenAI replacement: enough surface for NewAPIJudge to work."""
+
+    def __init__(self, behavior):
+        self.chat = SimpleNamespace(completions=_FakeCompletions(behavior))
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def test_newapi_judge_falls_back_to_next_provider_after_error():
+    """When the first provider raises, the second one is consulted. The SDK's
+    APIConnectionError is the canonical "transport blew up" exception we want to
+    fall through; we use it here instead of OSError so the test exercises the
+    actual except branch the production code will hit."""
+
+    from openai import APIConnectionError
 
     settings = replace(
         _settings(),
@@ -139,6 +166,31 @@ def test_newapi_judge_falls_back_to_next_provider_after_error():
         newapi_api_key="key-a,key-b",
         newapi_model="model-a,model-b",
     )
+
+    class FallbackJudge(NewAPIJudge):
+        def __init__(self, settings):
+            super().__init__(settings)
+            self.called_base_urls: list[str] = []
+            self.fake_clients: list[_FakeAsyncOpenAI] = []
+
+        def _build_client(self, provider):  # noqa: ANN001 - matches parent signature
+            self.called_base_urls.append(provider.base_url)
+            call_index = len(self.called_base_urls)
+
+            async def behavior(_kwargs):
+                if call_index == 1:
+                    raise APIConnectionError(request=None)
+                return _fake_completion_response(
+                    content=(
+                        '{"is_spam": true, "confidence": 0.93, '
+                        '"category": "ads", "signal_phrases": ["赚钱"]}'
+                    )
+                )
+
+            client = _FakeAsyncOpenAI(behavior)
+            self.fake_clients.append(client)
+            return client
+
     message = SimpleNamespace(
         message_id=1,
         chat=SimpleNamespace(id=-1001),
@@ -156,60 +208,20 @@ def test_newapi_judge_falls_back_to_next_provider_after_error():
     assert outcome.judgement.is_spam is True
     assert outcome.judgement.confidence == 0.93
     assert outcome.provider_count == 2
-    assert judge.called_endpoints == [
-        "https://api-a.example/v1/chat/completions",
-        "https://api-b.example/v1/chat/completions",
+    assert judge.called_base_urls == [
+        "https://api-a.example/v1",
+        "https://api-b.example/v1",
     ]
-
-
-def test_newapi_uses_no_proxy_opener_so_system_proxies_are_ignored(monkeypatch):
-    """Regression: urllib.request.urlopen() reads HTTP_PROXY/HTTPS_PROXY from os.environ
-    every call. A misconfigured proxy on the host would silently route every NewAPI call
-    through a slow hop while curl from the same host (no proxy honored) returned in ~1s,
-    making "all providers timed out" reports look like a network or model issue when in
-    fact our urllib was just going through molasses. We now bind the requests to an
-    opener that ignores environment proxies entirely.
-
-    Tested by observing the actual socket address the opener connects to — with a bogus
-    proxy in env, a default urlopen would dial the proxy host; our opener dials the
-    target host directly.
-    """
-
-    import socket
-    from urllib.request import Request
-
-    from telegram_llm_antispam.llm import _NO_PROXY_OPENER
-
-    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
-    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:1")
-
-    captured: list[tuple[str, int]] = []
-
-    real_create_connection = socket.create_connection
-
-    def fake(address, *args, **kwargs):
-        captured.append(address)
-        raise OSError("synthetic abort — only capturing the dial target")
-
-    monkeypatch.setattr(socket, "create_connection", fake)
-
-    req = Request("https://example.invalid/path", method="GET")
-    try:
-        _NO_PROXY_OPENER.open(req, timeout=2)
-    except OSError:
-        pass  # expected — fake connect aborts
-
-    assert captured, "opener never reached socket.create_connection"
-    host, _port = captured[0]
-    assert host == "example.invalid", (
-        f"opener dialed {host!r}; expected the target host, not the proxy"
-    )
+    # Both clients must have been closed — leaking httpx connections in a long-
+    # running bot adds up.
+    assert all(c.closed for c in judge.fake_clients)
 
 
 def test_newapi_judge_returns_failed_outcome_when_all_providers_fail():
-    class AlwaysFailJudge(NewAPIJudge):
-        def _post_chat_completion(self, provider, payload):  # noqa: ANN001
-            raise OSError("boom")
+    """When every provider raises, the outcome carries FAILED + the last error
+    string, and never raises out of judge()."""
+
+    from openai import APIConnectionError
 
     settings = replace(
         _settings(),
@@ -217,6 +229,14 @@ def test_newapi_judge_returns_failed_outcome_when_all_providers_fail():
         newapi_api_key="key-a,key-b",
         newapi_model="model-a,model-b",
     )
+
+    class AlwaysFailJudge(NewAPIJudge):
+        def _build_client(self, provider):  # noqa: ANN001
+            async def behavior(_kwargs):
+                raise APIConnectionError(request=None)
+
+            return _FakeAsyncOpenAI(behavior)
+
     message = SimpleNamespace(
         message_id=1,
         chat=SimpleNamespace(id=-1001),
@@ -233,7 +253,46 @@ def test_newapi_judge_returns_failed_outcome_when_all_providers_fail():
     assert outcome.provider_count == 2
     assert outcome.judgement is None
     assert outcome.error is not None
-    assert "OSError" in outcome.error
+    assert "connection_error" in outcome.error
+
+
+def test_newapi_judge_reports_sdk_timeout_with_elapsed():
+    """APITimeoutError gets its own branch so admin notifications can distinguish
+    'we hit the configured limit' from 'connection blew up immediately'."""
+
+    from openai import APITimeoutError
+
+    settings = replace(
+        _settings(),
+        newapi_base_url="https://api-a.example",
+        newapi_api_key="key-a",
+        newapi_model="model-a",
+        newapi_timeout_seconds=2,
+    )
+
+    class TimingOutJudge(NewAPIJudge):
+        def _build_client(self, provider):  # noqa: ANN001
+            async def behavior(_kwargs):
+                raise APITimeoutError(request=None)
+
+            return _FakeAsyncOpenAI(behavior)
+
+    message = SimpleNamespace(
+        message_id=1,
+        chat=SimpleNamespace(id=-1001),
+        from_user=SimpleNamespace(id=42),
+        text="hi",
+    )
+    context = UserContext(chat_id=-1001, user_id=42, reputation_score=50, messages_seen=1)
+    features = build_message_features(message, context)
+    judge = TimingOutJudge(settings)
+
+    outcome = asyncio.run(judge.judge(features))
+
+    assert outcome.status == LLMOutcomeStatus.FAILED
+    assert outcome.error is not None
+    assert "timeout after" in outcome.error
+    assert "limit 2.0s" in outcome.error
 
 
 def test_loads_json_object_handles_fenced_json():

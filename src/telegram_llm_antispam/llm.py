@@ -1,15 +1,19 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
 import time
 from dataclasses import dataclass
 from typing import Protocol
-from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
-from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
+from urllib.parse import urlparse
+
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    AsyncOpenAI,
+    OpenAIError,
+)
 
 from .config import Settings
 from .models import (
@@ -44,21 +48,27 @@ class NullLLMJudge:
 
 @dataclass(frozen=True, slots=True)
 class NewAPIProvider:
-    endpoint: str
+    """A single OpenAI-compatible NewAPI endpoint configuration.
+
+    `base_url` is the OpenAI-style root (e.g. "https://api.example/v1"). The SDK
+    handles the "/chat/completions" suffix internally — we pass base_url straight
+    through to AsyncOpenAI without our old urljoin-based normalization.
+    """
+
+    base_url: str
     api_key: str
     model: str
 
 
-# Build a single opener with proxy explicitly disabled. urllib.request.urlopen() reads
-# HTTP_PROXY/HTTPS_PROXY from the process env every call by default, which has burned us
-# before: curl from the same VPS returned in 1.2s while our Python path timed out at 45s
-# because a misconfigured/stale proxy env was silently bending the connection through a
-# slow hop. NewAPI is a direct public endpoint — there is no scenario where we want a
-# proxy here. ProxyHandler({}) with an empty dict means "no proxies, for any scheme".
-_NO_PROXY_OPENER = build_opener(ProxyHandler({}), HTTPSHandler())
-
-
 class NewAPIJudge:
+    """OpenAI-SDK-backed implementation. Sibling project Telegram-PresenceD/vision.py
+    proved this exact shape (AsyncOpenAI + base_url + per-call client + close in
+    finally) is rock-solid against the same NewAPI host that our old urllib path
+    was timing out against. Confirmed root cause was urllib's blocking getaddrinfo
+    plus asyncio.to_thread + wait_for layering: the SDK uses httpx + async DNS
+    natively and avoids both pitfalls.
+    """
+
     def __init__(self, settings: Settings) -> None:
         providers = _newapi_providers_from_settings(settings)
         if not providers:
@@ -83,7 +93,9 @@ class NewAPIJudge:
             if error is not None:
                 last_error = error
 
-        logger.warning("All %s NewAPI provider(s) failed; using local fallback", len(self._providers))
+        logger.warning(
+            "All %s NewAPI provider(s) failed; using local fallback", len(self._providers)
+        )
         return LLMOutcome(
             status=LLMOutcomeStatus.FAILED,
             provider_count=len(self._providers),
@@ -96,61 +108,76 @@ class NewAPIJudge:
         feature_payload: dict[str, object],
         index: int,
     ) -> tuple[LLMJudgement | None, str | None]:
-        payload = _chat_payload(
-            model=provider.model,
-            feature_payload=feature_payload,
-            temperature=self._temperature,
-            max_tokens=self._max_tokens,
-        )
-
-        # Two timeout layers stack here. The inner urlopen() timeout is a per-socket-op
-        # idle limit (resets on every chunk received), not a total-time limit. The outer
-        # asyncio.wait_for is the true wall-clock ceiling. We report whichever fires
-        # along with the actual elapsed time, so when this lands in admin notifications
-        # we can immediately tell "client cap hit" from "network was actually slow".
+        # Per-call client mirrors Telegram-PresenceD vision.py: small create+close cost
+        # in exchange for sidestepping every long-lived-session pitfall (stale
+        # connections, DNS cache poisoning, pool exhaustion). Reverse-cost-benefit
+        # for our QPS is wildly in favor of per-call.
+        client = self._build_client(provider)
+        messages = _chat_messages(feature_payload)
         start = time.monotonic()
         try:
-            response = await asyncio.wait_for(
-                asyncio.to_thread(self._post_chat_completion, provider, payload),
-                timeout=self._timeout + 1,
+            response = await client.chat.completions.create(
+                model=provider.model,
+                messages=messages,
+                temperature=self._temperature,
+                max_tokens=self._max_tokens,
+                response_format={"type": "json_object"},
+                timeout=self._timeout,
             )
-        except TimeoutError:
+        except APITimeoutError as exc:
             elapsed = time.monotonic() - start
-            error = (
-                f"wait_for_timeout after {elapsed:.1f}s "
-                f"(limit {self._timeout + 1:.1f}s, configured NEWAPI_TIMEOUT_SECONDS={self._timeout:.1f}s)"
-            )
             logger.warning(
-                "NewAPI provider %s timed out after %.1fs (wait_for): %s",
+                "NewAPI provider %s timed out after %.1fs: %s",
                 index,
                 elapsed,
-                provider.endpoint,
+                provider.base_url,
             )
-            return None, error
-        except (HTTPError, URLError, OSError, ValueError, json.JSONDecodeError) as exc:
+            await _safe_close(client)
+            return None, f"timeout after {elapsed:.1f}s (limit {self._timeout:.1f}s)"
+        except APIConnectionError as exc:
             elapsed = time.monotonic() - start
-            # urllib raises URLError(socket.timeout) on the per-op idle timeout. Surface
-            # that as a distinct error so operators don't conflate it with wall-clock.
-            is_socket_timeout = isinstance(exc, URLError) and "timed out" in str(exc).lower()
-            kind = "socket_idle_timeout" if is_socket_timeout else f"{type(exc).__name__}"
             logger.warning(
-                "NewAPI provider %s failed after %.1fs (%s): %s",
+                "NewAPI provider %s connection error after %.1fs (%s): %s",
                 index,
                 elapsed,
-                kind,
+                provider.base_url,
                 exc,
             )
-            return None, f"{kind} after {elapsed:.1f}s: {exc}"
+            await _safe_close(client)
+            return None, f"connection_error after {elapsed:.1f}s: {exc}"
+        except OpenAIError as exc:
+            elapsed = time.monotonic() - start
+            logger.warning(
+                "NewAPI provider %s API error after %.1fs (%s): %s",
+                index,
+                elapsed,
+                provider.base_url,
+                exc,
+            )
+            await _safe_close(client)
+            return None, f"api_error after {elapsed:.1f}s: {type(exc).__name__}: {exc}"
+        except Exception as exc:  # defense in depth: SDK must never crash the bot loop
+            elapsed = time.monotonic() - start
+            logger.warning(
+                "NewAPI provider %s unexpected error after %.1fs (%s): %s",
+                index,
+                elapsed,
+                provider.base_url,
+                exc,
+            )
+            await _safe_close(client)
+            return None, f"unexpected_error after {elapsed:.1f}s: {type(exc).__name__}: {exc}"
 
         content = _extract_message_content(response)
+        await _safe_close(client)
+
         if not content:
-            error = "empty content"
             logger.warning(
                 "NewAPI provider %s returned no message content: %s",
                 index,
-                provider.endpoint,
+                provider.base_url,
             )
-            return None, error
+            return None, "empty content"
 
         try:
             data = _loads_json_object(content)
@@ -159,31 +186,25 @@ class NewAPIJudge:
             logger.warning(
                 "NewAPI provider %s returned invalid judgement JSON (%s): %s",
                 index,
-                provider.endpoint,
+                provider.base_url,
                 exc,
             )
             return None, f"parse_error: {type(exc).__name__}: {exc}"
 
-    def _post_chat_completion(
-        self,
-        provider: NewAPIProvider,
-        payload: dict[str, object],
-    ) -> dict[str, object]:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        request = Request(
-            provider.endpoint,
-            data=body,
-            headers={
-                "Authorization": f"Bearer {provider.api_key}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "User-Agent": "TelegramLLMAntiSpamBot/0.1",
-            },
-            method="POST",
+    def _build_client(self, provider: NewAPIProvider) -> AsyncOpenAI:
+        return AsyncOpenAI(
+            api_key=provider.api_key,
+            base_url=provider.base_url,
+            timeout=self._timeout,
+            max_retries=0,  # we do our own retry across providers; SDK retry adds latency we'd misattribute
         )
-        with _NO_PROXY_OPENER.open(request, timeout=self._timeout) as response:
-            raw = response.read(2_000_000)
-        return json.loads(raw.decode("utf-8"))
+
+
+async def _safe_close(client: AsyncOpenAI) -> None:
+    try:
+        await client.close()
+    except Exception:  # pragma: no cover - close() failures are best-effort cleanup
+        logger.debug("AsyncOpenAI.close() failed", exc_info=True)
 
 
 def decision_from_llm(
@@ -253,13 +274,33 @@ def newapi_provider_count(settings: Settings) -> int:
     return len(_newapi_providers_from_settings(settings))
 
 
-def _chat_completions_url(base_url: str) -> str:
-    normalized = base_url.rstrip("/") + "/"
-    if normalized.endswith("/chat/completions/"):
-        return normalized[:-1]
-    if normalized.endswith("/v1/"):
-        return urljoin(normalized, "chat/completions")
-    return urljoin(normalized, "v1/chat/completions")
+def _normalize_base_url(base_url: str) -> str:
+    """Return an AsyncOpenAI-compatible base_url.
+
+    AsyncOpenAI expects the OpenAI-style "/v1" root (it appends "/chat/completions"
+    itself). Users may configure NEWAPI_BASE_URL as any of:
+      - "https://api.example"                               (host only)
+      - "https://api.example/v1"                            (v1 root)
+      - "https://api.example/v1/chat/completions"           (legacy full path)
+    Normalize all three to the /v1 form so the SDK appends correctly.
+    """
+
+    stripped = base_url.rstrip("/")
+    parsed = urlparse(stripped)
+    if not parsed.scheme or not parsed.netloc:
+        return stripped  # let the SDK surface the error rather than guessing
+
+    if stripped.endswith("/chat/completions"):
+        stripped = stripped[: -len("/chat/completions")]
+    if stripped.endswith("/v1"):
+        return stripped
+    return f"{stripped}/v1"
+
+
+# Backwards-compatible alias so any external call sites / tests referencing the old
+# helper name (which previously returned the full /v1/chat/completions URL) still
+# work, but with the new semantics. We re-export under both names to keep churn small.
+_chat_completions_url = _normalize_base_url
 
 
 def _newapi_providers_from_settings(settings: Settings) -> tuple[NewAPIProvider, ...]:
@@ -287,7 +328,7 @@ def _newapi_providers_from_settings(settings: Settings) -> tuple[NewAPIProvider,
             continue
         providers.append(
             NewAPIProvider(
-                endpoint=_chat_completions_url(base_url),
+                base_url=_normalize_base_url(base_url),
                 api_key=api_key,
                 model=model,
             )
@@ -309,30 +350,16 @@ def _value_at_or_single(values: tuple[str, ...], index: int) -> str | None:
     return None
 
 
-def _chat_payload(
-    *,
-    model: str,
-    feature_payload: dict[str, object],
-    temperature: float,
-    max_tokens: int,
-) -> dict[str, object]:
-    return {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    feature_payload,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ),
-            },
-        ],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "response_format": {"type": "json_object"},
-    }
+def _chat_messages(feature_payload: dict[str, object]) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": json.dumps(
+                feature_payload, ensure_ascii=False, separators=(",", ":")
+            ),
+        },
+    ]
 
 
 def _feature_payload(features: MessageFeatures) -> dict[str, object]:
@@ -357,22 +384,33 @@ def _feature_payload(features: MessageFeatures) -> dict[str, object]:
     }
 
 
-def _extract_message_content(response: dict[str, object]) -> str | None:
-    choices = response.get("choices")
+def _extract_message_content(response: object) -> str | None:
+    """Pull `choices[0].message.content` from either an SDK response object or a
+    plain dict (the dict form keeps the existing dict-based tests working).
+    """
+
+    # SDK path: ChatCompletion has .choices[0].message.content
+    choices = getattr(response, "choices", None)
+    if choices is None and isinstance(response, dict):
+        choices = response.get("choices")
     if not isinstance(choices, list) or not choices:
         return None
 
     first = choices[0]
-    if not isinstance(first, dict):
-        return None
+    message = getattr(first, "message", None)
+    if message is None and isinstance(first, dict):
+        message = first.get("message")
 
-    message = first.get("message")
     if isinstance(message, dict):
         content = message.get("content")
-        if isinstance(content, str):
-            return content
+    else:
+        content = getattr(message, "content", None)
 
-    text = first.get("text")
+    if isinstance(content, str):
+        return content
+
+    # Some legacy non-chat completions endpoints put text at the top of the choice.
+    text = getattr(first, "text", None) if not isinstance(first, dict) else first.get("text")
     if isinstance(text, str):
         return text
 

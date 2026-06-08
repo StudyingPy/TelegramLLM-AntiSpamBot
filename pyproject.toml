@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "aiogram>=3.7,<4",
+    "openai>=1.40",
 ]
 
 [project.optional-dependencies]
