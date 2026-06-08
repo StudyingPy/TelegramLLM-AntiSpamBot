@@ -60,6 +60,17 @@ def main() -> None:
         ),
     )
 
+    inspect_fp = subparsers.add_parser(
+        "inspect-fingerprint",
+        help=(
+            "Show every vote_session and action_log row that produced or referenced a "
+            "given fingerprint hash. Useful to audit why a content/skeleton fingerprint "
+            "was upgraded to high weight — the text_snapshot in action_log metadata "
+            "tells you the original message that confirmed it."
+        ),
+    )
+    inspect_fp.add_argument("value", help="the fingerprint hash to inspect")
+
     args = parser.parse_args()
     settings = Settings.from_env()
     configure_logging(settings.log_level)
@@ -147,6 +158,42 @@ def main() -> None:
                     print(f"  removed {removed} row(s) at value={value}")
                     total += removed
             print(f"Total fingerprint rows removed: {total}")
+        finally:
+            db.close()
+        return
+
+    if args.command == "inspect-fingerprint":
+        db = Database.from_settings(settings)
+        db.connect()
+        try:
+            fp = db.get_fingerprint(args.value)
+            if fp is None:
+                print(f"No fingerprint with value={args.value}")
+            else:
+                print(
+                    f"Fingerprint id={fp.id} type={fp.fingerprint_type} "
+                    f"weight={fp.weight} hits={fp.hit_count} "
+                    f"fp={fp.false_positive_count} source={fp.source}"
+                )
+
+            sessions = db.find_vote_sessions_by_hash(args.value)
+            if not sessions:
+                print("(no vote_sessions referenced this hash)")
+            else:
+                print(f"\nVote sessions referencing this hash ({len(sessions)}):")
+                for s in sessions:
+                    print(
+                        f"  session_id={s['id']} chat_id={s['chat_id']} "
+                        f"user_id={s['suspect_user_id']} status={s['status']} "
+                        f"reason={s['reason']!r} created_at={s['created_at']}"
+                    )
+                    snap = s.get("text_snapshot")
+                    if snap:
+                        # text_snapshot is in action_log metadata, only present when
+                        # the original moderation action stored it (WITHDRAW_VOTE or
+                        # BAN paths in actions.py).
+                        truncated = snap[:200] + ("..." if len(snap) > 200 else "")
+                        print(f"    text: {truncated!r}")
         finally:
             db.close()
         return

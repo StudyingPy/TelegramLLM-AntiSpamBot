@@ -522,6 +522,54 @@ class Database:
             conn.commit()
         return cursor.rowcount
 
+    def find_vote_sessions_by_hash(self, hash_value: str) -> tuple[dict[str, Any], ...]:
+        """Return every vote_session whose content_hash or skeleton_hash equals
+        `hash_value`, with the original message's text_snapshot joined from
+        action_log when available.
+
+        Operators run this via `antispam-admin inspect-fingerprint <hash>` to figure
+        out why a fingerprint got upgraded — see the message text that voted-spam
+        confirmed it, and decide whether to keep or delete.
+        """
+        with self._locked_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, chat_id, suspect_user_id, status, reason,
+                    skeleton_hash, content_hash, created_at, original_message_id
+                FROM vote_sessions
+                WHERE content_hash = ? OR skeleton_hash = ?
+                ORDER BY created_at DESC
+                LIMIT 50
+                """,
+                (hash_value, hash_value),
+            ).fetchall()
+
+            results: list[dict[str, Any]] = []
+            for row in rows:
+                entry = dict(row)
+                # action_log stores text_snapshot in metadata_json at moderation time.
+                # Look it up by (chat_id, message_id) matching the session's original.
+                snap_row = conn.execute(
+                    """
+                    SELECT metadata_json
+                    FROM action_log
+                    WHERE chat_id = ? AND message_id = ?
+                    ORDER BY id ASC
+                    LIMIT 1
+                    """,
+                    (row["chat_id"], row["original_message_id"]),
+                ).fetchone()
+                if snap_row is not None:
+                    try:
+                        meta = json.loads(snap_row["metadata_json"] or "{}")
+                        snap = meta.get("text_snapshot")
+                        if isinstance(snap, str):
+                            entry["text_snapshot"] = snap
+                    except json.JSONDecodeError:
+                        pass
+                results.append(entry)
+        return tuple(results)
+
     def count_recent_skeleton_senders(
         self,
         skeleton_hash: str,
