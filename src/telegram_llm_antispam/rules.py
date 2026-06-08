@@ -125,6 +125,64 @@ class RuleEngine:
         return False
 
 
+# Hard signals split into two tiers:
+#
+# STRONG tokens almost only appear in ads / fraud / 引流 copy. A bio that mentions
+# any of these alongside a contact carrier is a confident BAN — false positives here
+# are rare enough that the trade-off is worth it.
+#
+# WEAK tokens (加群 / 客服 / 私聊 / 群一个 / 教程) DO appear in spam, but normal users
+# also write "私聊我 @xxx", "进 X 群一起讨论", "这个教程有用 https://...". Banning on
+# weak tokens in the BIO field has caused real false positives (e.g. a regular member
+# whose bio was just "私聊 @kbXXXX 频道: https://t.me/..."). Weak tokens stay active for
+# the message-body path (where the carrier + context is more reliable), but BIO matching
+# is restricted to STRONG tokens only.
+_STRONG_SPAM_TOKENS = (
+    "拿码",
+    "收钱",
+    "做单",
+    "刷单",
+    "返利",
+    "日结",
+    "日入",
+    "日赚",
+    "稳赚",
+    "兼职",
+    "赚钱",
+    "几分钟赚",
+    "几百",
+    "几千",
+    "成人版",
+    "成人片",
+    "裸聊",
+    "看片",
+    "推特调教",
+    "调教",
+    "反差",
+    "破处",
+    "博彩",
+    "下注",
+    "盘口",
+    "空投",
+    "代币",
+    "冼米",  # 洗码黑话变形,常见广告体
+    "翻身",  # "新手来冼米翻身" 等
+    "收米",  # 博彩黑话
+)
+
+_WEAK_SPAM_TOKENS = (
+    "点击进群",
+    "进群了解",
+    "加群",
+    "群一个",
+    "教程",
+    "客服",
+    "私聊",
+)
+
+_ALL_SPAM_TOKENS = _STRONG_SPAM_TOKENS + _WEAK_SPAM_TOKENS
+
+
 def _profile_spam_decision(features: MessageFeatures) -> LocalDecision | None:
     profile = features.metadata.get("sender_profile")
     if not isinstance(profile, dict):
@@ -195,43 +253,7 @@ def _looks_like_hard_spam_text(value: str, *, has_carrier: bool) -> bool:
     if not normalized or not has_carrier:
         return False
 
-    hard_tokens = (
-        "点击进群",
-        "进群了解",
-        "加群",
-        "群一个",
-        "拿码",
-        "收钱",
-        "做单",
-        "教程",
-        "刷单",
-        "返利",
-        "日结",
-        "日入",
-        "日赚",
-        "稳赚",
-        "兼职",
-        "赚钱",
-        "几分钟赚",
-        "几百",
-        "几千",
-        "客服",
-        "私聊",
-        "成人版",
-        "成人片",
-        "裸聊",
-        "看片",
-        "推特调教",
-        "调教",
-        "反差",
-        "破处",
-        "博彩",
-        "下注",
-        "盘口",
-        "空投",
-        "代币",
-    )
-    return any(token in normalized for token in hard_tokens)
+    return any(token in normalized for token in _ALL_SPAM_TOKENS)
 
 
 def _looks_like_spam_bio(value: str) -> bool:
@@ -245,4 +267,6 @@ def _looks_like_spam_bio(value: str) -> bool:
     if not has_contact_or_link:
         return False
 
-    return _looks_like_hard_spam_text(value, has_carrier=True)
+    # Bio path uses only STRONG tokens — weak tokens like "私聊", "客服", "加群" appear
+    # in normal users' bios too often to safely auto-ban.
+    return any(token in normalized for token in _STRONG_SPAM_TOKENS)

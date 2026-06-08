@@ -233,6 +233,59 @@ def test_riru_guowan_bio_with_invite_link_bans_via_local_rules():
     assert decision.reason == "spam_profile_bio"
 
 
+def test_weak_token_in_bio_does_not_auto_ban():
+    """Regression: '私聊 @akondesebot 频道: https://t.me/zmkh5' was auto-banned by the
+    local bio rule because '私聊' was in the hard-token list. But '私聊我 @xxx' is a
+    common pattern in normal users' bios. Weak tokens are now restricted to the message
+    body path; bio matching only uses strong tokens (日入/做单/拿码/...) where false
+    positives are rare.
+    """
+    features = _features("(空消息)", messages_seen=0)
+    features.metadata["sender_profile"] = {
+        "display_name": "浮生",
+        "username": "kb8567",
+        "bio": "私聊 @akondesebot 频道:https://t.me/zmkh5",
+    }
+
+    decision = RuleEngine(_settings()).evaluate(features)
+
+    # No spam_profile_bio ban. The decision should fall through to the LLM hop or
+    # general review (we don't pin the exact reason — just that local rules didn't
+    # auto-ban this borderline case).
+    assert decision.action != DecisionAction.BAN, (
+        f"weak-token bio must not auto-ban; got {decision.action.value} / {decision.reason}"
+    )
+
+
+def test_strong_token_in_bio_still_auto_bans():
+    """Bio matching is tightened, NOT disabled. Bios that mention strong tokens
+    (做单/拿码/日入/...) alongside a contact carrier still ban locally — these
+    almost never appear in legitimate user bios."""
+
+    features = _features("签到", messages_seen=0)
+    features.metadata["sender_profile"] = {
+        "display_name": "X",
+        "username": None,
+        "bio": "做单拿码 @bossbot https://t.me/+work",
+    }
+
+    decision = RuleEngine(_settings()).evaluate(features)
+
+    assert decision.action == DecisionAction.BAN
+    assert decision.reason == "spam_profile_bio"
+
+
+def test_weak_token_in_message_body_still_bans():
+    """The weak/strong split applies only to the BIO path. In message body the carrier
+    is the message itself, contextual signals are stronger, and our existing local rule
+    still bans '加群一个20' / '客服私聊@bot 拿码' / etc."""
+
+    decision = RuleEngine(_settings()).evaluate(_features("@qunji2bot   加群一个20"))
+
+    assert decision.action == DecisionAction.BAN
+    assert decision.reason == "hard_spam_message"
+
+
 def test_bot_contact_plus_join_offer_bans_without_llm():
     decision = RuleEngine(_settings()).evaluate(_features("@qunji2bot   加群一个20"))
 
