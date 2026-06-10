@@ -314,3 +314,85 @@ def test_messages_from_other_bots_are_moderated_not_silently_skipped(tmp_path):
         assert other_rows, "other bots' messages must be moderated like users'"
     finally:
         db.close()
+
+
+def test_whitelisted_user_messages_skip_moderation_entirely(tmp_path):
+    """Whitelisted user_ids bypass moderation entirely — no action_log, no
+    fingerprint write, no LLM call. Mirrors the nmBot/客服酱 scenario where a
+    friendly bot's text contains tokens or carriers our local rules would
+    otherwise act on, and we want it absolutely silent."""
+    import asyncio
+
+    db = _db(tmp_path)
+    settings = _settings()
+    try:
+        router = create_router(settings, db)
+        handlers = router.message.handlers
+        assert handlers
+
+        async def fake_get_me():
+            return SimpleNamespace(id=7777)
+
+        async def fake_send_message(*args, **kwargs):
+            return SimpleNamespace(message_id=999)
+
+        async def fake_get_chat(_user_id):
+            return SimpleNamespace(bio=None)
+
+        async def fake_get_chat_member(*args, **kwargs):
+            return SimpleNamespace(status=SimpleNamespace(value="member"))
+
+        bot = SimpleNamespace(
+            get_me=fake_get_me,
+            send_message=fake_send_message,
+            get_chat=fake_get_chat,
+            get_chat_member=fake_get_chat_member,
+            ban_chat_member=lambda *a, **kw: asyncio.sleep(0),
+            delete_message=lambda *a, **kw: asyncio.sleep(0),
+        )
+
+        db.allow_chat(-1001, "t", added_by_user_id=None)
+        # Whitelist user_id=5304501737 (nmBot in production).
+        db.whitelist_user(5304501737, note="nmBot 客服酱", added_by_user_id=None)
+
+        async def run_message(user_id: int, text: str, message_id: int):
+            msg = SimpleNamespace(
+                message_id=message_id,
+                chat=SimpleNamespace(id=-1001, type="supergroup", title="t"),
+                from_user=SimpleNamespace(
+                    id=user_id, is_bot=True, username="nmnmfunbot",
+                    first_name="nmBot", last_name=None,
+                ),
+                text=text,
+                caption=None,
+                entities=None,
+                caption_entities=None,
+                link_preview_options=None,
+                bot=bot,
+                sender_chat=None,
+                new_chat_members=None,
+            )
+            for handler in handlers:
+                if not handler.filters:
+                    await handler.callback(msg)
+                    return
+            raise AssertionError("no catch-all handler")
+
+        # Even with a message that WOULD trigger hard_spam_message (strong tokens
+        # + @-mention carrier), the whitelisted user must be completely untouched.
+        async def _go():
+            await run_message(
+                user_id=5304501737,
+                text="某用户 被匿名管理员 客服酱 永久封禁 https://t.me/...",
+                message_id=42,
+            )
+
+        asyncio.run(_go())
+
+        with db._locked_conn() as conn:  # noqa: SLF001
+            rows = conn.execute(
+                "SELECT id FROM action_log WHERE message_id = 42"
+            ).fetchall()
+        assert not rows, "whitelisted user's message must not appear in action_log"
+    finally:
+        db.close()

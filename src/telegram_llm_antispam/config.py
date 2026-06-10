@@ -65,6 +65,7 @@ class Settings:
     allowed_chat_ids: tuple[int, ...]
     require_allowed_chat: bool
     whitelist_domains: tuple[str, ...]
+    whitelisted_user_ids: tuple[int, ...]
 
     vote_min_confirmations: int
     vote_timeout_seconds: int
@@ -127,6 +128,7 @@ class Settings:
             allowed_chat_ids=_env_int_tuple("ALLOWED_CHAT_IDS"),
             require_allowed_chat=_env_bool("REQUIRE_ALLOWED_CHAT", True),
             whitelist_domains=_env_list("WHITELIST_DOMAINS"),
+            whitelisted_user_ids=_env_int_tuple("WHITELISTED_USER_IDS"),
             vote_min_confirmations=_env_int("VOTE_MIN_CONFIRMATIONS", 3),
             vote_timeout_seconds=_env_int("VOTE_TIMEOUT_SECONDS", 1800),
             vote_sweep_interval_seconds=_env_int("VOTE_SWEEP_INTERVAL_SECONDS", 60),

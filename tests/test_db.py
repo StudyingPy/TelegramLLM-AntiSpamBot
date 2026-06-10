@@ -374,3 +374,37 @@ def test_low_entropy_skeleton_hash_is_not_emitted_for_lookup():
     assert sentinel_skeleton_hash not in skeleton_hashes_emitted, (
         f"low-entropy <url> skeleton must not be looked up: {lookup!r}"
     )
+
+
+def test_whitelisted_user_persists_and_combines_with_env(tmp_path):
+    """Whitelist feature mirrors the allow_chat shape: env-configured ids take
+    effect instantly, runtime-added ids persist in whitelisted_users table. Both
+    sources must be honored by is_user_whitelisted."""
+    db = _db(tmp_path)
+    try:
+        # User not in env, not in db → not whitelisted.
+        assert db.is_user_whitelisted(5304501737, ()) is False
+
+        # Add via env-style configured tuple → whitelisted (no DB row needed).
+        assert db.is_user_whitelisted(5304501737, (5304501737,)) is True
+
+        # Add via DB → whitelisted even when env is empty. Survives lookup with
+        # empty env tuple, which is how production runs without WHITELISTED_USER_IDS.
+        db.whitelist_user(5304501737, note="nmBot 客服酱", added_by_user_id=42)
+        assert db.is_user_whitelisted(5304501737, ()) is True
+
+        rows = db.list_whitelisted_users()
+        assert len(rows) == 1
+        assert rows[0]["user_id"] == 5304501737
+        assert rows[0]["note"] == "nmBot 客服酱"
+
+        removed = db.unwhitelist_user(5304501737)
+        assert removed is True
+        assert db.is_user_whitelisted(5304501737, ()) is False
+        # env removal not affected by unwhitelist — env-configured ids always win.
+        assert db.is_user_whitelisted(5304501737, (5304501737,)) is True
+
+        # unwhitelist on a missing row is a no-op, returns False.
+        assert db.unwhitelist_user(999999) is False
+    finally:
+        db.close()

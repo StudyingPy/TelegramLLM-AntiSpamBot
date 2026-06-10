@@ -175,6 +175,20 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
         # every rule we have.
         self_id = await _get_self_bot_id(message.bot)
 
+        # Whitelisted user IDs (env WHITELISTED_USER_IDS + DB whitelisted_users table)
+        # completely bypass moderation. This is the escape hatch for friendly bots like
+        # nmBot / 客服酱 whose moderation notifications were getting auto-banned by
+        # earlier versions of the body-path rule — even though commit 6cb0316 fixed
+        # the specific keyword, a whitelist is the right ergonomic answer for "this
+        # user is known to be safe, never touch their messages". Applied to BOTH
+        # message events and new-member events; we don't want to write fingerprints
+        # off a whitelisted user's text either.
+        sender_id = message.from_user.id if message.from_user else None
+        if sender_id is not None and db.is_user_whitelisted(
+            sender_id, settings.whitelisted_user_ids
+        ):
+            return
+
         new_members = _new_chat_members(message)
         if new_members and not is_edit:
             for user in new_members:
@@ -182,6 +196,12 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
                 # Our own bot joining is a no-op for moderation. Other bots joining
                 # still get a profile check — their bio/name might already be spammy.
                 if self_id is not None and user_id == self_id:
+                    continue
+                # Whitelisted users (e.g. friendly anti-spam bots like nmBot) bypass
+                # the profile/bio check on join too.
+                if user_id is not None and db.is_user_whitelisted(
+                    user_id, settings.whitelisted_user_ids
+                ):
                     continue
                 await _process_features_for_user(
                     message,

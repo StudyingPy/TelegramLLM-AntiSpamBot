@@ -55,6 +55,7 @@ def _settings_with_admins() -> Settings:
         allowed_chat_ids=(),
         require_allowed_chat=True,
         whitelist_domains=settings.whitelist_domains,
+        whitelisted_user_ids=settings.whitelisted_user_ids,
         vote_min_confirmations=settings.vote_min_confirmations,
         vote_timeout_seconds=settings.vote_timeout_seconds,
         vote_sweep_interval_seconds=settings.vote_sweep_interval_seconds,

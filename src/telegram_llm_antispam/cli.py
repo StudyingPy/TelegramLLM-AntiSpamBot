@@ -71,6 +71,32 @@ def main() -> None:
     )
     inspect_fp.add_argument("value", help="the fingerprint hash to inspect")
 
+    whitelist_user = subparsers.add_parser(
+        "whitelist-user",
+        help=(
+            "Mark a user_id as whitelisted: all their messages bypass moderation. "
+            "Intended for friendly bots like nmBot / 客服酱 whose moderation "
+            "notifications would otherwise get caught by our local rules. Persists "
+            "in the whitelisted_users table; survives restart. Use the WHITELISTED_"
+            "USER_IDS env var for the same purpose if you want it tracked in .env."
+        ),
+    )
+    whitelist_user.add_argument("user_id", type=int)
+    whitelist_user.add_argument(
+        "--note", default=None, help="optional human-readable annotation (e.g. 'nmBot 客服酱')"
+    )
+
+    unwhitelist_user = subparsers.add_parser(
+        "unwhitelist-user",
+        help="Remove a user_id from the whitelist table (env-configured ids are unaffected).",
+    )
+    unwhitelist_user.add_argument("user_id", type=int)
+
+    subparsers.add_parser(
+        "list-whitelisted-users",
+        help="List every user_id in the whitelisted_users table.",
+    )
+
     args = parser.parse_args()
     settings = Settings.from_env()
     configure_logging(settings.log_level)
@@ -198,6 +224,51 @@ def main() -> None:
             db.close()
         return
 
+    if args.command == "whitelist-user":
+        db = Database.from_settings(settings)
+        db.connect()
+        try:
+            db.whitelist_user(args.user_id, args.note, added_by_user_id=None)
+            note = f" (note: {args.note})" if args.note else ""
+            print(f"Whitelisted user_id={args.user_id}{note}")
+        finally:
+            db.close()
+        return
+
+    if args.command == "unwhitelist-user":
+        db = Database.from_settings(settings)
+        db.connect()
+        try:
+            removed = db.unwhitelist_user(args.user_id)
+            print(
+                f"Removed user_id={args.user_id} from whitelist"
+                if removed
+                else f"user_id={args.user_id} was not in whitelist"
+            )
+        finally:
+            db.close()
+        return
+
+    if args.command == "list-whitelisted-users":
+        db = Database.from_settings(settings)
+        db.connect()
+        try:
+            rows = db.list_whitelisted_users()
+            env_ids = settings.whitelisted_user_ids
+            if env_ids:
+                print(f"From WHITELISTED_USER_IDS env: {', '.join(str(i) for i in env_ids)}")
+            if not rows:
+                print("(no rows in whitelisted_users table)")
+                return
+            print(f"{'user_id':>14} {'added_at':>12}  note")
+            for row in rows:
+                print(
+                    f"{row['user_id']:>14} {row['added_at']:>12}  {row.get('note') or ''}"
+                )
+        finally:
+            db.close()
+        return
+
 
 def _print_config(settings: Settings) -> None:
     print(f"DATABASE_PATH={settings.database_path}")
@@ -207,6 +278,7 @@ def _print_config(settings: Settings) -> None:
     print(f"ALLOWED_CHAT_IDS={','.join(str(item) for item in settings.allowed_chat_ids)}")
     print(f"REQUIRE_ALLOWED_CHAT={settings.require_allowed_chat}")
     print(f"WHITELIST_DOMAINS={','.join(settings.whitelist_domains)}")
+    print(f"WHITELISTED_USER_IDS={','.join(str(item) for item in settings.whitelisted_user_ids)}")
     print(f"VOTE_MIN_CONFIRMATIONS={settings.vote_min_confirmations}")
     print(f"VOTE_TIMEOUT_SECONDS={settings.vote_timeout_seconds}")
     print(f"VOTE_SWEEP_INTERVAL_SECONDS={settings.vote_sweep_interval_seconds}")

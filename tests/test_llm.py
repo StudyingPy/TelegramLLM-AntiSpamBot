@@ -30,6 +30,7 @@ def _settings() -> Settings:
         allowed_chat_ids=(),
         require_allowed_chat=True,
         whitelist_domains=(),
+        whitelisted_user_ids=(),
         vote_min_confirmations=3,
         vote_timeout_seconds=1800,
         vote_sweep_interval_seconds=60,

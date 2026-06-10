@@ -57,6 +57,13 @@ CREATE TABLE IF NOT EXISTS allowed_chats (
     added_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS whitelisted_users (
+    user_id INTEGER PRIMARY KEY,
+    note TEXT,
+    added_by_user_id INTEGER,
+    added_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS fingerprints (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     fingerprint_type TEXT NOT NULL,
@@ -199,6 +206,55 @@ class Database:
                 (chat_id,),
             ).fetchone()
         return row is not None
+
+    def whitelist_user(self, user_id: int, note: str | None, added_by_user_id: int | None) -> None:
+        with self._locked_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO whitelisted_users (user_id, note, added_by_user_id, added_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    note = excluded.note,
+                    added_by_user_id = excluded.added_by_user_id,
+                    added_at = excluded.added_at
+                """,
+                (user_id, note, added_by_user_id, _now()),
+            )
+            conn.commit()
+
+    def unwhitelist_user(self, user_id: int) -> bool:
+        with self._locked_conn() as conn:
+            cursor = conn.execute(
+                "DELETE FROM whitelisted_users WHERE user_id = ?",
+                (user_id,),
+            )
+            conn.commit()
+        return cursor.rowcount > 0
+
+    def is_user_whitelisted(self, user_id: int, configured_user_ids: tuple[int, ...]) -> bool:
+        """Whitelisted users completely bypass moderation. Mirrors is_chat_allowed:
+        env-configured ids take effect immediately, runtime additions via the
+        whitelist-user CLI command are persisted in the whitelisted_users table.
+        """
+        if user_id in configured_user_ids:
+            return True
+        with self._locked_conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM whitelisted_users WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        return row is not None
+
+    def list_whitelisted_users(self) -> tuple[dict[str, Any], ...]:
+        with self._locked_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id, note, added_by_user_id, added_at
+                FROM whitelisted_users
+                ORDER BY added_at DESC, user_id ASC
+                """
+            ).fetchall()
+        return tuple(dict(row) for row in rows)
 
     def get_user_profile(self, user_id: int) -> SenderProfile | None:
         with self._locked_conn() as conn:
