@@ -8,6 +8,8 @@ from telegram_llm_antispam.handlers import (
     _admin_verify_keyboard,
     _annotate_with_llm_outcome,
     _apply_verified_admin_action,
+    _is_automatic_channel_forward,
+    _is_whitelisted_sender,
     _new_chat_members,
     _same_user_open_vote_repeat_decision,
     _is_anonymous_admin_message,
@@ -394,5 +396,103 @@ def test_whitelisted_user_messages_skip_moderation_entirely(tmp_path):
                 "SELECT id FROM action_log WHERE message_id = 42"
             ).fetchall()
         assert not rows, "whitelisted user's message must not appear in action_log"
+    finally:
+        db.close()
+
+
+def test_automatic_channel_forward_is_detected():
+    """A linked channel's post auto-forwarded into the discussion group carries
+    is_automatic_forward=True and a sender_chat for the source channel."""
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-1001, type="supergroup"),
+        is_automatic_forward=True,
+        sender_chat=SimpleNamespace(id=-1009999),
+    )
+
+    assert _is_automatic_channel_forward(message) is True
+
+
+def test_anonymous_admin_post_is_not_an_automatic_forward():
+    """An anonymous admin posts with sender_chat == own chat id but without
+    is_automatic_forward; it must not be mistaken for a linked-channel forward."""
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-1001, type="supergroup"),
+        is_automatic_forward=False,
+        sender_chat=SimpleNamespace(id=-1001),
+    )
+
+    assert _is_automatic_channel_forward(message) is False
+
+
+def test_telegram_service_account_is_whitelisted_by_default(tmp_path):
+    """777000 ("Telegram") bypasses moderation with no operator configuration."""
+    db = _db(tmp_path)
+    settings = _settings()
+    try:
+        assert _is_whitelisted_sender(db, settings, 777000) is True
+        assert _is_whitelisted_sender(db, settings, 12345) is False
+    finally:
+        db.close()
+
+
+def test_automatic_channel_forward_skips_moderation_entirely(tmp_path):
+    """A linked-channel promo post (the 端午 failure) must never be deleted/banned:
+    no action_log row, even though its text trips spam rules."""
+    import asyncio
+
+    db = _db(tmp_path)
+    settings = _settings()
+    try:
+        router = create_router(settings, db)
+        handlers = router.message.handlers
+        assert handlers
+
+        async def fake_get_me():
+            return SimpleNamespace(id=7777)
+
+        async def fake_send_message(*args, **kwargs):
+            return SimpleNamespace(message_id=999)
+
+        bot = SimpleNamespace(
+            get_me=fake_get_me,
+            send_message=fake_send_message,
+            ban_chat_member=lambda *a, **kw: asyncio.sleep(0),
+            delete_message=lambda *a, **kw: asyncio.sleep(0),
+        )
+
+        db.allow_chat(-1001, "t", added_by_user_id=None)
+
+        msg = SimpleNamespace(
+            message_id=80241,
+            chat=SimpleNamespace(id=-1001, type="supergroup", title="t"),
+            from_user=SimpleNamespace(
+                id=777000, is_bot=False, username=None,
+                first_name="Telegram", last_name=None,
+            ),
+            text="端午八折优惠码 Dragon Boat Festival 可用时间 2026.06.17",
+            caption=None,
+            entities=None,
+            caption_entities=None,
+            link_preview_options=None,
+            bot=bot,
+            sender_chat=SimpleNamespace(id=-1009999),
+            is_automatic_forward=True,
+            new_chat_members=None,
+        )
+
+        async def _go():
+            for handler in handlers:
+                if not handler.filters:
+                    await handler.callback(msg)
+                    return
+            raise AssertionError("no catch-all handler")
+
+        asyncio.run(_go())
+
+        with db._locked_conn() as conn:  # noqa: SLF001
+            rows = conn.execute(
+                "SELECT id FROM action_log WHERE message_id = 80241"
+            ).fetchall()
+        assert not rows, "auto-forwarded channel post must not appear in action_log"
     finally:
         db.close()

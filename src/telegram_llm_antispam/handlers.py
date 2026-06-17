@@ -38,6 +38,13 @@ logger = logging.getLogger(__name__)
 
 ADMIN_VERIFY_ACTIONS = {"status", "allow_chat", "deny_chat"}
 
+# Telegram's own service account. 777000 ("Telegram") is the sender of channel posts
+# auto-forwarded into a linked discussion group, and of login/service notifications.
+# It is never a real group member submitting spam, so it bypasses moderation
+# unconditionally — the same effect as an operator whitelisting it, but built in so a
+# fresh deployment never bans its own linked-channel posts.
+TELEGRAM_SERVICE_USER_IDS: frozenset[int] = frozenset({777000})
+
 
 def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None) -> Router:
     router = Router(name="moderation")
@@ -175,18 +182,24 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
         # every rule we have.
         self_id = await _get_self_bot_id(message.bot)
 
-        # Whitelisted user IDs (env WHITELISTED_USER_IDS + DB whitelisted_users table)
-        # completely bypass moderation. This is the escape hatch for friendly bots like
-        # nmBot / 客服酱 whose moderation notifications were getting auto-banned by
-        # earlier versions of the body-path rule — even though commit 6cb0316 fixed
-        # the specific keyword, a whitelist is the right ergonomic answer for "this
-        # user is known to be safe, never touch their messages". Applied to BOTH
-        # message events and new-member events; we don't want to write fingerprints
-        # off a whitelisted user's text either.
+        # Channel posts auto-forwarded into a linked discussion group arrive as
+        # messages from Telegram's service account (777000) with is_automatic_forward
+        # set and sender_chat pointing at the source channel. They are not member
+        # submissions — moderating them deletes/bans the group's own channel content
+        # (the classic "bot ate the forwarded 端午 promo post" failure). Never touch them.
+        if not is_edit and _is_automatic_channel_forward(message):
+            return
+
+        # Whitelisted user IDs (built-in Telegram service accounts + env
+        # WHITELISTED_USER_IDS + DB whitelisted_users table) completely bypass
+        # moderation. This is the escape hatch for friendly bots like nmBot / 客服酱
+        # whose moderation notifications were getting auto-banned by earlier versions of
+        # the body-path rule — even though commit 6cb0316 fixed the specific keyword, a
+        # whitelist is the right ergonomic answer for "this user is known to be safe,
+        # never touch their messages". Applied to BOTH message events and new-member
+        # events; we don't want to write fingerprints off a whitelisted user's text either.
         sender_id = message.from_user.id if message.from_user else None
-        if sender_id is not None and db.is_user_whitelisted(
-            sender_id, settings.whitelisted_user_ids
-        ):
+        if sender_id is not None and _is_whitelisted_sender(db, settings, sender_id):
             return
 
         new_members = _new_chat_members(message)
@@ -199,9 +212,7 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
                     continue
                 # Whitelisted users (e.g. friendly anti-spam bots like nmBot) bypass
                 # the profile/bio check on join too.
-                if user_id is not None and db.is_user_whitelisted(
-                    user_id, settings.whitelisted_user_ids
-                ):
+                if user_id is not None and _is_whitelisted_sender(db, settings, user_id):
                     continue
                 await _process_features_for_user(
                     message,
@@ -385,6 +396,32 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
 
 def _chat_type(message: Message) -> str:
     return str(getattr(message.chat.type, "value", message.chat.type))
+
+
+def _is_whitelisted_sender(db: Database, settings: Settings, user_id: int) -> bool:
+    """A sender bypasses moderation if it is a built-in Telegram service account
+    (e.g. 777000, the linked-channel auto-forwarder) or appears in the operator's
+    whitelist (env WHITELISTED_USER_IDS or the whitelisted_users table)."""
+    if user_id in TELEGRAM_SERVICE_USER_IDS:
+        return True
+    return db.is_user_whitelisted(user_id, settings.whitelisted_user_ids)
+
+
+def _is_automatic_channel_forward(message: Message) -> bool:
+    """True when Telegram itself forwarded a linked channel's post into the discussion
+    group. These carry is_automatic_forward=True and a sender_chat for the source
+    channel (distinct from the group's own chat id, which would be an anonymous admin).
+    """
+    if not getattr(message, "is_automatic_forward", False):
+        return False
+    sender_chat = getattr(message, "sender_chat", None)
+    sender_chat_id = getattr(sender_chat, "id", None)
+    if sender_chat_id is None:
+        # is_automatic_forward without a sender_chat shouldn't happen, but if it does
+        # the flag alone already tells us Telegram, not a member, posted this.
+        return True
+    chat_id = getattr(message.chat, "id", None)
+    return chat_id is None or int(sender_chat_id) != int(chat_id)
 
 
 def _is_anonymous_admin_message(message: Message) -> bool:

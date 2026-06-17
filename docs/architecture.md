@@ -3,28 +3,33 @@
 ## Pipeline
 
 1. Telegram message handler receives group/supergroup messages.
-2. Join service messages with `new_chat_members` are converted into profile checks for the
+2. Linked-channel posts auto-forwarded by Telegram (`is_automatic_forward=True`, sender
+   `777000`, `sender_chat` = source channel) are skipped before any rule runs, so the
+   group's own channel content is never deleted/banned. Telegram's service account
+   `777000` is also whitelisted by default; operator whitelist entries (env
+   `WHITELISTED_USER_IDS` / `whitelisted_users` table) bypass moderation here too.
+3. Join service messages with `new_chat_members` are converted into profile checks for the
    joined users, so spammy profile bio can be handled even when the service message has no text.
-3. Feature extraction parses links from text, `text_link` entities, and link previews.
-4. For short text or punctuation-only text with `link_preview_options.url`, the OG fetcher
+4. Feature extraction parses links from text, `text_link` entities, and link previews.
+5. For short text or punctuation-only text with `link_preview_options.url`, the OG fetcher
    validates the URL, blocks private/internal destinations, limits redirects/bytes/time, and
    extracts title/description text for local rules and the LLM payload.
-5. Text is normalized and converted to content/skeleton fingerprints.
-6. User profile context is cached from message sender fields. Bio is fetched best-effort via
+6. Text is normalized and converted to content/skeleton fingerprints.
+7. User profile context is cached from message sender fields. Bio is fetched best-effort via
    `get_chat(user_id)` when Bot API exposes it, and explicit bio spam signals are handled locally.
-7. Local rules check known fingerprints, reputation, repeat windows, repeated open votes, profile
+8. Local rules check known fingerprints, reputation, repeat windows, repeated open votes, profile
    bio signals, and hard carrier signals.
-8. Decisions are applied by the action layer:
+9. Decisions are applied by the action layer:
    - allow/review only logs observations
    - withdraw + vote opens an inline vote session while preserving the original message for review
    - ban deletes the current hit plus the same user's open-vote suspect/vote messages, bans when
      permissions allow it, and posts a group summary that is deleted after 2 minutes
-9. Vote callbacks update `vote_sessions`, `vote_session_votes`, reputation, and action logs.
-10. Confirmed-spam vote callbacks close all open vote sessions for the suspect user, clean the
+10. Vote callbacks update `vote_sessions`, `vote_session_votes`, reputation, and action logs.
+11. Confirmed-spam vote callbacks close all open vote sessions for the suspect user, clean the
    related suspect messages and bot vote prompts, ban the user, and update admin notifications.
-11. A background sweeper expires stale open vote sessions as `expired_released`, logs the
+12. A background sweeper expires stale open vote sessions as `expired_released`, logs the
    default-release action, and edits the vote message when Telegram allows it.
-12. Feedback updates fingerprints and reputation:
+13. Feedback updates fingerprints and reputation:
    - LLM spam creates medium-weight skeleton/phrase fingerprints
    - vote-confirmed spam boosts skeleton/content fingerprints
    - vote-released messages mark false positives and lower fingerprint weight
