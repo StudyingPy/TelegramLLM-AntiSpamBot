@@ -86,6 +86,8 @@ class Settings:
     llm_fingerprint_initial_weight: float
     vote_confirmed_fingerprint_weight: float
     fingerprint_false_positive_penalty: float
+    fingerprint_hit_weight_increment: float
+    fingerprint_hit_weight_cap: float
     llm_review_threshold: float
     llm_ban_threshold: float
     newapi_base_url: str | None
@@ -145,6 +147,8 @@ class Settings:
             llm_fingerprint_initial_weight=_env_float("LLM_FINGERPRINT_INITIAL_WEIGHT", 50),
             vote_confirmed_fingerprint_weight=_env_float("VOTE_CONFIRMED_FINGERPRINT_WEIGHT", 85),
             fingerprint_false_positive_penalty=_env_float("FINGERPRINT_FALSE_POSITIVE_PENALTY", 30),
+            fingerprint_hit_weight_increment=_env_float("FINGERPRINT_HIT_WEIGHT_INCREMENT", 5),
+            fingerprint_hit_weight_cap=_env_float("FINGERPRINT_HIT_WEIGHT_CAP", 80),
             llm_review_threshold=_env_float("LLM_REVIEW_THRESHOLD", 0.70),
             llm_ban_threshold=_env_float("LLM_BAN_THRESHOLD", 0.85),
             newapi_base_url=os.getenv("NEWAPI_BASE_URLS") or os.getenv("NEWAPI_BASE_URL") or None,

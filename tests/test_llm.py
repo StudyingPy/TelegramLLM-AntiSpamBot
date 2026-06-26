@@ -47,6 +47,8 @@ def _settings() -> Settings:
         llm_fingerprint_initial_weight=50,
         vote_confirmed_fingerprint_weight=85,
         fingerprint_false_positive_penalty=30,
+        fingerprint_hit_weight_increment=5,
+        fingerprint_hit_weight_cap=80,
         llm_review_threshold=0.70,
         llm_ban_threshold=0.85,
         newapi_base_url=None,
