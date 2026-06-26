@@ -72,6 +72,8 @@ def _settings_with_admins() -> Settings:
         llm_fingerprint_initial_weight=settings.llm_fingerprint_initial_weight,
         vote_confirmed_fingerprint_weight=settings.vote_confirmed_fingerprint_weight,
         fingerprint_false_positive_penalty=settings.fingerprint_false_positive_penalty,
+        fingerprint_hit_weight_increment=settings.fingerprint_hit_weight_increment,
+        fingerprint_hit_weight_cap=settings.fingerprint_hit_weight_cap,
         llm_review_threshold=settings.llm_review_threshold,
         llm_ban_threshold=settings.llm_ban_threshold,
         newapi_base_url=settings.newapi_base_url,

@@ -470,7 +470,24 @@ class Database:
             source=row["source"],
         )
 
-    def record_fingerprint_hit(self, fingerprint_id: int) -> None:
+    def record_fingerprint_hit(
+        self,
+        fingerprint_id: int,
+        *,
+        weight_increment: float = 0.0,
+        weight_cap: float = 0.0,
+    ) -> float | None:
+        """Record a hit and optionally bump the fingerprint weight.
+
+        Each hit on a known-spam fingerprint is corroborating evidence, so we
+        let weight climb by ``weight_increment`` per hit up to ``weight_cap``.
+        The cap is intentionally kept below ``fingerprint_ban_weight`` so that
+        repeated hits raise confidence without ever crossing the auto-ban line
+        on their own — only vote-confirmed / strict content fingerprints may.
+        An already-higher weight (e.g. vote-confirmed) is never lowered.
+
+        Returns the resulting weight, or ``None`` if the fingerprint was gone.
+        """
         with self._locked_conn() as conn:
             conn.execute(
                 """
@@ -480,7 +497,21 @@ class Database:
                 """,
                 (_now(), fingerprint_id),
             )
+            if weight_increment > 0:
+                conn.execute(
+                    """
+                    UPDATE fingerprints
+                    SET weight = max(weight, min(weight + ?, ?))
+                    WHERE id = ?
+                    """,
+                    (weight_increment, weight_cap, fingerprint_id),
+                )
+            row = conn.execute(
+                "SELECT weight FROM fingerprints WHERE id = ?",
+                (fingerprint_id,),
+            ).fetchone()
             conn.commit()
+        return None if row is None else row["weight"]
 
     def upsert_fingerprint(
         self,

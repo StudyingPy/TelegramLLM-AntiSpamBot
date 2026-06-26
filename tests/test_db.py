@@ -140,6 +140,49 @@ def test_vote_feedback_boosts_and_downgrades_fingerprints(tmp_path):
         db.close()
 
 
+def test_record_fingerprint_hit_accumulates_weight_up_to_cap(tmp_path):
+    """Regression: an LLM-derived fingerprint starts at weight 50, which maps to a
+    fixed 0.50 confidence via min(0.90, weight/100). Repeated hits on a known-spam
+    fingerprint are corroborating evidence and must raise its weight (and thus
+    confidence) instead of staying pinned at 50%, capped below the auto-ban line."""
+    db = _db(tmp_path)
+    try:
+        db.upsert_fingerprint("phrase", "known-spam-phrase", 50, "llm_spam_phrase")
+        fp = db.get_fingerprint("known-spam-phrase")
+        assert fp is not None
+        assert fp.weight == 50
+
+        increment, cap = 5, 80
+        new_weight = db.record_fingerprint_hit(
+            fp.id, weight_increment=increment, weight_cap=cap
+        )
+        assert new_weight == 55
+
+        # Climbs with each hit but never exceeds the cap.
+        last = new_weight
+        for _ in range(20):
+            last = db.record_fingerprint_hit(
+                fp.id, weight_increment=increment, weight_cap=cap
+            )
+        assert last == cap
+
+        bumped = db.get_fingerprint("known-spam-phrase")
+        assert bumped is not None
+        assert bumped.weight == cap
+        assert bumped.hit_count == 21
+
+        # An already-higher weight is never dragged down to the cap.
+        db.upsert_fingerprint("content", "vote-confirmed", 85, "vote_confirmed")
+        strong = db.get_fingerprint("vote-confirmed")
+        assert strong is not None
+        held = db.record_fingerprint_hit(
+            strong.id, weight_increment=increment, weight_cap=cap
+        )
+        assert held == 85
+    finally:
+        db.close()
+
+
 def test_recent_skeleton_senders_counts_distinct_users(tmp_path):
     db = _db(tmp_path)
     try:

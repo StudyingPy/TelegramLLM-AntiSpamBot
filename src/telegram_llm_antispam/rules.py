@@ -125,6 +125,15 @@ class RuleEngine:
             )
 
         if fingerprint.weight >= self._settings.fingerprint_review_weight:
+            # A skeleton/phrase fingerprint hit is strong evidence, but these types
+            # over-generalize, so we do NOT auto-ban on them (only content-type hashes
+            # above escalate to BAN). Crucially, we still send the message through the
+            # LLM rather than short-circuiting to a vote: a known-spam shape should get
+            # AT LEAST the same scrutiny an unmatched message would. _merge_llm_decision
+            # then upgrades to BAN when the LLM confirms ad with high confidence, and
+            # falls back to this WITHDRAW_VOTE when the LLM says not-spam or is
+            # unavailable — so a single mislabeled fingerprint can never connect-ban
+            # every later message that merely shares its shape.
             return LocalDecision(
                 action=DecisionAction.WITHDRAW_VOTE,
                 reason=(
@@ -133,7 +142,7 @@ class RuleEngine:
                     else "known_fingerprint"
                 ),
                 confidence=min(0.90, fingerprint.weight / 100),
-                should_call_llm=False,
+                should_call_llm=True,
                 metadata={
                     "fingerprint_id": fingerprint.id,
                     "fingerprint_type": fingerprint.fingerprint_type,

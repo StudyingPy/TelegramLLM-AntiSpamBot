@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -260,7 +261,13 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
 
         fingerprint = db.get_strongest_fingerprint(fingerprint_lookup_values(features))
         if fingerprint is not None:
-            db.record_fingerprint_hit(fingerprint.id)
+            new_weight = db.record_fingerprint_hit(
+                fingerprint.id,
+                weight_increment=settings.fingerprint_hit_weight_increment,
+                weight_cap=settings.fingerprint_hit_weight_cap,
+            )
+            if new_weight is not None and new_weight != fingerprint.weight:
+                fingerprint = replace(fingerprint, weight=new_weight)
 
         same_user_repeat_decision = _same_user_open_vote_repeat_decision(settings, db, features)
         repeat_decision = _repeat_decision(settings, db, features)

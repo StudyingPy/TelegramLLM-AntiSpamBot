@@ -10,6 +10,7 @@ from telegram_llm_antispam.handlers import (
     _apply_verified_admin_action,
     _is_automatic_channel_forward,
     _is_whitelisted_sender,
+    _merge_llm_decision,
     _new_chat_members,
     _same_user_open_vote_repeat_decision,
     _is_anonymous_admin_message,
@@ -496,3 +497,69 @@ def test_automatic_channel_forward_skips_moderation_entirely(tmp_path):
         assert not rows, "auto-forwarded channel post must not appear in action_log"
     finally:
         db.close()
+
+
+def _known_fingerprint_features(reputation: int = 10):
+    """A benign-looking multi-token message that matched a known phrase/skeleton
+    fingerprint: local decision is WITHDRAW_VOTE with should_call_llm=True. Low
+    reputation so an LLM ad-confirmation is allowed to escalate to BAN."""
+    message = SimpleNamespace(
+        message_id=9,
+        chat=SimpleNamespace(id=-100123),
+        from_user=SimpleNamespace(id=42),
+        text="看我主页 有你想要的",
+    )
+    context = UserContext(
+        chat_id=-100123, user_id=42, reputation_score=reputation, messages_seen=1
+    )
+    return build_message_features(message, context)
+
+
+def test_known_fingerprint_vote_upgrades_to_ban_when_llm_confirms_ad():
+    """A known phrase/skeleton fingerprint hit now goes through the LLM. When the LLM
+    confirms spam at high confidence, the WITHDRAW_VOTE must upgrade to BAN — so a
+    known-spam shape is no longer treated more leniently than an unmatched message."""
+    settings = _settings()
+    features = _known_fingerprint_features(reputation=10)
+    local = LocalDecision(
+        action=DecisionAction.WITHDRAW_VOTE,
+        reason="known_fingerprint",
+        confidence=0.50,
+        should_call_llm=True,
+    )
+    judgement = LLMJudgement(
+        is_spam=True,
+        confidence=0.96,
+        category="traffic_diversion",
+        signal_phrases=("看我主页", "有你想要的"),
+    )
+
+    merged = _merge_llm_decision(local, judgement, features, settings)
+
+    assert merged.action == DecisionAction.BAN
+    assert merged.confidence == 0.96
+
+
+def test_known_fingerprint_vote_survives_llm_not_spam():
+    """When the LLM says not-spam, the known-fingerprint WITHDRAW_VOTE must remain a
+    vote (not flip to ALLOW) — a single mislabeled fingerprint can never connect-ban,
+    but a genuine shape match still earns a chat dispute rather than a silent pass."""
+    settings = _settings()
+    features = _known_fingerprint_features(reputation=50)
+    local = LocalDecision(
+        action=DecisionAction.WITHDRAW_VOTE,
+        reason="known_fingerprint",
+        confidence=0.50,
+        should_call_llm=True,
+    )
+    judgement = LLMJudgement(
+        is_spam=False,
+        confidence=0.90,
+        category="benign",
+        signal_phrases=(),
+    )
+
+    merged = _merge_llm_decision(local, judgement, features, settings)
+
+    assert merged.action == DecisionAction.WITHDRAW_VOTE
+    assert merged.reason == "known_fingerprint"
