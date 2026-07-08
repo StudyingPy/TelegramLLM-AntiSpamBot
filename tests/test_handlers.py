@@ -12,8 +12,12 @@ from telegram_llm_antispam.handlers import (
     _is_whitelisted_sender,
     _merge_llm_decision,
     _new_chat_members,
+    _parse_whitelist_target,
     _same_user_open_vote_repeat_decision,
     _is_anonymous_admin_message,
+    _whitelist_add,
+    _whitelist_list,
+    _whitelist_remove,
     create_router,
 )
 from telegram_llm_antispam.features import build_message_features
@@ -174,6 +178,116 @@ def test_review_deeplink_shows_card_to_group_admin(tmp_path):
         assert markup is not None
         callbacks = {b.callback_data for row in markup.inline_keyboard for b in row}
         assert callbacks == {f"review_ban:{session_id}", f"review_keep:{session_id}"}
+    finally:
+        db.close()
+
+
+def test_parse_whitelist_target_explicit_id_and_note():
+    message = SimpleNamespace(reply_to_message=None)
+    assert _parse_whitelist_target(message, "12345 nmBot 客服酱") == (12345, "nmBot 客服酱")
+    assert _parse_whitelist_target(message, "  678  ") == (678, None)
+
+
+def test_parse_whitelist_target_from_reply():
+    """Replying to a user's message resolves the target; args become the note."""
+    message = SimpleNamespace(
+        reply_to_message=SimpleNamespace(from_user=SimpleNamespace(id=999))
+    )
+    assert _parse_whitelist_target(message, "友好机器人") == (999, "友好机器人")
+    assert _parse_whitelist_target(message, None) == (999, None)
+
+
+def test_parse_whitelist_target_rejects_garbage():
+    message = SimpleNamespace(reply_to_message=None)
+    assert _parse_whitelist_target(message, "not_a_number") == (None, None)
+    assert _parse_whitelist_target(message, "") == (None, None)
+    assert _parse_whitelist_target(message, None) == (None, None)
+
+
+def test_whitelist_add_remove_list_roundtrip(tmp_path):
+    db = _db(tmp_path)
+    settings = _settings()
+    try:
+        add_text = _whitelist_add(db, 12345, "nmBot", added_by=100)
+        assert "已加入白名单" in add_text
+        assert "12345" in add_text
+        assert db.is_user_whitelisted(12345, ()) is True
+
+        list_text = _whitelist_list(db, settings)
+        assert "12345" in list_text
+        assert "nmBot" in list_text
+
+        remove_text = _whitelist_remove(db, 12345)
+        assert "已移出白名单" in remove_text
+        assert db.is_user_whitelisted(12345, ()) is False
+
+        # Removing again reports it was absent.
+        assert "不在白名单表中" in _whitelist_remove(db, 12345)
+    finally:
+        db.close()
+
+
+def test_whitelist_note_is_html_escaped(tmp_path):
+    """Notes are user-supplied and rendered under HTML parse mode — must be escaped."""
+    db = _db(tmp_path)
+    try:
+        text = _whitelist_add(db, 1, "<b>x</b>", added_by=None)
+        assert "<b>x</b>" not in text
+        assert "&lt;b&gt;" in text
+    finally:
+        db.close()
+
+
+def _run_command_handler(router, command_name: str, message, command):
+    """Invoke the router message handler registered for a given /command."""
+    import asyncio
+
+    for handler in router.message.handlers:
+        for f in handler.filters:
+            cmds = getattr(getattr(f, "callback", None), "commands", None)
+            if cmds and command_name in cmds:
+                asyncio.run(handler.callback(message, command=command))
+                return True
+    raise AssertionError(f"no handler for /{command_name}")
+
+
+def test_whitelist_command_requires_global_admin(tmp_path):
+    """Only global admins (ADMIN_USER_IDS) may run /whitelist; others are refused and
+    nothing is written."""
+    from dataclasses import replace
+
+    from aiogram.filters import CommandObject
+
+    db = _db(tmp_path)
+    settings = replace(_settings(), admin_user_ids=(100,))
+    try:
+        router = create_router(settings, db)
+        answers: list[str] = []
+
+        async def fake_answer(text, reply_markup=None):
+            answers.append(text)
+
+        def _msg(uid):
+            return SimpleNamespace(
+                chat=SimpleNamespace(id=uid, type="private"),
+                from_user=SimpleNamespace(id=uid),
+                reply_to_message=None,
+                answer=fake_answer,
+            )
+
+        # Non-admin (id=42) refused.
+        _run_command_handler(
+            router, "whitelist", _msg(42), CommandObject(command="whitelist", args="777")
+        )
+        assert "只有全局管理员" in answers[-1]
+        assert db.is_user_whitelisted(777, ()) is False
+
+        # Global admin (id=100) succeeds.
+        _run_command_handler(
+            router, "whitelist", _msg(100), CommandObject(command="whitelist", args="777 friend")
+        )
+        assert "已加入白名单" in answers[-1]
+        assert db.is_user_whitelisted(777, ()) is True
     finally:
         db.close()
 

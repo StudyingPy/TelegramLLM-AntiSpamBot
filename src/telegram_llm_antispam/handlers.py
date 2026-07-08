@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import logging
 from dataclasses import replace
 from types import SimpleNamespace
@@ -88,7 +89,10 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
             "Telegram 反广告机器人已运行。\n"
             "/status 查看状态\n"
             "/allow_chat 允许当前群组使用机器人\n"
-            "/deny_chat 禁用当前群组"
+            "/deny_chat 禁用当前群组\n"
+            "/whitelist <user_id> [备注] 加入全局白名单（仅全局管理员）\n"
+            "/unwhitelist <user_id> 移出全局白名单（仅全局管理员）\n"
+            "/list_whitelist 查看全局白名单（仅全局管理员）"
         )
 
     async def _handle_review_deeplink(message: Message, payload: str) -> None:
@@ -197,6 +201,44 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
             return
         db.disallow_chat(chat_id)
         await message.answer(f"已禁用群组：<code>{chat_id}</code>")
+
+    @router.message(Command("whitelist"))
+    async def on_whitelist(message: Message, command: CommandObject) -> None:
+        # Global-admin-only. The whitelist is global (not chat-scoped), so we gate on
+        # is_global_admin regardless of where the command runs, in group or private.
+        user_id = message.from_user.id if message.from_user else None
+        if not is_global_admin(settings, user_id):
+            await message.answer("只有全局管理员可以管理白名单。")
+            return
+        target_id, note = _parse_whitelist_target(message, command.args)
+        if target_id is None:
+            await message.answer(
+                "用法：/whitelist <user_id> [备注]，或回复某人的消息 /whitelist [备注]。"
+            )
+            return
+        await message.answer(_whitelist_add(db, target_id, note, added_by=user_id))
+
+    @router.message(Command("unwhitelist"))
+    async def on_unwhitelist(message: Message, command: CommandObject) -> None:
+        user_id = message.from_user.id if message.from_user else None
+        if not is_global_admin(settings, user_id):
+            await message.answer("只有全局管理员可以管理白名单。")
+            return
+        target_id, _ = _parse_whitelist_target(message, command.args)
+        if target_id is None:
+            await message.answer(
+                "用法：/unwhitelist <user_id>，或回复某人的消息 /unwhitelist。"
+            )
+            return
+        await message.answer(_whitelist_remove(db, target_id))
+
+    @router.message(Command("list_whitelist"))
+    async def on_list_whitelist(message: Message) -> None:
+        user_id = message.from_user.id if message.from_user else None
+        if not is_global_admin(settings, user_id):
+            await message.answer("只有全局管理员可以查看白名单。")
+            return
+        await message.answer(_whitelist_list(db, settings))
 
     @router.message()
     async def on_message(message: Message) -> None:
@@ -587,10 +629,86 @@ def _message_chat_title(message: Message | None) -> str | None:
 
 
 def _parse_chat_id(value: str) -> int | None:
+    return _parse_int(value)
+
+
+def _parse_int(value: str | None) -> int | None:
+    if value is None:
+        return None
     try:
         return int(value.strip())
     except ValueError:
         return None
+
+
+def _parse_whitelist_target(
+    message: Message,
+    args: str | None,
+) -> tuple[int | None, str | None]:
+    """Resolve the whitelist target from a /whitelist command.
+
+    Two forms:
+      - `/whitelist <user_id> [note]` — explicit id, remaining text is the note.
+      - reply to a user's message + `/whitelist [note]` — target is the replied-to
+        sender (the ergonomic path, since raw user_ids are hard to get in Telegram).
+    Returns (user_id, note); user_id is None when neither form yields a target.
+    """
+    reply = getattr(message, "reply_to_message", None)
+    reply_user = getattr(reply, "from_user", None)
+    reply_user_id = getattr(reply_user, "id", None)
+
+    text = (args or "").strip()
+    if reply_user_id is not None:
+        # Reply form: the whole argument string (if any) is the note.
+        note = text or None
+        return int(reply_user_id), note
+
+    if not text:
+        return None, None
+    parts = text.split(maxsplit=1)
+    target_id = _parse_int(parts[0])
+    if target_id is None:
+        return None, None
+    note = parts[1].strip() if len(parts) == 2 and parts[1].strip() else None
+    return target_id, note
+
+
+def _whitelist_add(
+    db: Database,
+    user_id: int,
+    note: str | None,
+    *,
+    added_by: int | None,
+) -> str:
+    db.whitelist_user(user_id, note, added_by_user_id=added_by)
+    note_text = f"（备注：{html.escape(note)}）" if note else ""
+    return f"已加入白名单：<code>{user_id}</code>{note_text}"
+
+
+def _whitelist_remove(db: Database, user_id: int) -> str:
+    removed = db.unwhitelist_user(user_id)
+    if removed:
+        return f"已移出白名单：<code>{user_id}</code>"
+    return f"该用户不在白名单表中：<code>{user_id}</code>（环境变量配置的 ID 不受影响）"
+
+
+def _whitelist_list(db: Database, settings: Settings) -> str:
+    lines: list[str] = ["全局白名单"]
+    env_ids = settings.whitelisted_user_ids
+    if env_ids:
+        lines.append(
+            "环境变量 WHITELISTED_USER_IDS：" + ", ".join(str(i) for i in env_ids)
+        )
+    rows = db.list_whitelisted_users()
+    if not rows:
+        lines.append("白名单表：暂无")
+        return "\n".join(lines)
+    lines.append("白名单表：")
+    for row in rows[:50]:
+        note = row.get("note")
+        note_text = f" — {html.escape(str(note))}" if note else ""
+        lines.append(f"- <code>{row['user_id']}</code>{note_text}")
+    return "\n".join(lines)
 
 
 def _new_chat_members(message: Message) -> tuple[Any, ...]:

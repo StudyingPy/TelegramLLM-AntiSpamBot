@@ -44,6 +44,9 @@ async def run() -> None:
             BotCommand(command="status", description="查看机器人状态"),
             BotCommand(command="allow_chat", description="允许当前群组使用机器人"),
             BotCommand(command="deny_chat", description="禁用当前群组"),
+            BotCommand(command="whitelist", description="加入全局白名单（仅全局管理员）"),
+            BotCommand(command="unwhitelist", description="移出全局白名单（仅全局管理员）"),
+            BotCommand(command="list_whitelist", description="查看全局白名单（仅全局管理员）"),
         ]
     )
     vote_sweeper = asyncio.create_task(

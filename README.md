@@ -55,6 +55,15 @@ URL、key、model 会按位置配对；只有一个 key 或 model 时会复用�
 继续按消息内容判断。包含进群、做单、刷单、色情、博彩等明确导流信号的 bio 会作为
 本地强信号直接处理。
 
+全局白名单里的用户完全跳过审核，适合放行 nmBot / 客服酱这类友好机器人。除了
+`WHITELISTED_USER_IDS` 环境变量和 `antispam-admin whitelist-user` CLI，**全局管理员**
+（`ADMIN_USER_IDS`）还可以直接在与 bot 的对话或群里用命令管理，群管理员无权使用：
+
+- `/whitelist <user_id> [备注]`：加入全局白名单；也可以直接回复某人的消息 `/whitelist [备注]`，
+  自动取被回复者的 ID（省去手动查 user_id）。
+- `/unwhitelist <user_id>`：从白名单表移出（环境变量配置的 ID 不受影响）。
+- `/list_whitelist`：查看当前白名单（环境变量 + 数据库表）。
+
 初始化数据库：
 
 ```powershell
