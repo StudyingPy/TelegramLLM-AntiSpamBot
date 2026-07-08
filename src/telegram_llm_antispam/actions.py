@@ -332,7 +332,12 @@ class ModerationActions:
             bot,
             self._db,
             session_id,
-            vote_status_text(self._db, refreshed),
+            vote_status_text(
+                self._db,
+                refreshed,
+                label="投票超时补审：维持放行",
+                moderator_user_id=moderator_user_id,
+            ),
             is_open=False,
         )
         return True, "已维持放行"
@@ -497,6 +502,11 @@ class ModerationActions:
             metadata["banned"] = False
             metadata["ban_error"] = permissions.reason or "missing_restrict_permission"
 
+        # Present in metadata for admin skip-vote ban and catch-up review ban; None
+        # for automatic (auto_banned / vote_threshold) closures, which suppresses the
+        # attribution line in the edited notification.
+        moderator_user_id = metadata.get("moderator_user_id")
+
         for session in sessions:
             self._db.close_vote_session(session.id, final_status, allowed_from=allowed_from)
             closed_session = self._db.get_vote_session(session.id)
@@ -514,7 +524,11 @@ class ModerationActions:
                     bot,
                     self._db,
                     session.id,
-                    vote_status_text(self._db, closed_session or session),
+                    vote_status_text(
+                        self._db,
+                        closed_session or session,
+                        moderator_user_id=moderator_user_id,
+                    ),
                     is_open=False,
                 )
 
@@ -525,7 +539,11 @@ class ModerationActions:
                     bot,
                     self._db,
                     primary_session.id,
-                    vote_status_text(self._db, primary_session),
+                    vote_status_text(
+                        self._db,
+                        primary_session,
+                        moderator_user_id=moderator_user_id,
+                    ),
                     is_open=False,
                 )
 

@@ -200,6 +200,71 @@ def test_catchup_keep_records_release_and_drops_button(tmp_path):
         db.close()
 
 
+def test_catchup_ban_attributes_moderator_in_admin_notification(tmp_path):
+    """The edited global-admin notification (same in-place edit as a live vote
+    result) must attribute the catch-up decision to the moderator's ID."""
+    db = _db(tmp_path)
+    bot = FakeBot()
+    try:
+        actions = ModerationActions(_settings(), db)
+        actions.SUMMARY_DELETE_DELAY_SECONDS = 0
+        session_id = db.create_vote_session(
+            _features(10),
+            LocalDecision(DecisionAction.WITHDRAW_VOTE, "known_fingerprint", 0.85),
+            timeout_seconds=-1,
+        )
+        db.set_vote_message_id(session_id, 110)
+        db.expire_open_vote_sessions()
+        # A global admin received the notification at vote-open time (user 555, msg 700).
+        db.record_admin_notification(
+            vote_session_id=session_id,
+            action_log_id=None,
+            notify_user_id=555,
+            message_id=700,
+            base_text="反广告处理记录",
+        )
+
+        ok, _ = asyncio.run(actions.catchup_ban_vote_session(bot, session_id, moderator_user_id=7))
+
+        assert ok is True
+        dm_edits = [e for e in bot.edited_messages if e["chat_id"] == 555 and e["message_id"] == 700]
+        assert dm_edits, "global admin notification should have been edited"
+        assert "补审操作者：7" in dm_edits[-1]["text"]
+    finally:
+        db.close()
+
+
+def test_catchup_keep_attributes_moderator_in_admin_notification(tmp_path):
+    db = _db(tmp_path)
+    bot = FakeBot()
+    try:
+        actions = ModerationActions(_settings(), db)
+        session_id = db.create_vote_session(
+            _features(10),
+            LocalDecision(DecisionAction.WITHDRAW_VOTE, "known_fingerprint", 0.85),
+            timeout_seconds=-1,
+        )
+        db.set_vote_message_id(session_id, 110)
+        db.expire_open_vote_sessions()
+        db.record_admin_notification(
+            vote_session_id=session_id,
+            action_log_id=None,
+            notify_user_id=555,
+            message_id=700,
+            base_text="反广告处理记录",
+        )
+
+        ok, _ = asyncio.run(actions.catchup_keep_vote_session(bot, session_id, moderator_user_id=9))
+
+        assert ok is True
+        dm_edits = [e for e in bot.edited_messages if e["chat_id"] == 555 and e["message_id"] == 700]
+        assert dm_edits
+        assert "补审操作者：9" in dm_edits[-1]["text"]
+        assert "维持放行" in dm_edits[-1]["text"]
+    finally:
+        db.close()
+
+
 def test_catchup_ban_rejects_already_finalized_session(tmp_path):
     """A session that was already confirmed/banned cannot be re-banned via catch-up."""
     db = _db(tmp_path)

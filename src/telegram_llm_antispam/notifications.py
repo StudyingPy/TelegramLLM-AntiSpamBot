@@ -81,6 +81,7 @@ def vote_status_text(
     session_or_tally: VoteSession | VoteTally,
     *,
     label: str | None = None,
+    moderator_user_id: int | None = None,
 ) -> str:
     spam_votes = session_or_tally.spam_votes
     ham_votes = session_or_tally.ham_votes
@@ -90,6 +91,11 @@ def vote_status_text(
         f"状态：{status}",
         f"投票：广告 {spam_votes} / 放行 {ham_votes}",
     ]
+    # An admin action (skip-vote ban, or catch-up review after timeout) records who
+    # did it. Surface that ID here so the global-admin notification — edited in place,
+    # same as a live vote result — attributes the manual decision.
+    if moderator_user_id is not None:
+        lines.append(f"补审操作者：{moderator_user_id}")
     session_id = (
         session_or_tally.id
         if isinstance(session_or_tally, VoteSession)
