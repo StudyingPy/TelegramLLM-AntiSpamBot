@@ -119,6 +119,65 @@ def admin_ban_keyboard(session_id: int) -> InlineKeyboardMarkup:
     )
 
 
+REVIEW_DEEPLINK_PREFIX = "review_"
+
+
+def catchup_review_keyboard(bot_username: str, session_id: int) -> InlineKeyboardMarkup:
+    """Button shown on a timed-out group vote message.
+
+    It is a deep link into the bot's private chat carrying the session id
+    (`https://t.me/<bot>?start=review_<id>`). Tapping it opens a DM where the
+    admin re-reviews the released message and can still ban or keep it. We use a
+    URL button rather than a callback because the private-chat review has to run
+    where `can_manage_chat` can verify the tapper is a real admin of the group.
+    """
+    url = f"https://t.me/{bot_username}?start={REVIEW_DEEPLINK_PREFIX}{session_id}"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="前往私聊补审",
+                    url=url,
+                )
+            ]
+        ]
+    )
+
+
+def review_action_keyboard(session_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="确认封禁",
+                    callback_data=f"review_ban:{session_id}",
+                ),
+                InlineKeyboardButton(
+                    text="维持放行",
+                    callback_data=f"review_keep:{session_id}",
+                ),
+            ]
+        ]
+    )
+
+
+def review_card_text(db: Database, session: VoteSession) -> str:
+    """Private-chat review card for a timed-out (or already closed) vote session."""
+    message_link = _message_link(session.chat_id, session.original_message_id)
+    lines = [
+        "投票超时补审",
+        f"群组：<code>{session.chat_id}</code>",
+        f"原消息：{message_link}",
+        f"疑似用户：<code>{session.suspect_user_id or '-'}</code>",
+        f"触发：<code>{_esc(session.reason)}</code>",
+        f"投票：广告 {session.spam_votes} / 放行 {session.ham_votes}",
+        f"当前状态：{_status_label(session.status)}",
+    ]
+    if session.status != "expired_released":
+        lines.append("该会话已被处理，补审仅供参考。")
+    return "\n".join(lines)
+
+
 def _notification_text(
     features: MessageFeatures,
     decision: LocalDecision,

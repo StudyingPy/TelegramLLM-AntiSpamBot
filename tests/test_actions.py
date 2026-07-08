@@ -16,10 +16,11 @@ class FakeBot:
         self.deleted_messages: list[tuple[int, int]] = []
         self.banned_users: list[tuple[int, int]] = []
         self.sent_messages: list[tuple[int, str]] = []
+        self.edited_messages: list[dict[str, object]] = []
         self.next_message_id = 900
 
     async def get_me(self):
-        return SimpleNamespace(id=999)
+        return SimpleNamespace(id=999, username="antispam_test_bot")
 
     async def get_chat_member(self, chat_id: int, user_id: int):
         if user_id == 999:
@@ -40,6 +41,16 @@ class FakeBot:
         self.sent_messages.append((chat_id, text))
         self.next_message_id += 1
         return SimpleNamespace(message_id=self.next_message_id)
+
+    async def edit_message_text(self, text, chat_id=None, message_id=None, reply_markup=None):
+        self.edited_messages.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
+                "reply_markup": reply_markup,
+            }
+        )
 
 
 def _db(tmp_path: Path) -> Database:
@@ -104,3 +115,120 @@ def test_confirmed_spam_vote_cleans_related_messages_and_bans(tmp_path):
         assert db.get_vote_session(second_session_id).status == "confirmed_spam"
     finally:
         db.close()
+
+
+def test_expired_vote_message_gets_catchup_review_button(tmp_path):
+    """When a vote times out, the group message is edited to carry a deep-link
+    button into the private-chat catch-up review."""
+    db = _db(tmp_path)
+    bot = FakeBot()
+    try:
+        actions = ModerationActions(_settings(), db)
+        session_id = db.create_vote_session(
+            _features(10),
+            LocalDecision(DecisionAction.WITHDRAW_VOTE, "known_fingerprint", 0.85),
+            timeout_seconds=-1,
+        )
+        db.set_vote_message_id(session_id, 110)
+
+        expired = asyncio.run(actions.expire_due_vote_sessions(bot))
+
+        assert expired == 1
+        assert db.get_vote_session(session_id).status == "expired_released"
+        assert len(bot.edited_messages) == 1
+        edit = bot.edited_messages[0]
+        assert edit["message_id"] == 110
+        assert "前往私聊补审" in _keyboard_text(edit["reply_markup"])
+        assert f"start=review_{session_id}" in _keyboard_url(edit["reply_markup"])
+    finally:
+        db.close()
+
+
+def test_catchup_ban_bans_expired_session_and_cleans_messages(tmp_path):
+    """A timed-out (expired_released) session can still be banned via catch-up
+    review; it deletes the original + vote messages and bans the suspect."""
+    db = _db(tmp_path)
+    bot = FakeBot()
+    try:
+        actions = ModerationActions(_settings(), db)
+        actions.SUMMARY_DELETE_DELAY_SECONDS = 0
+        session_id = db.create_vote_session(
+            _features(10),
+            LocalDecision(DecisionAction.WITHDRAW_VOTE, "known_fingerprint", 0.85),
+            timeout_seconds=-1,
+        )
+        db.set_vote_message_id(session_id, 110)
+        db.expire_open_vote_sessions()
+        assert db.get_vote_session(session_id).status == "expired_released"
+
+        ok, text = asyncio.run(actions.catchup_ban_vote_session(bot, session_id, moderator_user_id=7))
+
+        assert ok is True
+        assert text == "已封禁"
+        assert bot.banned_users == [(-1001, 42)]
+        assert (-1001, 10) in bot.deleted_messages
+        assert (-1001, 110) in bot.deleted_messages
+        assert db.get_vote_session(session_id).status == "admin_banned"
+    finally:
+        db.close()
+
+
+def test_catchup_keep_records_release_and_drops_button(tmp_path):
+    """Keeping a timed-out session after review records the decision and edits the
+    group message to remove the catch-up button."""
+    db = _db(tmp_path)
+    bot = FakeBot()
+    try:
+        actions = ModerationActions(_settings(), db)
+        session_id = db.create_vote_session(
+            _features(10),
+            LocalDecision(DecisionAction.WITHDRAW_VOTE, "known_fingerprint", 0.85),
+            timeout_seconds=-1,
+        )
+        db.set_vote_message_id(session_id, 110)
+        db.expire_open_vote_sessions()
+
+        ok, text = asyncio.run(actions.catchup_keep_vote_session(bot, session_id, moderator_user_id=7))
+
+        assert ok is True
+        assert text == "已维持放行"
+        assert bot.banned_users == []
+        assert bot.edited_messages[-1]["reply_markup"] is None
+        assert "维持放行" in bot.edited_messages[-1]["text"]
+        assert db.get_vote_session(session_id).status == "expired_released"
+    finally:
+        db.close()
+
+
+def test_catchup_ban_rejects_already_finalized_session(tmp_path):
+    """A session that was already confirmed/banned cannot be re-banned via catch-up."""
+    db = _db(tmp_path)
+    bot = FakeBot()
+    try:
+        actions = ModerationActions(_settings(), db)
+        session_id = db.create_vote_session(
+            _features(10),
+            LocalDecision(DecisionAction.WITHDRAW_VOTE, "known_fingerprint", 0.85),
+            timeout_seconds=60,
+        )
+        db.close_vote_session(session_id, "confirmed_spam")
+
+        ok, text = asyncio.run(actions.catchup_ban_vote_session(bot, session_id, moderator_user_id=7))
+
+        assert ok is False
+        assert "已处理" in text
+        assert bot.banned_users == []
+    finally:
+        db.close()
+
+
+def _keyboard_text(markup) -> str:
+    return " ".join(
+        button.text for row in markup.inline_keyboard for button in row
+    )
+
+
+def _keyboard_url(markup) -> str:
+    return " ".join(
+        (button.url or "") for row in markup.inline_keyboard for button in row
+    )

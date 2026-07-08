@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from aiogram import F, Router
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from .actions import ModerationActions
@@ -29,7 +29,12 @@ from .models import (
     LocalDecision,
     MessageFeatures,
 )
-from .notifications import notify_admins
+from .notifications import (
+    REVIEW_DEEPLINK_PREFIX,
+    notify_admins,
+    review_action_keyboard,
+    review_card_text,
+)
 from .og import fetch_og_for_features, should_fetch_og
 from .profile import get_sender_profile
 from .rules import RuleEngine
@@ -72,13 +77,46 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
             return None
 
     @router.message(Command("start", "help"))
-    async def on_help(message: Message) -> None:
+    async def on_help(message: Message, command: CommandObject) -> None:
+        # A `/start review_<id>` deep link (from the catch-up button on a timed-out
+        # group vote) opens the private-chat review flow instead of the help text.
+        payload = (command.args or "").strip()
+        if payload.startswith(REVIEW_DEEPLINK_PREFIX):
+            await _handle_review_deeplink(message, payload)
+            return
         await message.answer(
             "Telegram 反广告机器人已运行。\n"
             "/status 查看状态\n"
             "/allow_chat 允许当前群组使用机器人\n"
             "/deny_chat 禁用当前群组"
         )
+
+    async def _handle_review_deeplink(message: Message, payload: str) -> None:
+        if _chat_type(message) != "private":
+            # Deep links resolve to a DM; ignore a stray `/start review_x` in a group.
+            return
+        try:
+            session_id = int(payload[len(REVIEW_DEEPLINK_PREFIX):])
+        except ValueError:
+            await message.answer("补审链接无效。")
+            return
+
+        session = db.get_vote_session(session_id)
+        if session is None:
+            await message.answer("投票会话不存在或已被清理。")
+            return
+
+        user_id = message.from_user.id if message.from_user else None
+        if not await can_manage_chat(message.bot, settings, session.chat_id, user_id):
+            await message.answer("只有该群组的管理员可以补审此消息。")
+            return
+
+        reply_markup = (
+            review_action_keyboard(session_id)
+            if session.status in {"open", "expired_released"}
+            else None
+        )
+        await message.answer(review_card_text(db, session), reply_markup=reply_markup)
 
     @router.message(Command("status"))
     async def on_status(message: Message) -> None:
@@ -397,6 +435,50 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
                 await callback.message.edit_reply_markup(reply_markup=None)
             except Exception:
                 pass
+
+    @router.callback_query(F.data.startswith("review_ban:"))
+    async def on_review_ban(callback: CallbackQuery) -> None:
+        await _handle_review_action(callback, "review_ban:", ban=True)
+
+    @router.callback_query(F.data.startswith("review_keep:"))
+    async def on_review_keep(callback: CallbackQuery) -> None:
+        await _handle_review_action(callback, "review_keep:", ban=False)
+
+    async def _handle_review_action(callback: CallbackQuery, prefix: str, *, ban: bool) -> None:
+        if not callback.data or not callback.from_user:
+            return
+
+        try:
+            session_id = int(callback.data[len(prefix):])
+        except ValueError:
+            await callback.answer("操作数据无效", show_alert=False)
+            return
+
+        session = db.get_vote_session(session_id)
+        if session is None:
+            await callback.answer("投票不存在", show_alert=False)
+            return
+        if not await can_manage_chat(callback.bot, settings, session.chat_id, callback.from_user.id):
+            await callback.answer("只有该群组的管理员可以补审", show_alert=True)
+            return
+
+        if ban:
+            ok, text = await actions.catchup_ban_vote_session(
+                callback.bot, session_id, callback.from_user.id
+            )
+            result_text = f"已封禁：{session.suspect_user_id}" if ok else text
+        else:
+            ok, text = await actions.catchup_keep_vote_session(
+                callback.bot, session_id, callback.from_user.id
+            )
+            result_text = "已维持放行" if ok else text
+
+        await callback.answer(text, show_alert=not ok)
+        if callback.message is not None and ok:
+            try:
+                await callback.message.edit_text(f"补审完成：{result_text}")
+            except Exception:
+                logger.debug("Failed to edit review card after action", exc_info=True)
 
     return router
 

@@ -101,6 +101,141 @@ def test_router_registers_edited_message_moderation_handler(tmp_path):
         db.close()
 
 
+def test_router_registers_catchup_review_callbacks(tmp_path):
+    """The catch-up review deep link needs review_ban / review_keep callbacks wired."""
+    db = _db(tmp_path)
+    try:
+        router = create_router(_settings(), db)
+
+        # 4 callback groups now: vote, admin_verify, admin_ban, review_ban, review_keep.
+        assert len(router.callback_query.handlers) == 5
+    finally:
+        db.close()
+
+
+def test_review_deeplink_shows_card_to_group_admin(tmp_path):
+    """A `/start review_<id>` DM from a verified group admin returns the review card
+    with ban/keep buttons for a timed-out session."""
+    import asyncio
+
+    from aiogram.filters import CommandObject
+
+    from telegram_llm_antispam.models import DecisionAction, LocalDecision
+
+    db = _db(tmp_path)
+    settings = _settings()
+    try:
+        router = create_router(settings, db)
+
+        message_features = build_message_features(
+            SimpleNamespace(
+                message_id=10,
+                chat=SimpleNamespace(id=-100123),
+                from_user=SimpleNamespace(id=42),
+                text="加群送码拿钱 详细教程 https://spam.example",
+            ),
+            UserContext(chat_id=-100123, user_id=42, reputation_score=20, messages_seen=0),
+        )
+        session_id = db.create_vote_session(
+            message_features,
+            LocalDecision(DecisionAction.WITHDRAW_VOTE, "known_fingerprint", 0.85),
+            timeout_seconds=-1,
+        )
+        db.expire_open_vote_sessions()
+
+        answered: list[dict] = []
+
+        async def fake_answer(text, reply_markup=None):
+            answered.append({"text": text, "reply_markup": reply_markup})
+
+        async def fake_get_chat_member(chat_id, user_id):
+            # The requesting user is an administrator of the group.
+            return SimpleNamespace(status=SimpleNamespace(value="administrator"))
+
+        bot = SimpleNamespace(get_chat_member=fake_get_chat_member)
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=42, type="private"),
+            from_user=SimpleNamespace(id=42),
+            bot=bot,
+            answer=fake_answer,
+        )
+
+        # Find the /start,/help handler and invoke it with the review deep link.
+        start_handler = router.message.handlers[0]
+        asyncio.run(
+            start_handler.callback(
+                message, command=CommandObject(command="start", args=f"review_{session_id}")
+            )
+        )
+
+        assert len(answered) == 1
+        assert "投票超时补审" in answered[0]["text"]
+        markup = answered[0]["reply_markup"]
+        assert markup is not None
+        callbacks = {b.callback_data for row in markup.inline_keyboard for b in row}
+        assert callbacks == {f"review_ban:{session_id}", f"review_keep:{session_id}"}
+    finally:
+        db.close()
+
+
+def test_review_deeplink_rejects_non_admin(tmp_path):
+    """A non-admin who opens the deep link gets refused, no review card."""
+    import asyncio
+
+    from aiogram.filters import CommandObject
+
+    from telegram_llm_antispam.models import DecisionAction, LocalDecision
+
+    db = _db(tmp_path)
+    settings = _settings()
+    try:
+        router = create_router(settings, db)
+        message_features = build_message_features(
+            SimpleNamespace(
+                message_id=10,
+                chat=SimpleNamespace(id=-100123),
+                from_user=SimpleNamespace(id=42),
+                text="加群送码拿钱 详细教程 https://spam.example",
+            ),
+            UserContext(chat_id=-100123, user_id=42, reputation_score=20, messages_seen=0),
+        )
+        session_id = db.create_vote_session(
+            message_features,
+            LocalDecision(DecisionAction.WITHDRAW_VOTE, "known_fingerprint", 0.85),
+            timeout_seconds=-1,
+        )
+        db.expire_open_vote_sessions()
+
+        answered: list[dict] = []
+
+        async def fake_answer(text, reply_markup=None):
+            answered.append({"text": text, "reply_markup": reply_markup})
+
+        async def fake_get_chat_member(chat_id, user_id):
+            return SimpleNamespace(status=SimpleNamespace(value="member"))
+
+        bot = SimpleNamespace(get_chat_member=fake_get_chat_member)
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=999, type="private"),
+            from_user=SimpleNamespace(id=999),
+            bot=bot,
+            answer=fake_answer,
+        )
+
+        start_handler = router.message.handlers[0]
+        asyncio.run(
+            start_handler.callback(
+                message, command=CommandObject(command="start", args=f"review_{session_id}")
+            )
+        )
+
+        assert len(answered) == 1
+        assert "只有该群组的管理员" in answered[0]["text"]
+        assert answered[0]["reply_markup"] is None
+    finally:
+        db.close()
+
+
 def test_same_user_open_vote_repeat_bans_without_new_vote(tmp_path):
     db = _db(tmp_path)
     settings = _settings()

@@ -132,7 +132,7 @@ class Settings:
             whitelist_domains=_env_list("WHITELIST_DOMAINS"),
             whitelisted_user_ids=_env_int_tuple("WHITELISTED_USER_IDS"),
             vote_min_confirmations=_env_int("VOTE_MIN_CONFIRMATIONS", 3),
-            vote_timeout_seconds=_env_int("VOTE_TIMEOUT_SECONDS", 1800),
+            vote_timeout_seconds=_env_int("VOTE_TIMEOUT_SECONDS", 86400),
             vote_sweep_interval_seconds=_env_int("VOTE_SWEEP_INTERVAL_SECONDS", 60),
             low_reputation_threshold=_env_float("LOW_REPUTATION_THRESHOLD", 35),
             high_reputation_threshold=_env_float("HIGH_REPUTATION_THRESHOLD", 80),

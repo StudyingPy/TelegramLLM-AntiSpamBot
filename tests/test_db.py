@@ -111,6 +111,33 @@ def test_expire_open_vote_sessions_marks_timeout_and_logs(tmp_path):
         db.close()
 
 
+def test_close_vote_session_can_reopen_expired_only_when_allowed(tmp_path):
+    """close_vote_session defaults to closing only `open` sessions. Catch-up ban of
+    a timed-out session must pass allowed_from to flip expired_released → admin_banned;
+    without it the transition is a no-op."""
+    db = _db(tmp_path)
+    try:
+        session_id = db.create_vote_session(
+            _features(),
+            LocalDecision(DecisionAction.WITHDRAW_VOTE, "test", 0.8),
+            timeout_seconds=-1,
+        )
+        db.expire_open_vote_sessions()
+        assert db.get_vote_session(session_id).status == "expired_released"
+
+        # Default allowed_from=("open",) must NOT touch an expired session.
+        db.close_vote_session(session_id, "admin_banned")
+        assert db.get_vote_session(session_id).status == "expired_released"
+
+        # Widening allowed_from lets the catch-up ban finalize it.
+        db.close_vote_session(
+            session_id, "admin_banned", allowed_from=("open", "expired_released")
+        )
+        assert db.get_vote_session(session_id).status == "admin_banned"
+    finally:
+        db.close()
+
+
 def test_vote_feedback_boosts_and_downgrades_fingerprints(tmp_path):
     db = _db(tmp_path)
     settings = _settings()

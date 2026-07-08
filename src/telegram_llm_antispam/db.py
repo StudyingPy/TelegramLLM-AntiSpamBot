@@ -867,15 +867,30 @@ class Database:
             for row in rows
         )
 
-    def close_vote_session(self, session_id: int, status: str) -> None:
+    def close_vote_session(
+        self,
+        session_id: int,
+        status: str,
+        *,
+        allowed_from: tuple[str, ...] = ("open",),
+    ) -> None:
+        """Move a vote session into a terminal `status`.
+
+        By default only an `open` session can be closed — this guards the live
+        vote flow against double-processing. Catch-up review (an admin acting on
+        a session that already timed out to `expired_released`) passes a wider
+        `allowed_from` so the timed-out session can still be flipped to
+        `admin_banned` / `confirmed_spam` after the fact.
+        """
+        placeholders = ",".join("?" for _ in allowed_from)
         with self._locked_conn() as conn:
             conn.execute(
-                """
+                f"""
                 UPDATE vote_sessions
                 SET status = ?, closed_at = ?
-                WHERE id = ? AND status = 'open'
+                WHERE id = ? AND status IN ({placeholders})
                 """,
-                (status, _now(), session_id),
+                (status, _now(), session_id, *allowed_from),
             )
             conn.commit()
 

@@ -12,7 +12,11 @@ from .config import Settings
 from .db import Database
 from .feedback import record_vote_ham_feedback, record_vote_spam_feedback
 from .models import ActionResult, DecisionAction, LocalDecision, MessageFeatures, VoteSession, VoteTally
-from .notifications import update_vote_notifications, vote_status_text
+from .notifications import (
+    catchup_review_keyboard,
+    update_vote_notifications,
+    vote_status_text,
+)
 from .permissions import check_permissions
 
 
@@ -25,6 +29,22 @@ class ModerationActions:
     def __init__(self, settings: Settings, db: Database) -> None:
         self._settings = settings
         self._db = db
+        # Cached lazily on first use so the timed-out group vote message can carry a
+        # deep link into this bot's private chat (t.me/<username>?start=review_<id>).
+        self._bot_username: str | None = None
+
+    async def _get_bot_username(self, bot: Any) -> str | None:
+        if self._bot_username is not None:
+            return self._bot_username
+        try:
+            me = await bot.get_me()
+        except Exception as exc:  # pragma: no cover - depends on Telegram API state.
+            logger.warning("Failed to resolve bot username for catch-up review: %s", exc)
+            return None
+        username = getattr(me, "username", None)
+        if username:
+            self._bot_username = str(username)
+        return self._bot_username
 
     async def apply(
         self,
@@ -139,6 +159,9 @@ class ModerationActions:
 
     async def expire_due_vote_sessions(self, bot: Any, limit: int = 100) -> int:
         sessions = self._db.expire_open_vote_sessions(limit=limit)
+        if not sessions:
+            return 0
+        bot_username = await self._get_bot_username(bot)
         for session in sessions:
             self._db.record_vote_session_action(
                 session.id,
@@ -147,7 +170,7 @@ class ModerationActions:
                 confidence=0.0,
                 metadata={"expires_at": session.expires_at},
             )
-            await self._edit_expired_vote_message(bot, session)
+            await self._edit_expired_vote_message(bot, session, bot_username)
             await update_vote_notifications(
                 bot,
                 self._db,
@@ -206,6 +229,113 @@ class ModerationActions:
             -self._settings.spam_reputation_penalty,
         )
         return True, "已封禁"
+
+    async def catchup_ban_vote_session(
+        self,
+        bot: Any,
+        session_id: int,
+        moderator_user_id: int,
+    ) -> tuple[bool, str]:
+        """Ban the suspect of a timed-out (default-released) vote session.
+
+        Reached from the private-chat catch-up review a moderator opens via the
+        deep-link button on the expired group message. Unlike
+        `admin_ban_vote_session`, the session is expected to be `expired_released`
+        rather than `open`, so it accepts either state and widens the close
+        transition accordingly.
+        """
+        session = self._db.get_vote_session(session_id)
+        if session is None:
+            return False, "投票会话不存在"
+        if session.status not in {"open", "expired_released"}:
+            return False, "该会话已处理，无法再次封禁"
+        if session.suspect_user_id is None:
+            return False, "没有可封禁的用户"
+
+        permissions = await check_permissions(bot, session.chat_id, session.suspect_user_id)
+        metadata: dict[str, Any] = {"moderator_user_id": moderator_user_id}
+        if not (permissions.can_restrict and permissions.target_is_restrictable):
+            metadata["banned"] = False
+            metadata["ban_error"] = permissions.reason or "missing_restrict_permission"
+            self._db.record_vote_session_action(
+                session.id,
+                action="catchup_ban_failed",
+                reason="catchup_review_ban_failed",
+                confidence=1.0,
+                metadata=metadata,
+            )
+            return False, "Bot 没有封禁权限，或目标不可封禁"
+
+        metadata = await self._finalize_spam_user(
+            bot,
+            session.chat_id,
+            session.suspect_user_id,
+            permissions,
+            final_status="admin_banned",
+            action="catchup_banned_user",
+            reason="catchup_review_ban",
+            confidence=1.0,
+            summary_reason="超时补审封禁",
+            primary_session_id=session.id,
+            extra_metadata=metadata,
+            allowed_from=("open", "expired_released"),
+        )
+        if not metadata.get("banned"):
+            return False, f"封禁失败：{metadata.get('ban_error') or 'unknown_error'}"
+        self._db.adjust_reputation(
+            session.chat_id,
+            session.suspect_user_id,
+            -self._settings.spam_reputation_penalty,
+        )
+        return True, "已封禁"
+
+    async def catchup_keep_vote_session(
+        self,
+        bot: Any,
+        session_id: int,
+        moderator_user_id: int,
+    ) -> tuple[bool, str]:
+        """Confirm the default-release of a timed-out vote session after review.
+
+        The message already stayed in the chat when the vote timed out, so there
+        is nothing to undo — we just record the moderator's explicit decision and
+        drop the catch-up button from the group message.
+        """
+        session = self._db.get_vote_session(session_id)
+        if session is None:
+            return False, "投票会话不存在"
+        if session.status not in {"open", "expired_released"}:
+            return False, "该会话已处理"
+
+        if session.status == "open":
+            # Rare: an admin opened the deep link before the sweep expired it.
+            self._db.close_vote_session(session_id, "released")
+        self._db.record_vote_session_action(
+            session_id,
+            action="catchup_kept_released",
+            reason="catchup_review_keep_released",
+            confidence=0.0,
+            metadata={"moderator_user_id": moderator_user_id},
+        )
+        refreshed = self._db.get_vote_session(session_id) or session
+        try:
+            await self._edit_vote_message_text(
+                bot,
+                refreshed,
+                "投票超时后经补审：维持放行。\n"
+                f"广告 {refreshed.spam_votes} / 放行 {refreshed.ham_votes}",
+                reply_markup=None,
+            )
+        except TelegramAPIError as exc:  # pragma: no cover - depends on Telegram API state.
+            logger.warning("Failed to edit kept vote message %s: %s", session_id, exc)
+        await update_vote_notifications(
+            bot,
+            self._db,
+            session_id,
+            vote_status_text(self._db, refreshed),
+            is_open=False,
+        )
+        return True, "已维持放行"
 
     async def _withdraw_and_vote(
         self,
@@ -294,13 +424,14 @@ class ModerationActions:
         current_message_id: int | None = None,
         primary_session_id: int | None = None,
         extra_metadata: dict[str, Any] | None = None,
+        allowed_from: tuple[str, ...] = ("open",),
     ) -> dict[str, Any]:
         metadata: dict[str, Any] = dict(extra_metadata or {})
         sessions = (
             self._db.list_vote_sessions_for_user(
                 chat_id,
                 user_id,
-                statuses=("open",),
+                statuses=allowed_from,
             )
             if user_id is not None
             else ()
@@ -367,7 +498,7 @@ class ModerationActions:
             metadata["ban_error"] = permissions.reason or "missing_restrict_permission"
 
         for session in sessions:
-            self._db.close_vote_session(session.id, final_status)
+            self._db.close_vote_session(session.id, final_status, allowed_from=allowed_from)
             closed_session = self._db.get_vote_session(session.id)
             if closed_session is not None:
                 record_vote_spam_feedback(self._db, closed_session, self._settings)
@@ -479,26 +610,45 @@ class ModerationActions:
         except TelegramAPIError:
             logger.debug("Failed to delete ban summary message %s", message_id, exc_info=True)
 
-    async def _edit_expired_vote_message(self, bot: Any, session: VoteSession) -> None:
+    async def _edit_expired_vote_message(
+        self,
+        bot: Any,
+        session: VoteSession,
+        bot_username: str | None,
+    ) -> None:
         if session.vote_message_id is None:
             return
 
         text = (
             "投票超时：默认放行并标记。\n"
-            f"广告 {session.spam_votes} / 放行 {session.ham_votes}"
+            f"广告 {session.spam_votes} / 放行 {session.ham_votes}\n"
+            "如需追加处置，管理员可点击下方按钮前往私聊补审。"
         )
+        # Only offer the deep link when we know our username and there is still a
+        # user to act on; otherwise fall back to a plain edit with no button.
+        reply_markup = None
+        if bot_username and session.suspect_user_id is not None:
+            reply_markup = catchup_review_keyboard(bot_username, session.id)
         try:
-            await self._edit_vote_message_text(bot, session, text)
+            await self._edit_vote_message_text(bot, session, text, reply_markup=reply_markup)
         except TelegramAPIError as exc:  # pragma: no cover - depends on Telegram API state.
             logger.warning("Failed to edit expired vote message %s: %s", session.id, exc)
 
-    async def _edit_vote_message_text(self, bot: Any, session: VoteSession, text: str) -> None:
+    async def _edit_vote_message_text(
+        self,
+        bot: Any,
+        session: VoteSession,
+        text: str,
+        *,
+        reply_markup: Any = None,
+    ) -> None:
         if session.vote_message_id is None:
             return
         await bot.edit_message_text(
             text=text,
             chat_id=session.chat_id,
             message_id=session.vote_message_id,
+            reply_markup=reply_markup,
         )
 
     async def _safe_edit_message(self, message: Message, text: str) -> None:
