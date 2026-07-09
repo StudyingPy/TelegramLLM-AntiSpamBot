@@ -70,6 +70,7 @@ class Settings:
     vote_min_confirmations: int
     vote_timeout_seconds: int
     vote_sweep_interval_seconds: int
+    vote_expired_message_ttl_seconds: int
 
     low_reputation_threshold: float
     high_reputation_threshold: float
@@ -134,6 +135,9 @@ class Settings:
             vote_min_confirmations=_env_int("VOTE_MIN_CONFIRMATIONS", 3),
             vote_timeout_seconds=_env_int("VOTE_TIMEOUT_SECONDS", 86400),
             vote_sweep_interval_seconds=_env_int("VOTE_SWEEP_INTERVAL_SECONDS", 60),
+            vote_expired_message_ttl_seconds=_env_int(
+                "VOTE_EXPIRED_MESSAGE_TTL_SECONDS", 21600
+            ),
             low_reputation_threshold=_env_float("LOW_REPUTATION_THRESHOLD", 35),
             high_reputation_threshold=_env_float("HIGH_REPUTATION_THRESHOLD", 80),
             reputation_ban_threshold=_env_float("REPUTATION_BAN_THRESHOLD", 20),

@@ -201,6 +201,7 @@ class VoteSession:
     created_at: int
     expires_at: int
     closed_at: int | None
+    detail_text: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

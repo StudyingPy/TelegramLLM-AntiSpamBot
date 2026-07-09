@@ -7,10 +7,17 @@ from types import SimpleNamespace
 from telegram_llm_antispam.config import Settings
 from telegram_llm_antispam.db import Database
 from telegram_llm_antispam.features import build_message_features
-from telegram_llm_antispam.models import ActionResult, DecisionAction, LocalDecision, UserContext
+from telegram_llm_antispam.models import (
+    ActionResult,
+    DecisionAction,
+    LocalDecision,
+    UserContext,
+    VoteSession,
+)
 from telegram_llm_antispam.notifications import (
     _format_llm_section,
     notify_admins,
+    review_card_text,
     update_vote_notifications,
 )
 from test_llm import _settings
@@ -59,6 +66,7 @@ def _settings_with_admins() -> Settings:
         vote_min_confirmations=settings.vote_min_confirmations,
         vote_timeout_seconds=settings.vote_timeout_seconds,
         vote_sweep_interval_seconds=settings.vote_sweep_interval_seconds,
+        vote_expired_message_ttl_seconds=settings.vote_expired_message_ttl_seconds,
         low_reputation_threshold=settings.low_reputation_threshold,
         high_reputation_threshold=settings.high_reputation_threshold,
         reputation_ban_threshold=settings.reputation_ban_threshold,
@@ -271,3 +279,78 @@ def test_format_llm_section_empty_when_no_llm_hop_attempted():
     )
 
     assert _format_llm_section(decision) == ""
+
+
+def _vote_session(**overrides) -> VoteSession:
+    base = dict(
+        id=5,
+        chat_id=-1001234567890,
+        original_message_id=100,
+        vote_message_id=110,
+        suspect_user_id=42,
+        skeleton_hash="sk",
+        content_hash="ct",
+        status="expired_released",
+        spam_votes=1,
+        ham_votes=0,
+        reason="llm_spam",
+        created_at=0,
+        expires_at=0,
+        closed_at=None,
+        detail_text=None,
+    )
+    base.update(overrides)
+    return VoteSession(**base)
+
+
+def test_review_card_uses_cached_detail_text(tmp_path):
+    """When the session has cached detail_text, the review card embeds it verbatim."""
+    db = _db(tmp_path)
+    try:
+        session = _vote_session(detail_text="反广告处理记录\n正文：\n<blockquote>看片加群</blockquote>")
+        text = review_card_text(db, session)
+        assert "投票超时补审" in text
+        assert "反广告处理记录" in text
+        assert "看片加群" in text
+        # Live header still present.
+        assert "投票：广告 1 / 放行 0" in text
+    finally:
+        db.close()
+
+
+def test_review_card_falls_back_to_action_log_snapshot(tmp_path):
+    """A session created before detail_text existed falls back to the action_log
+    text_snapshot so the reviewer still sees the original body."""
+    db = _db(tmp_path)
+    try:
+        message = SimpleNamespace(
+            message_id=100,
+            chat=SimpleNamespace(id=-1001234567890),
+            from_user=SimpleNamespace(id=42),
+            text="遗留消息正文 https://spam.example",
+        )
+        context = UserContext(chat_id=-1001234567890, user_id=42, reputation_score=20, messages_seen=0)
+        features = build_message_features(message, context)
+        db.record_action(
+            features,
+            LocalDecision(DecisionAction.WITHDRAW_VOTE, "llm_spam", 0.9),
+            {"text_snapshot": "遗留消息正文 https://spam.example"},
+        )
+
+        session = _vote_session(detail_text=None)
+        text = review_card_text(db, session)
+        assert "遗留消息正文" in text
+    finally:
+        db.close()
+
+
+def test_review_card_notice_when_no_detail_available(tmp_path):
+    """No cached detail and no action_log snapshot → a graceful notice, not a crash."""
+    db = _db(tmp_path)
+    try:
+        session = _vote_session(detail_text=None, original_message_id=999999)
+        text = review_card_text(db, session)
+        assert "投票超时补审" in text
+        assert "原文详情已不可用" in text
+    finally:
+        db.close()

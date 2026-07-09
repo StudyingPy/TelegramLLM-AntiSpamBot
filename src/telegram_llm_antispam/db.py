@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS vote_sessions (
     spam_votes INTEGER NOT NULL DEFAULT 0,
     ham_votes INTEGER NOT NULL DEFAULT 0,
     reason TEXT NOT NULL,
+    detail_text TEXT,
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
     closed_at INTEGER
@@ -175,7 +176,23 @@ class Database:
     def migrate(self) -> None:
         with self._locked_conn() as conn:
             conn.executescript(SCHEMA_SQL)
+            self._ensure_columns(conn)
             conn.commit()
+
+    def _ensure_columns(self, conn: sqlite3.Connection) -> None:
+        """Add columns introduced after a table's original CREATE.
+
+        SCHEMA_SQL only runs CREATE TABLE IF NOT EXISTS, so an existing deployment's
+        table keeps its old columns. Each new column needs an idempotent ALTER here.
+        `detail_text` on vote_sessions caches the full moderation detail so catch-up
+        review can show it independent of whether an admin notification was sent.
+        """
+        for table, column, ddl in (
+            ("vote_sessions", "detail_text", "ALTER TABLE vote_sessions ADD COLUMN detail_text TEXT"),
+        ):
+            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if column not in existing:
+                conn.execute(ddl)
 
     def allow_chat(self, chat_id: int, title: str | None, added_by_user_id: int | None) -> None:
         with self._locked_conn() as conn:
@@ -657,6 +674,33 @@ class Database:
                 results.append(entry)
         return tuple(results)
 
+    def get_action_text_snapshot(self, chat_id: int, message_id: int) -> str | None:
+        """Return the text_snapshot stored in action_log for a moderated message.
+
+        Fallback source for catch-up review detail on sessions created before the
+        detail_text column existed. The WITHDRAW_VOTE / BAN action paths store
+        text_snapshot in metadata_json at moderation time.
+        """
+        with self._locked_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT metadata_json
+                FROM action_log
+                WHERE chat_id = ? AND message_id = ?
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (chat_id, message_id),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            meta = json.loads(row["metadata_json"] or "{}")
+        except json.JSONDecodeError:
+            return None
+        snap = meta.get("text_snapshot")
+        return snap if isinstance(snap, str) else None
+
     def count_recent_skeleton_senders(
         self,
         skeleton_hash: str,
@@ -716,6 +760,7 @@ class Database:
         features: MessageFeatures,
         decision: LocalDecision,
         timeout_seconds: int,
+        detail_text: str | None = None,
     ) -> int:
         now = _now()
         with self._locked_conn() as conn:
@@ -723,9 +768,9 @@ class Database:
                 """
                 INSERT INTO vote_sessions (
                     chat_id, original_message_id, suspect_user_id, skeleton_hash, content_hash,
-                    reason, created_at, expires_at
+                    reason, detail_text, created_at, expires_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     features.chat_id,
@@ -734,6 +779,7 @@ class Database:
                     features.skeleton_hash,
                     features.content_hash,
                     decision.reason,
+                    detail_text,
                     now,
                     now + timeout_seconds,
                 ),
@@ -746,6 +792,14 @@ class Database:
             conn.execute(
                 "UPDATE vote_sessions SET vote_message_id = ? WHERE id = ?",
                 (vote_message_id, session_id),
+            )
+            conn.commit()
+
+    def set_vote_detail_text(self, session_id: int, detail_text: str) -> None:
+        with self._locked_conn() as conn:
+            conn.execute(
+                "UPDATE vote_sessions SET detail_text = ? WHERE id = ?",
+                (detail_text, session_id),
             )
             conn.commit()
 
@@ -1114,6 +1168,15 @@ def _now() -> int:
     return int(time.time())
 
 
+def _row_get(row: sqlite3.Row, key: str) -> Any:
+    """sqlite3.Row has no .get(); index access raises IndexError for absent columns.
+
+    Returns None when the column is missing so a VoteSession built from a SELECT that
+    predates the detail_text column (or any partial projection) still constructs.
+    """
+    return row[key] if key in row.keys() else None
+
+
 def _vote_session_from_row(
     row: sqlite3.Row,
     status: str | None = None,
@@ -1134,6 +1197,7 @@ def _vote_session_from_row(
         created_at=row["created_at"],
         expires_at=row["expires_at"],
         closed_at=closed_at if closed_at is not None else row["closed_at"],
+        detail_text=_row_get(row, "detail_text"),
     )
 
 

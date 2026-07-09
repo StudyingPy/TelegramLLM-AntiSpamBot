@@ -168,20 +168,65 @@ def review_action_keyboard(session_id: int) -> InlineKeyboardMarkup:
 
 
 def review_card_text(db: Database, session: VoteSession) -> str:
-    """Private-chat review card for a timed-out (or already closed) vote session."""
+    """Private-chat review card for a timed-out (or already closed) vote session.
+
+    The card leads with the full moderation detail (identical to what global admins
+    receive) so a reviewer can judge from原文/资料/OG/LLM, followed by a live
+    status header carrying the current tally and state.
+    """
+    detail = _review_detail_block(db, session)
     message_link = _message_link(session.chat_id, session.original_message_id)
-    lines = [
+    header = [
         "投票超时补审",
-        f"群组：<code>{session.chat_id}</code>",
         f"原消息：{message_link}",
-        f"疑似用户：<code>{session.suspect_user_id or '-'}</code>",
-        f"触发：<code>{_esc(session.reason)}</code>",
         f"投票：广告 {session.spam_votes} / 放行 {session.ham_votes}",
         f"当前状态：{_status_label(session.status)}",
     ]
     if session.status != "expired_released":
-        lines.append("该会话已被处理，补审仅供参考。")
-    return "\n".join(lines)
+        header.append("该会话已被处理，补审仅供参考。")
+
+    header_text = "\n".join(header)
+    if detail:
+        return f"{header_text}\n\n────────\n{detail}"
+    return header_text
+
+
+def _review_detail_block(db: Database, session: VoteSession) -> str:
+    """Full detail for the review card.
+
+    Primary source is the detail_text cached on the session at creation (present for
+    every session created after this feature shipped). Falls back to the action_log
+    text_snapshot for pre-existing sessions, which carries less (no profile/OG/LLM),
+    and to a bare notice if even that is gone.
+    """
+    if session.detail_text:
+        return session.detail_text
+    snapshot = db.get_action_text_snapshot(session.chat_id, session.original_message_id)
+    if snapshot:
+        return (
+            f"疑似用户：<code>{session.suspect_user_id or '-'}</code>\n"
+            f"触发：<code>{_esc(session.reason)}</code>\n"
+            f"正文：\n<blockquote>{_esc(snapshot[:800])}</blockquote>"
+        )
+    return (
+        f"疑似用户：<code>{session.suspect_user_id or '-'}</code>\n"
+        f"触发：<code>{_esc(session.reason)}</code>\n"
+        "（原文详情已不可用，可点击上方原消息链接查看。）"
+    )
+
+
+def build_moderation_detail_text(
+    features: MessageFeatures,
+    decision: LocalDecision,
+    result: ActionResult,
+) -> str:
+    """Public builder for the full moderation detail block.
+
+    Same content admins receive via notify_admins. Persisted onto the vote session
+    at creation so catch-up review can render it regardless of whether any admin
+    notification was sent.
+    """
+    return _notification_text(features, decision, result)
 
 
 def _notification_text(

@@ -13,6 +13,7 @@ from .db import Database
 from .feedback import record_vote_ham_feedback, record_vote_spam_feedback
 from .models import ActionResult, DecisionAction, LocalDecision, MessageFeatures, VoteSession, VoteTally
 from .notifications import (
+    build_moderation_detail_text,
     catchup_review_keyboard,
     update_vote_notifications,
     vote_status_text,
@@ -367,11 +368,20 @@ class ModerationActions:
         )
         self._db.set_vote_message_id(session_id, vote_message.message_id)
         action_log_id = self._db.record_action(features, decision, metadata)
-        return ActionResult(
+        # Cache the full moderation detail (same content admins receive) onto the
+        # session so catch-up review can show原文/资料/OG/LLM even when no admin
+        # notification was configured. Built after action_log_id is known so the
+        # detail's 日志/投票会话 lines match the admin notification exactly.
+        result = ActionResult(
             action_log_id=action_log_id,
             vote_session_id=session_id,
             deleted=False,
         )
+        self._db.set_vote_detail_text(
+            session_id,
+            build_moderation_detail_text(features, decision, result),
+        )
+        return result
 
     async def _ban(
         self,
@@ -605,28 +615,55 @@ class ModerationActions:
         if message_id is None:
             return None, None
         if self.SUMMARY_DELETE_DELAY_SECONDS > 0:
-            asyncio.create_task(
-                self._delete_summary_later(
-                    bot,
-                    chat_id,
-                    int(message_id),
-                    self.SUMMARY_DELETE_DELAY_SECONDS,
-                )
+            self._schedule_message_deletion(
+                bot,
+                chat_id,
+                int(message_id),
+                self.SUMMARY_DELETE_DELAY_SECONDS,
+                label="ban summary",
             )
         return int(message_id), None
 
-    async def _delete_summary_later(
+    def _schedule_message_deletion(
         self,
         bot: Any,
         chat_id: int,
         message_id: int,
         delay_seconds: int,
+        *,
+        label: str = "message",
     ) -> None:
+        """Fire-and-forget scheduling seam for delayed message deletion.
+
+        Isolated from _delete_message_later so tests can assert what got scheduled
+        without spawning a real long-lived background task.
+        """
+        if delay_seconds <= 0:
+            return
+        asyncio.create_task(
+            self._delete_message_later(bot, chat_id, message_id, delay_seconds, label=label)
+        )
+
+    async def _delete_message_later(
+        self,
+        bot: Any,
+        chat_id: int,
+        message_id: int,
+        delay_seconds: int,
+        *,
+        label: str = "message",
+    ) -> None:
+        """Delete a chat message after a delay.
+
+        Best-effort: a bot restart during the wait drops the pending task and leaves
+        the message in place (acceptable — no persistent scheduler). Used for the
+        auto-deleting ban summary and the timed-out vote message.
+        """
         await asyncio.sleep(delay_seconds)
         try:
             await bot.delete_message(chat_id=chat_id, message_id=message_id)
         except TelegramAPIError:
-            logger.debug("Failed to delete ban summary message %s", message_id, exc_info=True)
+            logger.debug("Failed to delete %s message %s", label, message_id, exc_info=True)
 
     async def _edit_expired_vote_message(
         self,
@@ -651,6 +688,18 @@ class ModerationActions:
             await self._edit_vote_message_text(bot, session, text, reply_markup=reply_markup)
         except TelegramAPIError as exc:  # pragma: no cover - depends on Telegram API state.
             logger.warning("Failed to edit expired vote message %s: %s", session.id, exc)
+            return
+
+        # Auto-delete the timed-out message (and its catch-up button) after the TTL.
+        # The button is the group-side entry to catch-up review, so deleting the
+        # message ends the catch-up window — this is by design (window == TTL).
+        self._schedule_message_deletion(
+            bot,
+            session.chat_id,
+            session.vote_message_id,
+            self._settings.vote_expired_message_ttl_seconds,
+            label="expired vote",
+        )
 
     async def _edit_vote_message_text(
         self,

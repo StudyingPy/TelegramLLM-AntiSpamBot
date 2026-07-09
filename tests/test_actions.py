@@ -124,6 +124,13 @@ def test_expired_vote_message_gets_catchup_review_button(tmp_path):
     bot = FakeBot()
     try:
         actions = ModerationActions(_settings(), db)
+        # Capture scheduled deletions instead of spawning real long-lived tasks.
+        scheduled: list[tuple] = []
+        actions._schedule_message_deletion = (  # type: ignore[method-assign]
+            lambda bot, chat_id, message_id, delay, *, label="message": scheduled.append(
+                (chat_id, message_id, delay, label)
+            )
+        )
         session_id = db.create_vote_session(
             _features(10),
             LocalDecision(DecisionAction.WITHDRAW_VOTE, "known_fingerprint", 0.85),
@@ -140,6 +147,8 @@ def test_expired_vote_message_gets_catchup_review_button(tmp_path):
         assert edit["message_id"] == 110
         assert "前往私聊补审" in _keyboard_text(edit["reply_markup"])
         assert f"start=review_{session_id}" in _keyboard_url(edit["reply_markup"])
+        # The timed-out message is scheduled for deletion at the configured TTL.
+        assert scheduled == [(-1001, 110, _settings().vote_expired_message_ttl_seconds, "expired vote")]
     finally:
         db.close()
 
@@ -283,6 +292,50 @@ def test_catchup_ban_rejects_already_finalized_session(tmp_path):
         assert ok is False
         assert "已处理" in text
         assert bot.banned_users == []
+    finally:
+        db.close()
+
+
+def test_delete_message_later_deletes_after_delay(tmp_path):
+    """The deletion coroutine issues a real delete_message once its delay elapses."""
+    db = _db(tmp_path)
+    bot = FakeBot()
+    try:
+        actions = ModerationActions(_settings(), db)
+        asyncio.run(actions._delete_message_later(bot, -1001, 110, 0, label="expired vote"))
+        assert (-1001, 110) in bot.deleted_messages
+    finally:
+        db.close()
+
+
+def test_withdraw_and_vote_caches_detail_text_on_session(tmp_path):
+    """_withdraw_and_vote stores the full moderation detail on the session so catch-up
+    review can render it independent of admin-notification config."""
+    db = _db(tmp_path)
+    bot = FakeBot()
+    try:
+        actions = ModerationActions(_settings(), db)
+        features = _features(10)
+        decision = LocalDecision(DecisionAction.WITHDRAW_VOTE, "llm_spam", 0.91)
+
+        answered: list[dict] = []
+
+        async def fake_answer(text, reply_markup=None, **kwargs):
+            answered.append({"text": text})
+            return SimpleNamespace(message_id=110)
+
+        message = SimpleNamespace(
+            message_id=10,
+            bot=bot,
+            answer=fake_answer,
+        )
+
+        result = asyncio.run(actions._withdraw_and_vote(message, features, decision))
+
+        session = db.get_vote_session(result.vote_session_id)
+        assert session.detail_text is not None
+        assert "反广告处理记录" in session.detail_text
+        assert f"投票会话：<code>{result.vote_session_id}</code>" in session.detail_text
     finally:
         db.close()
 

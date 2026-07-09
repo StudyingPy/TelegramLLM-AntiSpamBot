@@ -24,6 +24,7 @@ def _settings() -> Settings:
         vote_min_confirmations=3,
         vote_timeout_seconds=1800,
         vote_sweep_interval_seconds=60,
+        vote_expired_message_ttl_seconds=21600,
         low_reputation_threshold=35,
         high_reputation_threshold=80,
         reputation_ban_threshold=20,

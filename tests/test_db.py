@@ -71,6 +71,95 @@ def test_vote_session_records_changed_votes(tmp_path):
         db.close()
 
 
+def test_create_vote_session_stores_and_reads_detail_text(tmp_path):
+    """detail_text cached at creation is read back on the session so catch-up review
+    can render the full moderation detail without an admin notification."""
+    db = _db(tmp_path)
+    try:
+        session_id = db.create_vote_session(
+            _features(),
+            LocalDecision(DecisionAction.WITHDRAW_VOTE, "test", 0.8),
+            timeout_seconds=60,
+            detail_text="完整详情：正文 + 资料 + LLM",
+        )
+        assert db.get_vote_session(session_id).detail_text == "完整详情：正文 + 资料 + LLM"
+
+        db.set_vote_detail_text(session_id, "更新后的详情")
+        assert db.get_vote_session(session_id).detail_text == "更新后的详情"
+    finally:
+        db.close()
+
+
+def test_migrate_adds_detail_text_column_to_legacy_vote_sessions(tmp_path):
+    """A pre-existing DB whose vote_sessions has no detail_text column must gain it
+    on migrate() without losing rows — ALTER TABLE ADD COLUMN is idempotent."""
+    path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(path)
+    try:
+        # Minimal legacy vote_sessions WITHOUT detail_text, plus one row.
+        conn.executescript(
+            """
+            CREATE TABLE vote_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                original_message_id INTEGER NOT NULL,
+                vote_message_id INTEGER,
+                suspect_user_id INTEGER,
+                skeleton_hash TEXT,
+                content_hash TEXT,
+                status TEXT NOT NULL DEFAULT 'open',
+                spam_votes INTEGER NOT NULL DEFAULT 0,
+                ham_votes INTEGER NOT NULL DEFAULT 0,
+                reason TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                closed_at INTEGER
+            );
+            INSERT INTO vote_sessions (
+                id, chat_id, original_message_id, reason, created_at, expires_at
+            ) VALUES (7, -1001, 100, 'legacy', 0, 0);
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    db = Database(path)
+    db.connect()
+    try:
+        db.migrate()
+        with db._locked_conn() as conn:  # noqa: SLF001 - test-only inspection
+            cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(vote_sessions)")
+            }
+        assert "detail_text" in cols
+        # Legacy row survives; detail_text reads as None.
+        session = db.get_vote_session(7)
+        assert session is not None
+        assert session.detail_text is None
+        # migrate() again is a no-op (idempotent), no exception.
+        db.migrate()
+    finally:
+        db.close()
+
+
+def test_get_action_text_snapshot_reads_metadata(tmp_path):
+    db = _db(tmp_path)
+    try:
+        features = _features()
+        db.record_action(
+            features,
+            LocalDecision(DecisionAction.WITHDRAW_VOTE, "test", 0.8),
+            {"text_snapshot": "原始正文快照"},
+        )
+        snap = db.get_action_text_snapshot(features.chat_id, features.message_id)
+        assert snap == "原始正文快照"
+        assert db.get_action_text_snapshot(-9999, 9999) is None
+    finally:
+        db.close()
+
+
 def test_expire_open_vote_sessions_marks_timeout_and_logs(tmp_path):
     db = _db(tmp_path)
     try:
