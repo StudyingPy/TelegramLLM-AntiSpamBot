@@ -71,6 +71,29 @@ def test_vote_session_records_changed_votes(tmp_path):
         db.close()
 
 
+def test_normal_message_reward_updates_reputation_with_message_count(tmp_path):
+    db = _db(tmp_path)
+    try:
+        features = _features()
+
+        db.record_message_seen(features, reputation_delta=2)
+        first = db.get_user_context(features.chat_id, features.user_id or 0)
+        assert first.messages_seen == 1
+        assert first.reputation_score == 52
+
+        db.record_message_seen(features, reputation_delta=2)
+        second = db.get_user_context(features.chat_id, features.user_id or 0)
+        assert second.messages_seen == 2
+        assert second.reputation_score == 54
+
+        # Reputation remains bounded even after a large positive reward.
+        db.record_message_seen(features, reputation_delta=100)
+        capped = db.get_user_context(features.chat_id, features.user_id or 0)
+        assert capped.reputation_score == 100
+    finally:
+        db.close()
+
+
 def test_create_vote_session_stores_and_reads_detail_text(tmp_path):
     """detail_text cached at creation is read back on the session so catch-up review
     can render the full moderation detail without an admin notification."""
@@ -405,6 +428,73 @@ def test_phrase_fingerprints_are_used_in_lookup(tmp_path):
         assert phrase_fingerprint_value("日赚过万") in phrase_values
         assert strongest is not None
         assert strongest.fingerprint_type == "phrase"
+    finally:
+        db.close()
+
+
+def test_bare_human_mentions_are_not_phrase_fingerprints_but_bot_mentions_are(tmp_path):
+    """A group administrator mention is an address, not advertising intent.
+
+    The production @zaoanyun incident learned a bare human mention from one real ad,
+    then matched an innocent carrier-only message seven times. Reject it on both
+    write and lookup while retaining Telegram bot mentions, whose usernames must
+    end in "bot".
+    """
+
+    db = _db(tmp_path)
+    settings = _settings()
+    learned = _features()
+    human_value = phrase_fingerprint_value("@zaoanyun")
+    bot_value = phrase_fingerprint_value("@helperbot")
+    assert human_value is not None
+    assert bot_value is not None
+    try:
+        record_llm_spam_feedback(
+            db,
+            learned,
+            LLMJudgement(
+                is_spam=True,
+                confidence=0.95,
+                category="ads",
+                signal_phrases=("@zaoanyun", "@helperbot"),
+            ),
+            settings,
+        )
+
+        assert db.get_fingerprint(human_value) is None
+        assert db.get_fingerprint(bot_value) is not None
+
+        # Simulate the stale production row: the read guard must make it
+        # unreachable without requiring an immediate database purge.
+        db.upsert_fingerprint("phrase", human_value, 80, "llm_spam_phrase")
+
+        human_message = SimpleNamespace(
+            message_id=20,
+            chat=SimpleNamespace(id=-1001),
+            from_user=SimpleNamespace(id=44),
+            text="@zaoanyun",
+        )
+        bot_message = SimpleNamespace(
+            message_id=21,
+            chat=SimpleNamespace(id=-1001),
+            from_user=SimpleNamespace(id=44),
+            text="@helperbot",
+        )
+        context = UserContext(
+            chat_id=-1001,
+            user_id=44,
+            reputation_score=50,
+            messages_seen=1,
+        )
+
+        human_lookup = phrase_lookup_values(build_message_features(human_message, context))
+        bot_lookup = phrase_lookup_values(build_message_features(bot_message, context))
+
+        assert human_value not in human_lookup
+        # The stripped username candidate must also be absent for a carrier-only
+        # human mention, otherwise a stale "zaoanyun" phrase could still collide.
+        assert phrase_fingerprint_value("zaoanyun") not in human_lookup
+        assert bot_value in bot_lookup
     finally:
         db.close()
 

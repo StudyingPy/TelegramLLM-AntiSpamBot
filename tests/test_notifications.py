@@ -73,6 +73,7 @@ def _settings_with_admins() -> Settings:
         default_reputation=settings.default_reputation,
         spam_reputation_penalty=settings.spam_reputation_penalty,
         ham_reputation_reward=settings.ham_reputation_reward,
+        normal_message_reputation_reward=settings.normal_message_reputation_reward,
         repeat_window_seconds=settings.repeat_window_seconds,
         repeat_min_distinct_senders=settings.repeat_min_distinct_senders,
         fingerprint_review_weight=settings.fingerprint_review_weight,
@@ -144,7 +145,12 @@ def test_notify_admins_sends_one_combined_record_with_admin_ban_button(tmp_path)
         assert "用户资料：Promo Agent @promo_agent" in text
         assert "OG：CRTV成人版 / 看片就选择CRTV" in text
         assert reply_markup is not None
-        assert reply_markup.inline_keyboard[0][0].callback_data == "admin_ban:5"
+        callbacks = {
+            button.callback_data
+            for row in reply_markup.inline_keyboard
+            for button in row
+        }
+        assert callbacks == {"admin_ban:5", "admin_release:5"}
 
         notifications = db.list_admin_notifications(5)
         assert len(notifications) == 1

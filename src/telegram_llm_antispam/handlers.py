@@ -372,9 +372,20 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
                 decision = _merge_llm_decision(decision, outcome.judgement, features, settings)
             decision = _annotate_with_llm_outcome(decision, outcome)
 
+        reputation_reward = _normal_message_reputation_reward(
+            settings,
+            decision,
+            update_type=update_type,
+            is_edit=is_edit,
+        )
+        if reputation_reward:
+            metadata = dict(decision.metadata)
+            metadata["reputation_reward"] = reputation_reward
+            decision = replace(decision, metadata=metadata)
+
         result = await actions.apply(message, features, decision)
         if not is_edit:
-            db.record_message_seen(features)
+            db.record_message_seen(features, reputation_delta=reputation_reward)
         db.record_observation(features)
         await notify_admins(message.bot, db, settings, features, decision, result)
 
@@ -471,6 +482,38 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
             return
 
         ok, text = await actions.admin_ban_vote_session(callback.bot, session_id, callback.from_user.id)
+        await callback.answer(text, show_alert=not ok)
+        if callback.message is not None and ok:
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+
+    @router.callback_query(F.data.startswith("admin_release:"))
+    async def on_admin_release(callback: CallbackQuery) -> None:
+        if not callback.data or not callback.from_user:
+            return
+
+        try:
+            _, session_id_raw = callback.data.split(":", 1)
+            session_id = int(session_id_raw)
+        except ValueError:
+            await callback.answer("操作数据无效", show_alert=False)
+            return
+
+        session = db.get_vote_session(session_id)
+        if session is None:
+            await callback.answer("投票不存在", show_alert=False)
+            return
+        if not await can_manage_chat(callback.bot, settings, session.chat_id, callback.from_user.id):
+            await callback.answer("只有管理员可以跳过投票放行", show_alert=True)
+            return
+
+        ok, text = await actions.admin_release_vote_session(
+            callback.bot,
+            session_id,
+            callback.from_user.id,
+        )
         await callback.answer(text, show_alert=not ok)
         if callback.message is not None and ok:
             try:
@@ -859,6 +902,32 @@ def _merge_llm_decision(
         should_call_llm=False,
         metadata=metadata,
     )
+
+
+def _normal_message_reputation_reward(
+    settings: Settings,
+    decision: LocalDecision,
+    *,
+    update_type: str,
+    is_edit: bool,
+) -> float:
+    """Reward only a new message that the LLM explicitly judged non-spam.
+
+    Edits and join-service events must not be farmable reputation events. Likewise,
+    a local fallback after an LLM failure/disablement is not affirmative evidence
+    of normal behavior. Vote-confirmed releases keep their larger, existing
+    ``ham_reputation_reward`` in the action layer.
+    """
+
+    if is_edit or update_type != "message" or decision.action != DecisionAction.ALLOW:
+        return 0
+
+    outcome = decision.metadata.get("llm_outcome")
+    if not isinstance(outcome, dict):
+        return 0
+    if outcome.get("status") != LLMOutcomeStatus.OK.value or outcome.get("is_spam") is not False:
+        return 0
+    return max(0, settings.normal_message_reputation_reward)
 
 
 def _annotate_with_llm_outcome(decision: LocalDecision, outcome: LLMOutcome) -> LocalDecision:

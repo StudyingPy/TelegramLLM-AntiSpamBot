@@ -41,6 +41,7 @@ def _settings() -> Settings:
         default_reputation=50,
         spam_reputation_penalty=35,
         ham_reputation_reward=8,
+        normal_message_reputation_reward=2,
         repeat_window_seconds=300,
         repeat_min_distinct_senders=3,
         fingerprint_review_weight=40,

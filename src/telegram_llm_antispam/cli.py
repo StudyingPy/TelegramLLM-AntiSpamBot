@@ -284,6 +284,10 @@ def _print_config(settings: Settings) -> None:
     print(f"VOTE_SWEEP_INTERVAL_SECONDS={settings.vote_sweep_interval_seconds}")
     print(f"LOW_REPUTATION_THRESHOLD={settings.low_reputation_threshold}")
     print(f"HIGH_REPUTATION_THRESHOLD={settings.high_reputation_threshold}")
+    print(
+        "NORMAL_MESSAGE_REPUTATION_REWARD="
+        f"{settings.normal_message_reputation_reward}"
+    )
     print(f"REPEAT_WINDOW_SECONDS={settings.repeat_window_seconds}")
     print(f"REPEAT_MIN_DISTINCT_SENDERS={settings.repeat_min_distinct_senders}")
     print(f"NEWAPI_ENABLED={settings.has_newapi}")

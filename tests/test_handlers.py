@@ -12,6 +12,7 @@ from telegram_llm_antispam.handlers import (
     _is_whitelisted_sender,
     _merge_llm_decision,
     _new_chat_members,
+    _normal_message_reputation_reward,
     _parse_whitelist_target,
     _same_user_open_vote_repeat_decision,
     _is_anonymous_admin_message,
@@ -111,8 +112,8 @@ def test_router_registers_catchup_review_callbacks(tmp_path):
     try:
         router = create_router(_settings(), db)
 
-        # 4 callback groups now: vote, admin_verify, admin_ban, review_ban, review_keep.
-        assert len(router.callback_query.handlers) == 5
+        # vote, admin_verify, admin_ban, admin_release, review_ban, review_keep.
+        assert len(router.callback_query.handlers) == 6
     finally:
         db.close()
 
@@ -178,6 +179,128 @@ def test_review_deeplink_shows_card_to_group_admin(tmp_path):
         assert markup is not None
         callbacks = {b.callback_data for row in markup.inline_keyboard for b in row}
         assert callbacks == {f"review_ban:{session_id}", f"review_keep:{session_id}"}
+    finally:
+        db.close()
+
+
+def test_open_vote_detail_deeplink_uses_cached_original_detail(tmp_path):
+    """The open-vote detail button remains useful after another bot deletes the
+    replied-to message because the private card renders vote_sessions.detail_text."""
+
+    import asyncio
+
+    from aiogram.filters import CommandObject
+
+    db = _db(tmp_path)
+    settings = _settings()
+    try:
+        router = create_router(settings, db)
+        features = build_message_features(
+            SimpleNamespace(
+                message_id=11,
+                chat=SimpleNamespace(id=-100123),
+                from_user=SimpleNamespace(id=42),
+                text="原消息已被其他 bot 删除",
+            ),
+            UserContext(
+                chat_id=-100123,
+                user_id=42,
+                reputation_score=50,
+                messages_seen=1,
+            ),
+        )
+        session_id = db.create_vote_session(
+            features,
+            LocalDecision(DecisionAction.WITHDRAW_VOTE, "known_fingerprint", 0.8),
+            timeout_seconds=60,
+            detail_text="缓存详情：原文、资料、LLM",
+        )
+
+        answered: list[dict] = []
+
+        async def answer(text, reply_markup=None):
+            answered.append({"text": text, "reply_markup": reply_markup})
+
+        async def get_chat_member(_chat_id, _user_id):
+            return SimpleNamespace(status=SimpleNamespace(value="administrator"))
+
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=7, type="private"),
+            from_user=SimpleNamespace(id=7),
+            bot=SimpleNamespace(get_chat_member=get_chat_member),
+            answer=answer,
+        )
+        asyncio.run(
+            router.message.handlers[0].callback(
+                message,
+                command=CommandObject(command="start", args=f"review_{session_id}"),
+            )
+        )
+
+        assert len(answered) == 1
+        assert answered[0]["text"].startswith("原消息详情")
+        assert "缓存详情：原文、资料、LLM" in answered[0]["text"]
+        callbacks = {
+            button.callback_data
+            for row in answered[0]["reply_markup"].inline_keyboard
+            for button in row
+        }
+        assert callbacks == {f"review_ban:{session_id}", f"review_keep:{session_id}"}
+    finally:
+        db.close()
+
+
+def test_admin_release_callback_rejects_non_admin(tmp_path):
+    import asyncio
+
+    db = _db(tmp_path)
+    settings = _settings()
+    try:
+        router = create_router(settings, db)
+        features = build_message_features(
+            SimpleNamespace(
+                message_id=12,
+                chat=SimpleNamespace(id=-100123),
+                from_user=SimpleNamespace(id=42),
+                text="测试",
+            ),
+            UserContext(
+                chat_id=-100123,
+                user_id=42,
+                reputation_score=50,
+                messages_seen=1,
+            ),
+        )
+        session_id = db.create_vote_session(
+            features,
+            LocalDecision(DecisionAction.WITHDRAW_VOTE, "test", 0.8),
+            timeout_seconds=60,
+        )
+
+        async def get_chat_member(_chat_id, _user_id):
+            return SimpleNamespace(status=SimpleNamespace(value="member"))
+
+        answers: list[tuple[str, bool]] = []
+
+        async def answer(text, show_alert=False):
+            answers.append((text, show_alert))
+
+        callback = SimpleNamespace(
+            data=f"admin_release:{session_id}",
+            from_user=SimpleNamespace(id=99),
+            bot=SimpleNamespace(get_chat_member=get_chat_member),
+            message=None,
+            answer=answer,
+        )
+        handler = next(
+            item
+            for item in router.callback_query.handlers
+            if item.callback.__name__ == "on_admin_release"
+        )
+        asyncio.run(handler.callback(callback))
+
+        assert answers == [("只有管理员可以跳过投票放行", True)]
+        assert db.get_vote_session(session_id).status == "open"
     finally:
         db.close()
 
@@ -457,6 +580,141 @@ def test_annotate_with_llm_outcome_records_ok_judgement_payload():
     assert payload["signal_phrases"] == ["加群", "拿码"]
 
 
+def test_only_new_llm_confirmed_normal_messages_earn_reputation():
+    settings = _settings()
+    normal = _annotate_with_llm_outcome(
+        LocalDecision(
+            action=DecisionAction.ALLOW,
+            reason="llm_not_spam",
+            confidence=0.17,
+        ),
+        LLMOutcome(
+            status=LLMOutcomeStatus.OK,
+            provider_count=1,
+            judgement=LLMJudgement(
+                is_spam=False,
+                confidence=0.17,
+                category="unknown",
+            ),
+        ),
+    )
+
+    assert _normal_message_reputation_reward(
+        settings,
+        normal,
+        update_type="message",
+        is_edit=False,
+    ) == settings.normal_message_reputation_reward
+
+    # Edits cannot repeatedly farm trust from one message.
+    assert _normal_message_reputation_reward(
+        settings,
+        normal,
+        update_type="edited_message",
+        is_edit=True,
+    ) == 0
+
+    # An LLM-normal result that still leaves a fingerprint vote open is not an
+    # actual release and therefore earns no normal-message reward.
+    fingerprint_vote = LocalDecision(
+        action=DecisionAction.WITHDRAW_VOTE,
+        reason="known_fingerprint",
+        confidence=0.8,
+        metadata=normal.metadata,
+    )
+    assert _normal_message_reputation_reward(
+        settings,
+        fingerprint_vote,
+        update_type="message",
+        is_edit=False,
+    ) == 0
+
+
+def test_router_persists_reputation_reward_for_llm_normal_messages(tmp_path):
+    import asyncio
+    import json
+
+    class NormalJudge:
+        async def judge(self, _features):
+            return LLMOutcome(
+                status=LLMOutcomeStatus.OK,
+                provider_count=1,
+                judgement=LLMJudgement(
+                    is_spam=False,
+                    confidence=0.12,
+                    category="benign",
+                ),
+            )
+
+    db = _db(tmp_path)
+    settings = _settings()
+    try:
+        router = create_router(settings, db, llm=NormalJudge())
+        db.allow_chat(-1001, "t", added_by_user_id=None)
+
+        async def get_me():
+            return SimpleNamespace(id=7777)
+
+        async def get_chat(_user_id):
+            return SimpleNamespace(bio=None)
+
+        bot = SimpleNamespace(get_me=get_me, get_chat=get_chat)
+
+        async def send(message_id: int):
+            message = SimpleNamespace(
+                message_id=message_id,
+                chat=SimpleNamespace(id=-1001, type="supergroup", title="t"),
+                from_user=SimpleNamespace(
+                    id=42,
+                    is_bot=False,
+                    username="member",
+                    first_name="Member",
+                    last_name=None,
+                    language_code="zh-hans",
+                    is_premium=None,
+                ),
+                text=f"这是正常讨论消息 {message_id}",
+                caption=None,
+                entities=None,
+                caption_entities=None,
+                link_preview_options=None,
+                bot=bot,
+                sender_chat=None,
+                is_automatic_forward=False,
+                new_chat_members=None,
+            )
+            for handler in router.message.handlers:
+                if not handler.filters:
+                    await handler.callback(message)
+                    return
+            raise AssertionError("no catch-all message handler")
+
+        asyncio.run(send(100))
+        asyncio.run(send(101))
+
+        context = db.get_user_context(-1001, 42)
+        assert context.messages_seen == 2
+        assert context.reputation_score == 50 + 2 * settings.normal_message_reputation_reward
+
+        with db._locked_conn() as conn:  # noqa: SLF001 - test-only inspection
+            rows = conn.execute(
+                """
+                SELECT metadata_json
+                FROM action_log
+                WHERE chat_id = -1001 AND user_id = 42
+                ORDER BY id
+                """
+            ).fetchall()
+        assert len(rows) == 2
+        assert all(
+            json.loads(row["metadata_json"])["reputation_reward"]
+            == settings.normal_message_reputation_reward
+            for row in rows
+        )
+    finally:
+        db.close()
+
+
 def test_messages_from_other_bots_are_moderated_not_silently_skipped(tmp_path):
     """Regression: handlers used to drop every message with from_user.is_bot=True,
     which meant spammers registering a bot account (e.g. an 'AI strip / porn' promo
@@ -474,7 +732,6 @@ def test_messages_from_other_bots_are_moderated_not_silently_skipped(tmp_path):
     """
     import asyncio
 
-    from aiogram import Bot
     from aiogram.dispatcher.event.bases import SkipHandler  # noqa: F401
 
     db = _db(tmp_path)

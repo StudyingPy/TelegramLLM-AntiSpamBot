@@ -117,6 +117,93 @@ def test_confirmed_spam_vote_cleans_related_messages_and_bans(tmp_path):
         db.close()
 
 
+def test_confirmed_ham_vote_rewards_user_reputation(tmp_path):
+    db = _db(tmp_path)
+    bot = FakeBot()
+    try:
+        settings = _settings()
+        actions = ModerationActions(settings, db)
+        features = _features(12)
+        db.record_message_seen(features)
+        session_id = db.create_vote_session(
+            features,
+            LocalDecision(DecisionAction.WITHDRAW_VOTE, "known_fingerprint", 0.8),
+            timeout_seconds=60,
+        )
+        db.add_vote(session_id, 1001, "ham")
+        db.add_vote(session_id, 1002, "ham")
+        tally = db.add_vote(session_id, 1003, "ham")
+        assert tally is not None
+
+        edits: list[str] = []
+
+        async def edit_text(text, **_kwargs):
+            edits.append(text)
+
+        callback_message = SimpleNamespace(bot=bot, edit_text=edit_text)
+        closed = asyncio.run(actions.close_vote_if_threshold_reached(callback_message, tally))
+
+        assert closed is True
+        context = db.get_user_context(features.chat_id, features.user_id or 0)
+        assert context.reputation_score == 50 + settings.ham_reputation_reward
+        assert edits and "投票结束：放行" in edits[0]
+    finally:
+        db.close()
+
+
+def test_admin_release_closes_vote_rewards_once_and_updates_message(tmp_path):
+    db = _db(tmp_path)
+    bot = FakeBot()
+    try:
+        settings = _settings()
+        actions = ModerationActions(settings, db)
+        features = _features(13)
+        db.record_message_seen(features)
+        session_id = db.create_vote_session(
+            features,
+            LocalDecision(DecisionAction.WITHDRAW_VOTE, "known_fingerprint", 0.8),
+            timeout_seconds=60,
+        )
+        db.set_vote_message_id(session_id, 113)
+
+        ok, text = asyncio.run(
+            actions.admin_release_vote_session(bot, session_id, moderator_user_id=9001)
+        )
+
+        assert ok is True
+        assert text == "已放行"
+        assert db.get_vote_session(session_id).status == "released"
+        context = db.get_user_context(features.chat_id, features.user_id or 0)
+        assert context.reputation_score == 50 + settings.ham_reputation_reward
+        assert bot.edited_messages[-1]["message_id"] == 113
+        assert bot.edited_messages[-1]["reply_markup"] is None
+        assert "管理员已放行" in bot.edited_messages[-1]["text"]
+
+        with db._locked_conn() as conn:  # noqa: SLF001 - test-only inspection
+            log = conn.execute(
+                """
+                SELECT action, reason, metadata_json
+                FROM action_log
+                WHERE action = 'admin_released_user'
+                """
+            ).fetchone()
+        assert log is not None
+        assert log["reason"] == "admin_skip_vote_release"
+        assert '"moderator_user_id": 9001' in log["metadata_json"]
+
+        # Repeated/delayed callbacks are idempotent and cannot grant +8 twice.
+        second_ok, second_text = asyncio.run(
+            actions.admin_release_vote_session(bot, session_id, moderator_user_id=9001)
+        )
+        assert second_ok is False
+        assert "已处理" in second_text
+        assert db.get_user_context(features.chat_id, features.user_id or 0).reputation_score == (
+            50 + settings.ham_reputation_reward
+        )
+    finally:
+        db.close()
+
+
 def test_expired_vote_message_gets_catchup_review_button(tmp_path):
     """When a vote times out, the group message is edited to carry a deep-link
     button into the private-chat catch-up review."""
@@ -266,6 +353,7 @@ def test_catchup_keep_attributes_moderator_in_admin_notification(tmp_path):
         ok, _ = asyncio.run(actions.catchup_keep_vote_session(bot, session_id, moderator_user_id=9))
 
         assert ok is True
+        assert db.get_vote_session(session_id).status == "expired_released"
         dm_edits = [e for e in bot.edited_messages if e["chat_id"] == 555 and e["message_id"] == 700]
         assert dm_edits
         assert "补审操作者：9" in dm_edits[-1]["text"]
@@ -321,7 +409,7 @@ def test_withdraw_and_vote_caches_detail_text_on_session(tmp_path):
         answered: list[dict] = []
 
         async def fake_answer(text, reply_markup=None, **kwargs):
-            answered.append({"text": text})
+            answered.append({"text": text, "reply_markup": reply_markup})
             return SimpleNamespace(message_id=110)
 
         message = SimpleNamespace(
@@ -336,6 +424,25 @@ def test_withdraw_and_vote_caches_detail_text_on_session(tmp_path):
         assert session.detail_text is not None
         assert "反广告处理记录" in session.detail_text
         assert f"投票会话：<code>{result.vote_session_id}</code>" in session.detail_text
+
+        keyboard = answered[0]["reply_markup"]
+        callbacks = {
+            button.callback_data
+            for row in keyboard.inline_keyboard
+            for button in row
+            if button.callback_data
+        }
+        assert callbacks == {
+            f"vote:{result.vote_session_id}:spam",
+            f"vote:{result.vote_session_id}:ham",
+            f"admin_ban:{result.vote_session_id}",
+            f"admin_release:{result.vote_session_id}",
+        }
+        assert "原消息详情" in _keyboard_text(keyboard)
+        assert (
+            f"https://t.me/antispam_test_bot?start=review_{result.vote_session_id}"
+            in _keyboard_url(keyboard)
+        )
     finally:
         db.close()
 

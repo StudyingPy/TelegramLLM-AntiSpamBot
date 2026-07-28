@@ -15,6 +15,7 @@ from .models import ActionResult, DecisionAction, LocalDecision, MessageFeatures
 from .notifications import (
     build_moderation_detail_text,
     catchup_review_keyboard,
+    review_deeplink_button,
     update_vote_notifications,
     vote_status_text,
 )
@@ -71,8 +72,12 @@ class ModerationActions:
             f"投票中：广告 {tally.spam_votes} / 放行 {tally.ham_votes}\n"
             f"最低确认票数：{self._settings.vote_min_confirmations}"
         )
+        bot_username = await self._get_bot_username(callback_message.bot)
         try:
-            await callback_message.edit_text(text, reply_markup=self._vote_keyboard(tally.session_id))
+            await callback_message.edit_text(
+                text,
+                reply_markup=self._vote_keyboard(tally.session_id, bot_username),
+            )
         except TelegramBadRequest:
             logger.debug("Vote message was not modified")
         await update_vote_notifications(
@@ -231,6 +236,25 @@ class ModerationActions:
         )
         return True, "已封禁"
 
+    async def admin_release_vote_session(
+        self,
+        bot: Any,
+        session_id: int,
+        moderator_user_id: int,
+    ) -> tuple[bool, str]:
+        """Let a verified group admin immediately release an open vote."""
+
+        return await self._release_vote_session(
+            bot,
+            session_id,
+            moderator_user_id,
+            allowed_from=("open",),
+            action="admin_released_user",
+            reason="admin_skip_vote_release",
+            group_text="管理员已放行。",
+            notification_label="管理员已跳过投票并放行",
+        )
+
     async def catchup_ban_vote_session(
         self,
         bot: Any,
@@ -305,12 +329,25 @@ class ModerationActions:
         session = self._db.get_vote_session(session_id)
         if session is None:
             return False, "投票会话不存在"
-        if session.status not in {"open", "expired_released"}:
+        if session.status == "open":
+            ok, text = await self._release_vote_session(
+                bot,
+                session_id,
+                moderator_user_id,
+                allowed_from=("open",),
+                action="catchup_kept_released",
+                reason="catchup_review_keep_released",
+                group_text="详情页复审：维持放行。",
+                notification_label="详情页复审：维持放行",
+            )
+            return ok, "已维持放行" if ok else text
+        if session.status != "expired_released":
             return False, "该会话已处理"
 
-        if session.status == "open":
-            # Rare: an admin opened the deep link before the sweep expired it.
-            self._db.close_vote_session(session_id, "released")
+        # Preserve the established timeout-review semantics: expiry already
+        # released the message, so "keep" only records the explicit moderator
+        # confirmation and removes the deep-link button. It does not transition
+        # or reward the session a second time.
         self._db.record_vote_session_action(
             session_id,
             action="catchup_kept_released",
@@ -318,13 +355,12 @@ class ModerationActions:
             confidence=0.0,
             metadata={"moderator_user_id": moderator_user_id},
         )
-        refreshed = self._db.get_vote_session(session_id) or session
         try:
             await self._edit_vote_message_text(
                 bot,
-                refreshed,
+                session,
                 "投票超时后经补审：维持放行。\n"
-                f"广告 {refreshed.spam_votes} / 放行 {refreshed.ham_votes}",
+                f"广告 {session.spam_votes} / 放行 {session.ham_votes}",
                 reply_markup=None,
             )
         except TelegramAPIError as exc:  # pragma: no cover - depends on Telegram API state.
@@ -335,13 +371,85 @@ class ModerationActions:
             session_id,
             vote_status_text(
                 self._db,
-                refreshed,
+                session,
                 label="投票超时补审：维持放行",
                 moderator_user_id=moderator_user_id,
             ),
             is_open=False,
         )
         return True, "已维持放行"
+
+    async def _release_vote_session(
+        self,
+        bot: Any,
+        session_id: int,
+        moderator_user_id: int,
+        *,
+        allowed_from: tuple[str, ...],
+        action: str,
+        reason: str,
+        group_text: str,
+        notification_label: str,
+    ) -> tuple[bool, str]:
+        """Shared terminal release path for group and private-review buttons.
+
+        ``close_vote_session`` is the idempotency gate: only the first callback
+        transitions the allowed source state to ``released`` and earns feedback /
+        reputation. Delayed or double taps cannot reward the user twice.
+        """
+
+        session = self._db.get_vote_session(session_id)
+        if session is None:
+            return False, "投票会话不存在"
+        if session.status not in allowed_from:
+            return False, "该会话已处理"
+        if not self._db.close_vote_session(
+            session_id,
+            "released",
+            allowed_from=allowed_from,
+        ):
+            return False, "该会话已处理"
+
+        refreshed = self._db.get_vote_session(session_id) or session
+        record_vote_ham_feedback(self._db, refreshed, self._settings)
+        self._db.record_vote_session_action(
+            session_id,
+            action=action,
+            reason=reason,
+            confidence=1.0,
+            metadata={"moderator_user_id": moderator_user_id},
+        )
+        if refreshed.suspect_user_id is not None:
+            self._db.adjust_reputation(
+                refreshed.chat_id,
+                refreshed.suspect_user_id,
+                self._settings.ham_reputation_reward,
+            )
+
+        try:
+            await self._edit_vote_message_text(
+                bot,
+                refreshed,
+                f"{group_text}\n"
+                f"广告 {refreshed.spam_votes} / 放行 {refreshed.ham_votes}",
+                reply_markup=None,
+            )
+        except TelegramAPIError as exc:  # pragma: no cover - depends on Telegram API state.
+            logger.warning("Failed to edit released vote message %s: %s", session_id, exc)
+
+        await update_vote_notifications(
+            bot,
+            self._db,
+            session_id,
+            vote_status_text(
+                self._db,
+                refreshed,
+                label=notification_label,
+                moderator_user_id=moderator_user_id,
+            ),
+            is_open=False,
+        )
+        return True, "已放行"
 
     async def _withdraw_and_vote(
         self,
@@ -360,9 +468,10 @@ class ModerationActions:
             decision,
             timeout_seconds=self._settings.vote_timeout_seconds,
         )
+        bot_username = await self._get_bot_username(message.bot)
         vote_message = await message.answer(
             self._vote_text(decision),
-            reply_markup=self._vote_keyboard(session_id),
+            reply_markup=self._vote_keyboard(session_id, bot_username),
             reply_to_message_id=message.message_id,
             allow_sending_without_reply=True,
         )
@@ -733,25 +842,44 @@ class ModerationActions:
             f"置信度：{confidence}"
         )
 
-    def _vote_keyboard(self, session_id: int) -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup(
-            inline_keyboard=[
+    def _vote_keyboard(
+        self,
+        session_id: int,
+        bot_username: str | None = None,
+    ) -> InlineKeyboardMarkup:
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text="确认广告",
+                    callback_data=f"vote:{session_id}:spam",
+                ),
+                InlineKeyboardButton(
+                    text="放行",
+                    callback_data=f"vote:{session_id}:ham",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="管理员封禁",
+                    callback_data=f"admin_ban:{session_id}",
+                ),
+                InlineKeyboardButton(
+                    text="管理员放行",
+                    callback_data=f"admin_release:{session_id}",
+                ),
+            ],
+        ]
+        if bot_username:
+            rows.append(
                 [
-                    InlineKeyboardButton(
-                        text="确认广告",
-                        callback_data=f"vote:{session_id}:spam",
-                    ),
-                    InlineKeyboardButton(
-                        text="放行",
-                        callback_data=f"vote:{session_id}:ham",
-                    ),
-                    InlineKeyboardButton(
-                        text="管理员封禁",
-                        callback_data=f"admin_ban:{session_id}",
-                    ),
+                    review_deeplink_button(
+                        bot_username,
+                        session_id,
+                        text="原消息详情",
+                    )
                 ]
-            ]
-        )
+            )
+        return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _unique_ints(values: object) -> tuple[int, ...]:

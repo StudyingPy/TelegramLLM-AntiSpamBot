@@ -386,10 +386,18 @@ class Database:
             last_seen_at=row["last_seen_at"],
         )
 
-    def record_message_seen(self, features: MessageFeatures) -> None:
+    def record_message_seen(
+        self,
+        features: MessageFeatures,
+        reputation_delta: float = 0,
+    ) -> None:
         if features.user_id is None:
             return
         now = _now()
+        initial_reputation = max(
+            0,
+            min(100, self._default_reputation + reputation_delta),
+        )
         with self._locked_conn() as conn:
             conn.execute(
                 """
@@ -399,14 +407,19 @@ class Database:
                 VALUES (?, ?, ?, ?, ?, 1)
                 ON CONFLICT(chat_id, user_id) DO UPDATE SET
                     last_seen_at = excluded.last_seen_at,
-                    messages_seen = user_reputation.messages_seen + 1
+                    messages_seen = user_reputation.messages_seen + 1,
+                    reputation_score = max(
+                        0,
+                        min(100, user_reputation.reputation_score + ?)
+                    )
                 """,
                 (
                     features.chat_id,
                     features.user_id,
-                    self._default_reputation,
+                    initial_reputation,
                     now,
                     now,
+                    reputation_delta,
                 ),
             )
             conn.commit()
@@ -927,7 +940,7 @@ class Database:
         status: str,
         *,
         allowed_from: tuple[str, ...] = ("open",),
-    ) -> None:
+    ) -> bool:
         """Move a vote session into a terminal `status`.
 
         By default only an `open` session can be closed — this guards the live
@@ -938,7 +951,7 @@ class Database:
         """
         placeholders = ",".join("?" for _ in allowed_from)
         with self._locked_conn() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 f"""
                 UPDATE vote_sessions
                 SET status = ?, closed_at = ?
@@ -947,6 +960,7 @@ class Database:
                 (status, _now(), session_id, *allowed_from),
             )
             conn.commit()
+        return cursor.rowcount > 0
 
     def get_vote_session(self, session_id: int) -> VoteSession | None:
         with self._locked_conn() as conn:

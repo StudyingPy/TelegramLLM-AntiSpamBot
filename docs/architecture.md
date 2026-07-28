@@ -25,6 +25,9 @@
    - ban deletes the current hit plus the same user's open-vote suspect/vote messages, bans when
      permissions allow it, and posts a group summary that is deleted after 2 minutes
 10. Vote callbacks update `vote_sessions`, `vote_session_votes`, reputation, and action logs.
+    Open vote messages also expose administrator-only immediate ban/release actions and a
+    private-chat detail deep link backed by the cached session detail, so review remains possible
+    when another moderation bot has already deleted the original message.
 11. Confirmed-spam vote callbacks close all open vote sessions for the suspect user, clean the
    related suspect messages and bot vote prompts, ban the user, and update admin notifications.
 12. A background sweeper expires stale open vote sessions as `expired_released`, logs the
@@ -33,6 +36,9 @@
    - LLM spam creates medium-weight skeleton/phrase fingerprints
    - vote-confirmed spam boosts skeleton/content fingerprints
    - vote-released messages mark false positives and lower fingerprint weight
+   - each new message explicitly judged non-spam by the LLM adds a small reputation reward
+   - bare human `@username` mentions are excluded from phrase fingerprints; only usernames
+     ending in `bot` retain carrier-only phrase matching
 
 ## Phase Status
 

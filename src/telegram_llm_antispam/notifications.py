@@ -25,7 +25,7 @@ async def notify_admins(
     text = _notification_text(features, decision, result)
     reply_markup = None
     if result.vote_session_id is not None:
-        reply_markup = admin_ban_keyboard(result.vote_session_id)
+        reply_markup = admin_action_keyboard(result.vote_session_id)
 
     send_text = text
     if result.vote_session_id is not None:
@@ -61,7 +61,7 @@ async def update_vote_notifications(
     if not notifications:
         return
 
-    reply_markup = admin_ban_keyboard(session_id) if is_open else None
+    reply_markup = admin_action_keyboard(session_id) if is_open else None
     live_text = f"\n\n实时状态：\n{_esc(status_text)}"
     for notification in notifications:
         try:
@@ -112,20 +112,41 @@ def vote_status_text(
     return "\n".join(lines)
 
 
-def admin_ban_keyboard(session_id: int) -> InlineKeyboardMarkup:
+def admin_action_keyboard(session_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text="跳过投票并封禁",
                     callback_data=f"admin_ban:{session_id}",
-                )
+                ),
+                InlineKeyboardButton(
+                    text="管理员放行",
+                    callback_data=f"admin_release:{session_id}",
+                ),
             ]
         ]
     )
 
 
+# Backwards-compatible name for external callers; the keyboard now carries both
+# administrator terminal actions.
+admin_ban_keyboard = admin_action_keyboard
+
+
 REVIEW_DEEPLINK_PREFIX = "review_"
+
+
+def review_deeplink_button(
+    bot_username: str,
+    session_id: int,
+    *,
+    text: str,
+) -> InlineKeyboardButton:
+    """Build the shared private-review deep link used before and after timeout."""
+
+    url = f"https://t.me/{bot_username}?start={REVIEW_DEEPLINK_PREFIX}{session_id}"
+    return InlineKeyboardButton(text=text, url=url)
 
 
 def catchup_review_keyboard(bot_username: str, session_id: int) -> InlineKeyboardMarkup:
@@ -137,13 +158,13 @@ def catchup_review_keyboard(bot_username: str, session_id: int) -> InlineKeyboar
     URL button rather than a callback because the private-chat review has to run
     where `can_manage_chat` can verify the tapper is a real admin of the group.
     """
-    url = f"https://t.me/{bot_username}?start={REVIEW_DEEPLINK_PREFIX}{session_id}"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(
+                review_deeplink_button(
+                    bot_username,
+                    session_id,
                     text="前往私聊补审",
-                    url=url,
                 )
             ]
         ]
@@ -176,13 +197,20 @@ def review_card_text(db: Database, session: VoteSession) -> str:
     """
     detail = _review_detail_block(db, session)
     message_link = _message_link(session.chat_id, session.original_message_id)
+    if session.status == "open":
+        title = "原消息详情"
+    elif session.status == "expired_released":
+        title = "投票超时补审"
+    else:
+        title = "投票详情"
+
     header = [
-        "投票超时补审",
+        title,
         f"原消息：{message_link}",
         f"投票：广告 {session.spam_votes} / 放行 {session.ham_votes}",
         f"当前状态：{_status_label(session.status)}",
     ]
-    if session.status != "expired_released":
+    if session.status not in {"open", "expired_released"}:
         header.append("该会话已被处理，补审仅供参考。")
 
     header_text = "\n".join(header)

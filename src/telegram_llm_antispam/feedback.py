@@ -16,6 +16,15 @@ from .text import normalize_text
 
 PHRASE_CANDIDATE_LIMIT = 256
 
+# A bare @mention identifies the person being addressed, not the intent of the
+# message. Production learned "@zaoanyun" from one real advertisement and then
+# opened votes whenever members mentioned that group administrator. Bot usernames
+# are the narrow exception: Telegram requires bot usernames to end in "bot", and a
+# carrier-only mention of such an account remains useful for catching promotional
+# bot replies.
+_BARE_MENTION_RE = re.compile(r"^@([a-z0-9_]{3,})$", re.IGNORECASE)
+_SURROUNDING_MENTION_PUNCTUATION = " \t\r\n.,!?，。！？:：;；()[]{}<>《》\"'`~"
+
 # Minimum lengths for phrase fingerprints. Below this threshold a phrase collides
 # against too many unrelated messages to be useful as a signal. Two-character CJK
 # words like "可以", "我们", "什么" appear in every Chinese conversation; we must not
@@ -68,6 +77,24 @@ def _phrase_passes_min_length(phrase: str) -> bool:
     return not is_low_entropy_normalized_text(normalized)
 
 
+def _bare_mention_username(value: str) -> str | None:
+    candidate = normalize_text(value).strip(_SURROUNDING_MENTION_PUNCTUATION)
+    match = _BARE_MENTION_RE.fullmatch(candidate)
+    return match.group(1).lower() if match else None
+
+
+def _is_allowed_phrase_carrier(phrase: str) -> bool:
+    """Reject person-only mentions; retain Telegram bot mentions.
+
+    The test is deliberately applied on both fingerprint writes and lookups so
+    stale rows such as the production @zaoanyun fingerprint become unreachable
+    immediately after deployment, before an operator removes them from SQLite.
+    """
+
+    username = _bare_mention_username(phrase)
+    return username is None or username.endswith("bot")
+
+
 def fingerprint_lookup_values(features: MessageFeatures) -> tuple[tuple[str, str], ...]:
     values: list[tuple[str, str]] = []
     # Skeleton lookup is further gated by the skeleton STRING (not just the hash) so
@@ -113,7 +140,7 @@ def record_llm_spam_feedback(
         # LLM is free to return "可以" / "OK" / "see" as signal phrases. We must NOT
         # promote those to fingerprint candidates regardless of how confident the
         # judgement was — they will collide with every innocent message.
-        if not _phrase_passes_min_length(phrase):
+        if not _is_allowed_phrase_carrier(phrase) or not _phrase_passes_min_length(phrase):
             continue
         value = phrase_fingerprint_value(phrase)
         if _is_meaningful_fingerprint_value(value):
@@ -169,7 +196,7 @@ def phrase_lookup_values(features: MessageFeatures) -> tuple[str, ...]:
         # short) could still match against a stale low-entropy phrase fingerprint
         # left over from before this commit. The purge admin command cleans those,
         # but defense in depth keeps us safe before the operator runs it.
-        if not _phrase_passes_min_length(phrase):
+        if not _is_allowed_phrase_carrier(phrase) or not _phrase_passes_min_length(phrase):
             continue
         value = phrase_fingerprint_value(phrase)
         if value and value not in values:
@@ -180,7 +207,13 @@ def phrase_lookup_values(features: MessageFeatures) -> tuple[str, ...]:
 
 
 def _profile_and_message_phrase_candidates(features: MessageFeatures) -> tuple[str, ...]:
-    texts = [features.clean_text]
+    texts: list[str] = []
+    # Do not derive the secondary bare-username candidate ("zaoanyun") from a
+    # carrier-only non-bot mention after filtering "@zaoanyun" itself. Skipping the
+    # whole message text here makes the read-side guard complete while sender
+    # profile candidates remain available independently.
+    if _is_allowed_phrase_carrier(features.clean_text):
+        texts.append(features.clean_text)
 
     og_preview = features.metadata.get("og_preview")
     if isinstance(og_preview, dict):

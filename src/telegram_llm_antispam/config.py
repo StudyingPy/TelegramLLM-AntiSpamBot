@@ -78,6 +78,7 @@ class Settings:
     default_reputation: float
     spam_reputation_penalty: float
     ham_reputation_reward: float
+    normal_message_reputation_reward: float
 
     repeat_window_seconds: int
     repeat_min_distinct_senders: int
@@ -144,6 +145,9 @@ class Settings:
             default_reputation=_env_float("DEFAULT_REPUTATION", 50),
             spam_reputation_penalty=_env_float("SPAM_REPUTATION_PENALTY", 35),
             ham_reputation_reward=_env_float("HAM_REPUTATION_REWARD", 8),
+            normal_message_reputation_reward=_env_float(
+                "NORMAL_MESSAGE_REPUTATION_REWARD", 2
+            ),
             repeat_window_seconds=_env_int("REPEAT_WINDOW_SECONDS", 300),
             repeat_min_distinct_senders=_env_int("REPEAT_MIN_DISTINCT_SENDERS", 3),
             fingerprint_review_weight=_env_float("FINGERPRINT_REVIEW_WEIGHT", 40),

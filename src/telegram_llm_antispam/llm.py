@@ -124,7 +124,7 @@ class NewAPIJudge:
                 response_format={"type": "json_object"},
                 timeout=self._timeout,
             )
-        except APITimeoutError as exc:
+        except APITimeoutError:
             elapsed = time.monotonic() - start
             logger.warning(
                 "NewAPI provider %s timed out after %.1fs: %s",
