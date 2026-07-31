@@ -189,7 +189,7 @@ def review_action_keyboard(session_id: int) -> InlineKeyboardMarkup:
 
 
 def review_card_text(db: Database, session: VoteSession) -> str:
-    """Private-chat review card for a timed-out (or already closed) vote session.
+    """Private administrator review card for an open, timed-out, or closed vote.
 
     The card leads with the full moderation detail (identical to what global admins
     receive) so a reviewer can judge from原文/资料/OG/LLM, followed by a live
@@ -197,15 +197,9 @@ def review_card_text(db: Database, session: VoteSession) -> str:
     """
     detail = _review_detail_block(db, session)
     message_link = _message_link(session.chat_id, session.original_message_id)
-    if session.status == "open":
-        title = "原消息详情"
-    elif session.status == "expired_released":
-        title = "投票超时补审"
-    else:
-        title = "投票详情"
 
     header = [
-        title,
+        "管理员私聊封禁",
         f"原消息：{message_link}",
         f"投票：广告 {session.spam_votes} / 放行 {session.ham_votes}",
         f"当前状态：{_status_label(session.status)}",

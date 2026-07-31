@@ -174,7 +174,7 @@ def test_review_deeplink_shows_card_to_group_admin(tmp_path):
         )
 
         assert len(answered) == 1
-        assert "投票超时补审" in answered[0]["text"]
+        assert "管理员私聊封禁" in answered[0]["text"]
         markup = answered[0]["reply_markup"]
         assert markup is not None
         callbacks = {b.callback_data for row in markup.inline_keyboard for b in row}
@@ -238,7 +238,7 @@ def test_open_vote_detail_deeplink_uses_cached_original_detail(tmp_path):
         )
 
         assert len(answered) == 1
-        assert answered[0]["text"].startswith("原消息详情")
+        assert answered[0]["text"].startswith("管理员私聊封禁")
         assert "缓存详情：原文、资料、LLM" in answered[0]["text"]
         callbacks = {
             button.callback_data

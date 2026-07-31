@@ -315,7 +315,7 @@ def test_review_card_uses_cached_detail_text(tmp_path):
     try:
         session = _vote_session(detail_text="反广告处理记录\n正文：\n<blockquote>看片加群</blockquote>")
         text = review_card_text(db, session)
-        assert "投票超时补审" in text
+        assert "管理员私聊封禁" in text
         assert "反广告处理记录" in text
         assert "看片加群" in text
         # Live header still present.
@@ -356,7 +356,7 @@ def test_review_card_notice_when_no_detail_available(tmp_path):
     try:
         session = _vote_session(detail_text=None, original_message_id=999999)
         text = review_card_text(db, session)
-        assert "投票超时补审" in text
+        assert "管理员私聊封禁" in text
         assert "原文详情已不可用" in text
     finally:
         db.close()
