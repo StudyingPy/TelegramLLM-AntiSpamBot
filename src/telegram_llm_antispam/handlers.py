@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import logging
+import re
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
@@ -51,6 +52,13 @@ ADMIN_VERIFY_ACTIONS = {"status", "allow_chat", "deny_chat"}
 # unconditionally — the same effect as an operator whitelisting it, but built in so a
 # fresh deployment never bans its own linked-channel posts.
 TELEGRAM_SERVICE_USER_IDS: frozenset[int] = frozenset({777000})
+
+_BOT_USERNAME = r"[A-Za-z0-9_]{2,29}bot"
+_BOT_ONLY_MESSAGE_RE = re.compile(
+    rf"^\s*(?P<mentions>@{_BOT_USERNAME}(?:\s+@{_BOT_USERNAME})*)\s*$",
+    re.IGNORECASE,
+)
+_BOT_MENTION_RE = re.compile(rf"@({_BOT_USERNAME})", re.IGNORECASE)
 
 
 def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None) -> Router:
@@ -255,14 +263,6 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
         if not is_chat_allowed(settings, db, message.chat.id):
             return
 
-        # Only OUR own bot's messages must be skipped — replies to /help, vote prompts,
-        # ban summaries. Any OTHER bot in the group is fair game: spammers register
-        # their own bots and post promotional content under bot identities, which is
-        # a real Telegram pattern (e.g. AI-strip / porn / lottery promo bots replying
-        # to @mentions). Treating every is_bot=True as untouchable lets that bypass
-        # every rule we have.
-        self_id = await _get_self_bot_id(message.bot)
-
         # Channel posts auto-forwarded into a linked discussion group arrive as
         # messages from Telegram's service account (777000) with is_automatic_forward
         # set and sender_chat pointing at the source channel. They are not member
@@ -284,6 +284,42 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
             return
 
         new_members = _new_chat_members(message)
+        bot_usernames: tuple[str, ...] = ()
+        had_ad_invocation = False
+        if (
+            not is_edit
+            and not new_members
+            and message.from_user is not None
+            and not getattr(message.from_user, "is_bot", False)
+        ):
+            # Persist before the first network await. A called bot can respond while
+            # sender-profile lookup is still in flight; recording later would race
+            # that response and lose the caller attribution.
+            # A media attachment with an @bot-only caption is not a message whose
+            # only content is @bot, so this rule deliberately reads `text` only.
+            raw_text = getattr(message, "text", None)
+            bot_usernames = _only_bot_mentions(raw_text) if isinstance(raw_text, str) else ()
+            if bot_usernames:
+                had_ad_invocation = db.has_prior_confirmed_ad_bot_invocation(
+                    message.chat.id,
+                    message.from_user.id,
+                    message.message_id,
+                )
+                db.record_bot_only_message(
+                    message.chat.id,
+                    message.message_id,
+                    message.from_user.id,
+                    bot_usernames,
+                )
+
+        # Only OUR own bot's messages must be skipped — replies to /help, vote prompts,
+        # ban summaries. Any OTHER bot in the group is fair game: spammers register
+        # their own bots and post promotional content under bot identities, which is
+        # a real Telegram pattern (e.g. AI-strip / porn / lottery promo bots replying
+        # to @mentions). Treating every is_bot=True as untouchable lets that bypass
+        # every rule we have.
+        self_id = await _get_self_bot_id(message.bot)
+
         if new_members and not is_edit:
             for user in new_members:
                 user_id = getattr(user, "id", None)
@@ -316,6 +352,8 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
             message.from_user,
             update_type="edited_message" if is_edit else "message",
             is_edit=is_edit,
+            bot_usernames=bot_usernames,
+            had_ad_invocation=had_ad_invocation,
         )
 
     async def _process_features_for_user(
@@ -324,6 +362,8 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
         *,
         update_type: str,
         is_edit: bool,
+        bot_usernames: tuple[str, ...] = (),
+        had_ad_invocation: bool = False,
     ) -> None:
         user_context = db.get_user_context(message.chat.id, user.id)
         sender_profile = await get_sender_profile(message.bot, db, user, settings)
@@ -339,6 +379,28 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
             if og_preview is not None:
                 features.metadata["og_preview"] = og_preview.to_payload()
 
+        repeated_bot_only_decision: LocalDecision | None = None
+        if (
+            update_type == "message"
+            and not is_edit
+            and not sender_profile.is_bot
+            and features.user_id is not None
+            and bot_usernames
+            and had_ad_invocation
+        ):
+            repeated_bot_only_decision = LocalDecision(
+                action=DecisionAction.BAN,
+                reason="repeated_bot_only_invocation_after_ad",
+                confidence=1.0,
+                should_call_llm=False,
+                metadata={
+                    "bot_usernames": list(bot_usernames),
+                    "additional_message_ids_to_delete": list(
+                        db.list_bot_only_message_ids(features.chat_id, features.user_id)
+                    ),
+                },
+            )
+
         fingerprint = db.get_strongest_fingerprint(fingerprint_lookup_values(features))
         if fingerprint is not None:
             new_weight = db.record_fingerprint_hit(
@@ -352,7 +414,8 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
         same_user_repeat_decision = _same_user_open_vote_repeat_decision(settings, db, features)
         repeat_decision = _repeat_decision(settings, db, features)
         decision = (
-            same_user_repeat_decision
+            repeated_bot_only_decision
+            or same_user_repeat_decision
             or repeat_decision
             or rule_engine.evaluate(features, fingerprint=fingerprint)
         )
@@ -371,6 +434,22 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
                 record_llm_spam_feedback(db, features, outcome.judgement, settings)
                 decision = _merge_llm_decision(decision, outcome.judgement, features, settings)
             decision = _annotate_with_llm_outcome(decision, outcome)
+
+        if (
+            update_type == "message"
+            and not is_edit
+            and sender_profile.is_bot
+            and sender_profile.username
+            and _decision_identifies_advertising_bot(decision)
+        ):
+            reply = getattr(message, "reply_to_message", None)
+            reply_to_message_id = getattr(reply, "message_id", None)
+            db.confirm_bot_only_invocation_ad(
+                features.chat_id,
+                sender_profile.username,
+                features.message_id,
+                reply_to_message_id=reply_to_message_id,
+            )
 
         reputation_reward = _normal_message_reputation_reward(
             settings,
@@ -902,6 +981,30 @@ def _merge_llm_decision(
         should_call_llm=False,
         metadata=metadata,
     )
+
+
+def _only_bot_mentions(text: str) -> tuple[str, ...]:
+    """Return normalized usernames when text contains only one or more @...bot mentions."""
+
+    match = _BOT_ONLY_MESSAGE_RE.fullmatch(text)
+    if match is None:
+        return ()
+    # Keep order for audit metadata but collapse duplicates within one message.
+    return tuple(
+        dict.fromkeys(
+            username.casefold()
+            for username in _BOT_MENTION_RE.findall(match.group("mentions"))
+        )
+    )
+
+
+def _decision_identifies_advertising_bot(decision: LocalDecision) -> bool:
+    """Whether the bot message reached a final automatic advertising decision."""
+
+    # A WITHDRAW_VOTE result is still awaiting human confirmation. Flagging its
+    # caller now could turn a later released false positive into a direct user ban.
+    # Vote/admin-confirmed bot ads are correlated in the action finalization path.
+    return decision.action == DecisionAction.BAN
 
 
 def _normal_message_reputation_reward(

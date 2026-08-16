@@ -19,6 +19,11 @@
    `get_chat(user_id)` when Bot API exposes it, and explicit bio spam signals are handled locally.
 8. Local rules check known fingerprints, reputation, repeat windows, repeated open votes, profile
    bio signals, and hard carrier signals.
+   Bot-only invocation messages (one or more whitespace-separated `@...bot` usernames and no
+   other content) are persisted separately. If a named bot responds with content classified as
+   advertising, that invocation marks its human caller. The caller's next bot-only message bans
+   them regardless of which bot usernames it contains, and supplies every recorded bot-only
+   message ID to the cleanup action.
 9. Decisions are applied by the action layer:
    - allow/review only logs observations
    - withdraw + vote opens an inline vote session while preserving the original message for review

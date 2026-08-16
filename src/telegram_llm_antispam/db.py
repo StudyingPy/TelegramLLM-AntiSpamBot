@@ -139,6 +139,19 @@ CREATE TABLE IF NOT EXISTS message_observations (
     created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS bot_only_messages (
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    caller_user_id INTEGER NOT NULL,
+    bot_usernames_json TEXT NOT NULL,
+    ad_bot_confirmed INTEGER NOT NULL DEFAULT 0,
+    confirmed_bot_username TEXT,
+    advertising_bot_message_id INTEGER,
+    created_at INTEGER NOT NULL,
+    confirmed_at INTEGER,
+    PRIMARY KEY (chat_id, message_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_fingerprints_value ON fingerprints(value);
 CREATE INDEX IF NOT EXISTS idx_fingerprints_type_value ON fingerprints(fingerprint_type, value);
 CREATE INDEX IF NOT EXISTS idx_user_profiles_updated_at ON user_profiles(updated_at);
@@ -148,6 +161,10 @@ CREATE INDEX IF NOT EXISTS idx_admin_notifications_vote_session
     ON admin_notifications(vote_session_id);
 CREATE INDEX IF NOT EXISTS idx_observations_skeleton_time
     ON message_observations(skeleton_hash, created_at);
+CREATE INDEX IF NOT EXISTS idx_bot_only_messages_caller
+    ON bot_only_messages(chat_id, caller_user_id, ad_bot_confirmed, message_id);
+CREATE INDEX IF NOT EXISTS idx_bot_only_messages_time
+    ON bot_only_messages(chat_id, created_at);
 """
 
 
@@ -962,6 +979,150 @@ class Database:
             conn.commit()
         return cursor.rowcount > 0
 
+    def record_bot_only_message(
+        self,
+        chat_id: int,
+        message_id: int,
+        caller_user_id: int,
+        bot_usernames: tuple[str, ...],
+    ) -> None:
+        """Persist a human message whose only content is one or more bot mentions.
+
+        The raw invocation messages are kept because Telegram only lets the action
+        layer delete old messages when their message IDs are known. Usernames are
+        normalized by the caller before storage.
+        """
+
+        if not bot_usernames:
+            return
+        with self._locked_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO bot_only_messages (
+                    chat_id, message_id, caller_user_id, bot_usernames_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, message_id) DO NOTHING
+                """,
+                (
+                    chat_id,
+                    message_id,
+                    caller_user_id,
+                    json.dumps(list(bot_usernames), ensure_ascii=False),
+                    _now(),
+                ),
+            )
+            conn.commit()
+
+    def confirm_bot_only_invocation_ad(
+        self,
+        chat_id: int,
+        bot_username: str,
+        advertising_bot_message_id: int,
+        *,
+        reply_to_message_id: int | None = None,
+        fallback_window_seconds: int = 300,
+    ) -> int | None:
+        """Attribute an advertising bot response to the invocation that called it.
+
+        An explicit Telegram reply is authoritative. Some bots send a standalone
+        response instead, so the safe fallback is the closest preceding bot-only
+        message in the same chat which names that bot and falls inside a short time
+        window. Returns the caller user ID when an invocation was confirmed.
+        """
+
+        normalized_username = bot_username.casefold().lstrip("@")
+        now = _now()
+        with self._locked_conn() as conn:
+            if reply_to_message_id is not None:
+                rows = conn.execute(
+                    """
+                    SELECT chat_id, message_id, caller_user_id, bot_usernames_json
+                    FROM bot_only_messages
+                    WHERE chat_id = ? AND message_id = ?
+                    LIMIT 1
+                    """,
+                    (chat_id, reply_to_message_id),
+                ).fetchall()
+            else:
+                rows = []
+
+            matched = _find_bot_only_message(rows, normalized_username)
+            if matched is None:
+                rows = conn.execute(
+                    """
+                    SELECT chat_id, message_id, caller_user_id, bot_usernames_json
+                    FROM bot_only_messages
+                    WHERE chat_id = ?
+                        AND message_id < ?
+                        AND created_at >= ?
+                    ORDER BY message_id DESC
+                    """,
+                    (
+                        chat_id,
+                        advertising_bot_message_id,
+                        now - max(0, fallback_window_seconds),
+                    ),
+                ).fetchall()
+                matched = _find_bot_only_message(rows, normalized_username)
+
+            if matched is None:
+                return None
+
+            conn.execute(
+                """
+                UPDATE bot_only_messages
+                SET ad_bot_confirmed = 1,
+                    confirmed_bot_username = ?,
+                    advertising_bot_message_id = ?,
+                    confirmed_at = ?
+                WHERE chat_id = ? AND message_id = ?
+                """,
+                (
+                    normalized_username,
+                    advertising_bot_message_id,
+                    now,
+                    matched["chat_id"],
+                    matched["message_id"],
+                ),
+            )
+            conn.commit()
+            return int(matched["caller_user_id"])
+
+    def has_prior_confirmed_ad_bot_invocation(
+        self,
+        chat_id: int,
+        caller_user_id: int,
+        before_message_id: int,
+    ) -> bool:
+        with self._locked_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM bot_only_messages
+                WHERE chat_id = ?
+                    AND caller_user_id = ?
+                    AND ad_bot_confirmed = 1
+                    AND message_id < ?
+                LIMIT 1
+                """,
+                (chat_id, caller_user_id, before_message_id),
+            ).fetchone()
+        return row is not None
+
+    def list_bot_only_message_ids(self, chat_id: int, caller_user_id: int) -> tuple[int, ...]:
+        with self._locked_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT message_id
+                FROM bot_only_messages
+                WHERE chat_id = ? AND caller_user_id = ?
+                ORDER BY message_id ASC
+                """,
+                (chat_id, caller_user_id),
+            ).fetchall()
+        return tuple(int(row["message_id"]) for row in rows)
+
     def get_vote_session(self, session_id: int) -> VoteSession | None:
         with self._locked_conn() as conn:
             row = conn.execute(
@@ -1180,6 +1341,24 @@ class _LockedConnection:
 
 def _now() -> int:
     return int(time.time())
+
+
+def _find_bot_only_message(
+    rows: list[sqlite3.Row],
+    normalized_username: str,
+) -> sqlite3.Row | None:
+    for row in rows:
+        try:
+            usernames = json.loads(row["bot_usernames_json"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(usernames, list):
+            continue
+        if normalized_username in {
+            str(username).casefold().lstrip("@") for username in usernames
+        }:
+            return row
+    return None
 
 
 def _row_get(row: sqlite3.Row, key: str) -> Any:

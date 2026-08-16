@@ -7,7 +7,12 @@ from types import SimpleNamespace
 from telegram_llm_antispam.actions import ModerationActions
 from telegram_llm_antispam.db import Database
 from telegram_llm_antispam.features import build_message_features
-from telegram_llm_antispam.models import DecisionAction, LocalDecision, UserContext
+from telegram_llm_antispam.models import (
+    DecisionAction,
+    LocalDecision,
+    SenderProfile,
+    UserContext,
+)
 from test_llm import _settings
 
 
@@ -69,6 +74,65 @@ def _features(message_id: int):
     )
     context = UserContext(chat_id=-1001, user_id=42, reputation_score=50, messages_seen=1)
     return build_message_features(message, context)
+
+
+def test_repeat_bot_invocation_ban_deletes_all_recorded_bot_only_messages(tmp_path):
+    db = _db(tmp_path)
+    bot = FakeBot()
+    try:
+        actions = ModerationActions(_settings(), db)
+        actions.SUMMARY_DELETE_DELAY_SECONDS = 0
+        features = _features(103)
+        decision = LocalDecision(
+            DecisionAction.BAN,
+            "repeated_bot_only_invocation_after_ad",
+            1.0,
+            metadata={"additional_message_ids_to_delete": [101, 102, 103]},
+        )
+
+        result = asyncio.run(
+            actions.apply(
+                SimpleNamespace(bot=bot, message_id=103),
+                features,
+                decision,
+            )
+        )
+
+        assert result.banned is True
+        assert bot.banned_users == [(-1001, 42)]
+        assert set(bot.deleted_messages) == {(-1001, 101), (-1001, 102), (-1001, 103)}
+        assert len(bot.deleted_messages) == 3
+    finally:
+        db.close()
+
+
+def test_vote_confirmed_ad_bot_marks_its_invoker(tmp_path):
+    db = _db(tmp_path)
+    bot = FakeBot()
+    try:
+        settings = _settings()
+        actions = ModerationActions(settings, db)
+        actions.SUMMARY_DELETE_DELAY_SECONDS = 0
+        db.record_bot_only_message(-1001, 5, 7, ("adbot",))
+        db.upsert_user_profile(SenderProfile(user_id=42, username="AdBot", is_bot=True))
+        features = _features(6)
+        session_id = db.create_vote_session(
+            features,
+            LocalDecision(DecisionAction.WITHDRAW_VOTE, "llm_spam", 0.8),
+            timeout_seconds=60,
+        )
+        db.add_vote(session_id, 1001, "spam")
+        db.add_vote(session_id, 1002, "spam")
+        tally = db.add_vote(session_id, 1003, "spam")
+
+        closed = asyncio.run(
+            actions.close_vote_if_threshold_reached(SimpleNamespace(bot=bot), tally)
+        )
+
+        assert closed is True
+        assert db.has_prior_confirmed_ad_bot_invocation(-1001, 7, 7) is True
+    finally:
+        db.close()
 
 
 def test_confirmed_spam_vote_cleans_related_messages_and_bans(tmp_path):

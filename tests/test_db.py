@@ -657,3 +657,58 @@ def test_whitelisted_user_persists_and_combines_with_env(tmp_path):
         assert db.unwhitelist_user(999999) is False
     finally:
         db.close()
+
+
+def test_advertising_bot_response_marks_the_invoking_user(tmp_path):
+    db = _db(tmp_path)
+    try:
+        db.record_bot_only_message(
+            -1001,
+            10,
+            42,
+            ("helperbot", "another_bot"),
+        )
+
+        assert db.has_prior_confirmed_ad_bot_invocation(-1001, 42, 10) is False
+        caller_id = db.confirm_bot_only_invocation_ad(
+            -1001,
+            "@HelperBot",
+            11,
+            reply_to_message_id=10,
+        )
+
+        assert caller_id == 42
+        # The triggering message itself is the first invocation, not a repeat.
+        assert db.has_prior_confirmed_ad_bot_invocation(-1001, 42, 10) is False
+        # A later bot-only message is a repeat even if it names different bots.
+        assert db.has_prior_confirmed_ad_bot_invocation(-1001, 42, 12) is True
+    finally:
+        db.close()
+
+
+def test_standalone_ad_bot_response_uses_closest_matching_invocation(tmp_path):
+    db = _db(tmp_path)
+    try:
+        db.record_bot_only_message(-1001, 20, 41, ("adbot",))
+        db.record_bot_only_message(-1001, 21, 42, ("otherbot",))
+        db.record_bot_only_message(-1001, 22, 43, ("adbot", "thirdbot"))
+
+        caller_id = db.confirm_bot_only_invocation_ad(-1001, "AdBot", 23)
+
+        assert caller_id == 43
+        assert db.has_prior_confirmed_ad_bot_invocation(-1001, 43, 24) is True
+        assert db.has_prior_confirmed_ad_bot_invocation(-1001, 41, 24) is False
+    finally:
+        db.close()
+
+
+def test_bot_only_message_ids_are_retained_for_cleanup(tmp_path):
+    db = _db(tmp_path)
+    try:
+        db.record_bot_only_message(-1001, 30, 42, ("firstbot",))
+        db.record_bot_only_message(-1001, 31, 99, ("otherbot",))
+        db.record_bot_only_message(-1001, 32, 42, ("secondbot", "thirdbot"))
+
+        assert db.list_bot_only_message_ids(-1001, 42) == (30, 32)
+    finally:
+        db.close()

@@ -503,6 +503,11 @@ class ModerationActions:
             "text_snapshot": features.text[:500],
             "links": [link.url for link in features.links],
         }
+        additional_message_ids = _unique_ints(
+            decision.metadata.get("additional_message_ids_to_delete", ())
+        )
+        if additional_message_ids:
+            metadata["additional_message_ids_to_delete"] = list(additional_message_ids)
 
         final_metadata = await self._finalize_spam_user(
             message.bot,
@@ -515,6 +520,7 @@ class ModerationActions:
             confidence=decision.confidence,
             summary_reason=decision.reason,
             current_message_id=features.message_id,
+            additional_message_ids=additional_message_ids,
             extra_metadata=metadata,
         )
 
@@ -546,6 +552,7 @@ class ModerationActions:
         confidence: float,
         summary_reason: str,
         current_message_id: int | None = None,
+        additional_message_ids: tuple[int, ...] = (),
         primary_session_id: int | None = None,
         extra_metadata: dict[str, Any] | None = None,
         allowed_from: tuple[str, ...] = ("open",),
@@ -565,6 +572,26 @@ class ModerationActions:
             if primary_session is not None:
                 sessions = (primary_session, *sessions)
 
+        # A vote/admin decision can be the point at which an invoked bot becomes
+        # definitively advertising. Correlate every finalized bot message back to
+        # the human's earlier pure-@bot invocation; automatic BANs without a vote
+        # are correlated in handlers while the Telegram reply object is available.
+        if user_id is not None:
+            profile = self._db.get_user_profile(user_id)
+            if profile is not None and profile.is_bot and profile.username:
+                advertising_message_ids = _unique_ints(
+                    (
+                        *(session.original_message_id for session in sessions),
+                        current_message_id,
+                    )
+                )
+                for advertising_message_id in advertising_message_ids:
+                    self._db.confirm_bot_only_invocation_ad(
+                        chat_id,
+                        profile.username,
+                        advertising_message_id,
+                    )
+
         original_message_ids = _unique_ints(
             session.original_message_id for session in sessions if session.original_message_id
         )
@@ -573,6 +600,8 @@ class ModerationActions:
         )
         if current_message_id is not None:
             original_message_ids = _unique_ints((*original_message_ids, current_message_id))
+        if additional_message_ids:
+            original_message_ids = _unique_ints((*original_message_ids, *additional_message_ids))
 
         metadata["related_vote_session_ids"] = [session.id for session in sessions]
         metadata["deleted_original_message_ids"] = []

@@ -13,6 +13,7 @@ from telegram_llm_antispam.handlers import (
     _merge_llm_decision,
     _new_chat_members,
     _normal_message_reputation_reward,
+    _only_bot_mentions,
     _parse_whitelist_target,
     _same_user_open_vote_repeat_decision,
     _is_anonymous_admin_message,
@@ -711,6 +712,123 @@ def test_router_persists_reputation_reward_for_llm_normal_messages(tmp_path):
             == settings.normal_message_reputation_reward
             for row in rows
         )
+    finally:
+        db.close()
+
+
+def test_only_bot_mentions_accepts_one_or_many_bots_without_other_content():
+    assert _only_bot_mentions("@HelperBot") == ("helperbot",)
+    assert _only_bot_mentions("  @FirstBot\n@second_bot @FIRSTBOT  ") == (
+        "firstbot",
+        "second_bot",
+    )
+
+
+def test_only_bot_mentions_rejects_non_bot_mentions_and_any_other_content():
+    assert _only_bot_mentions("@ordinary_user") == ()
+    assert _only_bot_mentions("@HelperBot 请帮忙") == ()
+    assert _only_bot_mentions("@HelperBot, @SecondBot") == ()
+
+
+def test_ad_bot_invoker_is_banned_on_next_bot_only_message_and_all_calls_are_deleted(
+    tmp_path,
+):
+    import asyncio
+
+    db = _db(tmp_path)
+    settings = _settings()
+    try:
+        router = create_router(settings, db)
+        handlers = router.message.handlers
+        db.allow_chat(-1001, "t", added_by_user_id=None)
+
+        banned: list[tuple[int, int]] = []
+        deleted: list[tuple[int, int]] = []
+
+        async def get_me():
+            return SimpleNamespace(id=7777, username="moderatorbot")
+
+        async def get_chat(_user_id):
+            return SimpleNamespace(bio=None)
+
+        async def get_chat_member(chat_id, user_id):
+            if user_id == 7777:
+                return SimpleNamespace(
+                    status=SimpleNamespace(value="administrator"),
+                    can_delete_messages=True,
+                    can_restrict_members=True,
+                )
+            return SimpleNamespace(status=SimpleNamespace(value="member"))
+
+        async def ban_chat_member(chat_id, user_id):
+            banned.append((chat_id, user_id))
+
+        async def delete_message(chat_id, message_id):
+            deleted.append((chat_id, message_id))
+
+        async def send_message(_chat_id, _text):
+            return SimpleNamespace(message_id=900)
+
+        bot = SimpleNamespace(
+            get_me=get_me,
+            get_chat=get_chat,
+            get_chat_member=get_chat_member,
+            ban_chat_member=ban_chat_member,
+            delete_message=delete_message,
+            send_message=send_message,
+        )
+
+        async def dispatch(message_id, user_id, *, username, is_bot, text):
+            message = SimpleNamespace(
+                message_id=message_id,
+                chat=SimpleNamespace(id=-1001, type="supergroup", title="t"),
+                from_user=SimpleNamespace(
+                    id=user_id,
+                    username=username,
+                    is_bot=is_bot,
+                    first_name="x",
+                    last_name=None,
+                ),
+                text=text,
+                caption=None,
+                entities=None,
+                caption_entities=None,
+                link_preview_options=None,
+                reply_to_message=None,
+                sender_chat=None,
+                is_automatic_forward=False,
+                new_chat_members=None,
+                bot=bot,
+            )
+            catch_all = next(handler for handler in handlers if not handler.filters)
+            await catch_all.callback(message)
+
+        async def scenario():
+            # First invocation is merely remembered.
+            await dispatch(10, 42, username="human", is_bot=False, text="@AdBot")
+            # The called bot's hard-spam output confirms that invocation as abusive.
+            await dispatch(
+                11,
+                99,
+                username="AdBot",
+                is_bot=True,
+                text="\u62ff\u7801 @AdBot",
+            )
+            # Any later bot-only call is enough; it need not name the same bot.
+            await dispatch(
+                12,
+                42,
+                username="human",
+                is_bot=False,
+                text="@DifferentBot @ThirdBot",
+            )
+
+        asyncio.run(scenario())
+
+        assert (-1001, 99) in banned
+        assert (-1001, 42) in banned
+        assert (-1001, 10) in deleted
+        assert (-1001, 12) in deleted
     finally:
         db.close()
 
