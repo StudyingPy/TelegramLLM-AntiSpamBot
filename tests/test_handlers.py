@@ -716,6 +716,142 @@ def test_router_persists_reputation_reward_for_llm_normal_messages(tmp_path):
         db.close()
 
 
+def test_router_live_personal_channel_crosscheck_auto_bans(tmp_path):
+    import asyncio
+    import json
+
+    db = _db(tmp_path)
+    settings = _settings()
+    try:
+        class CombinedJudge:
+            def __init__(self) -> None:
+                self.personal_chats: list[object] = []
+
+            async def judge(self, features):
+                self.personal_chats.append(features.metadata.get("personal_chat"))
+                return LLMOutcome(
+                    status=LLMOutcomeStatus.OK,
+                    provider_count=1,
+                    judgement=LLMJudgement(
+                        is_spam=True,
+                        confidence=0.98,
+                        category="traffic_diversion",
+                        signal_phrases=("2000+一天", "进群演员结算"),
+                    ),
+                )
+
+        judge = CombinedJudge()
+        router = create_router(settings, db, llm=judge)
+        db.allow_chat(-1001, "t", added_by_user_id=None)
+
+        personal_chat_calls: list[tuple[int, int]] = []
+        deleted: list[tuple[int, int]] = []
+        banned: list[tuple[int, int]] = []
+
+        async def get_me():
+            return SimpleNamespace(id=7777, username="moderatorbot")
+
+        async def get_chat(_user_id):
+            return SimpleNamespace(bio=None)
+
+        async def get_user_personal_chat_messages(*, user_id, limit):
+            personal_chat_calls.append((user_id, limit))
+            channel = SimpleNamespace(
+                id=-100999,
+                title="财天下飞机进群演员结算",
+                username=None,
+            )
+            return [
+                SimpleNamespace(
+                    chat=channel,
+                    text="没及时回复的每天下午六点私聊我核对结算 @CaiG018",
+                    caption=None,
+                )
+            ]
+
+        async def get_chat_member(_chat_id, user_id):
+            if user_id == 7777:
+                return SimpleNamespace(
+                    status=SimpleNamespace(value="administrator"),
+                    can_delete_messages=True,
+                    can_restrict_members=True,
+                )
+            return SimpleNamespace(status=SimpleNamespace(value="member"))
+
+        async def delete_message(*, chat_id, message_id):
+            deleted.append((chat_id, message_id))
+
+        async def ban_chat_member(chat_id, user_id):
+            banned.append((chat_id, user_id))
+
+        async def send_message(_chat_id, _text):
+            return SimpleNamespace(message_id=900)
+
+        bot = SimpleNamespace(
+            get_me=get_me,
+            get_chat=get_chat,
+            get_user_personal_chat_messages=get_user_personal_chat_messages,
+            get_chat_member=get_chat_member,
+            delete_message=delete_message,
+            ban_chat_member=ban_chat_member,
+            send_message=send_message,
+        )
+        message = SimpleNamespace(
+            message_id=123,
+            chat=SimpleNamespace(id=-1001, type="supergroup", title="t"),
+            from_user=SimpleNamespace(
+                id=42,
+                is_bot=False,
+                username=None,
+                first_name="Achilles",
+                last_name=None,
+                language_code="zh-hans",
+                is_premium=None,
+            ),
+            text="2000+一天",
+            caption=None,
+            entities=None,
+            caption_entities=None,
+            link_preview_options=None,
+            bot=bot,
+            sender_chat=None,
+            is_automatic_forward=False,
+            new_chat_members=None,
+        )
+
+        async def dispatch():
+            for handler in router.message.handlers:
+                if not handler.filters:
+                    await handler.callback(message)
+                    return
+            raise AssertionError("no catch-all message handler")
+
+        asyncio.run(dispatch())
+
+        assert personal_chat_calls == [(42, 3)]
+        assert judge.personal_chats == [
+            {
+                "title": "财天下飞机进群演员结算",
+                "username": None,
+                "messages": ("没及时回复的每天下午六点私聊我核对结算 @CaiG018",),
+            }
+        ]
+        assert deleted == [(-1001, 123)]
+        assert banned == [(-1001, 42)]
+        with db._locked_conn() as conn:  # noqa: SLF001 - test-only inspection
+            row = conn.execute(
+                "SELECT reason, metadata_json FROM action_log WHERE message_id = 123"
+            ).fetchone()
+        assert row["reason"] == "llm_spam_high_confidence"
+        metadata = json.loads(row["metadata_json"])
+        assert metadata["deleted"] is True
+        assert metadata["banned"] is True
+        assert metadata["local_signal"] == "message_personal_channel_crosscheck"
+        assert "personal_chat" not in metadata
+    finally:
+        db.close()
+
+
 def test_only_bot_mentions_accepts_one_or_many_bots_without_other_content():
     assert _only_bot_mentions("@HelperBot") == ("helperbot",)
     assert _only_bot_mentions("  @FirstBot\n@second_bot @FIRSTBOT  ") == (

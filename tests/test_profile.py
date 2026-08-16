@@ -7,7 +7,11 @@ from types import SimpleNamespace
 from telegram_llm_antispam.db import Database
 from telegram_llm_antispam.features import build_message_features
 from telegram_llm_antispam.models import UserContext
-from telegram_llm_antispam.profile import get_sender_profile, sender_profile_from_user
+from telegram_llm_antispam.profile import (
+    fetch_personal_chat_for_crosscheck,
+    get_sender_profile,
+    sender_profile_from_user,
+)
 from test_llm import _settings
 
 
@@ -76,3 +80,40 @@ def test_build_message_features_includes_sender_profile_payload():
 
     assert features.metadata["sender_profile"]["username"] == "promo_agent"
     assert features.metadata["sender_profile"]["display_name"] == "成人"
+
+
+def test_fetch_personal_chat_for_crosscheck_reads_live_text_and_caption():
+    class PersonalChatBot:
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, int]] = []
+
+        async def get_user_personal_chat_messages(self, *, user_id: int, limit: int):
+            self.calls.append((user_id, limit))
+            chat = SimpleNamespace(
+                id=-100123,
+                title="恒泰高聘换资车队有码就要",
+                username="promo_channel",
+            )
+            return [
+                SimpleNamespace(chat=chat, text="微信支付宝来有码就要 日赚3000-8000"),
+                SimpleNamespace(chat=chat, text=None, caption="高效率稳定开工"),
+            ]
+
+    bot = PersonalChatBot()
+
+    result = asyncio.run(fetch_personal_chat_for_crosscheck(bot, 42))
+
+    assert bot.calls == [(42, 3)]
+    assert result == {
+        "title": "恒泰高聘换资车队有码就要",
+        "username": "promo_channel",
+        "messages": ("微信支付宝来有码就要 日赚3000-8000", "高效率稳定开工"),
+    }
+
+
+def test_fetch_personal_chat_for_crosscheck_is_best_effort():
+    class FailingBot:
+        async def get_user_personal_chat_messages(self, *, user_id: int, limit: int):
+            raise RuntimeError("method unavailable")
+
+    assert asyncio.run(fetch_personal_chat_for_crosscheck(FailingBot(), 42)) is None

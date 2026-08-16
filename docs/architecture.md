@@ -17,8 +17,15 @@
 6. Text is normalized and converted to content/skeleton fingerprints.
 7. User profile context is cached from message sender fields. Bio is fetched best-effort via
    `get_chat(user_id)` when Bot API exposes it, and explicit bio spam signals are handled locally.
+   Separately, a group message containing recruitment, code-trading, settlement, or high daily-pay
+   language triggers a live `getUserPersonalChatMessages(user_id, limit=3)` lookup. This lookup is
+   not cached, so an account that attached an advertising channel after joining cannot reuse its
+   earlier clean profile state.
 8. Local rules check known fingerprints, reputation, repeat windows, repeated open votes, profile
-   bio signals, and hard carrier signals.
+   bio signals, and hard carrier signals. A suspicious group message plus a currently attached
+   personal channel forces an LLM hop with both contexts. The normal LLM thresholds then apply:
+   high-confidence spam is auto-banned, medium-confidence spam opens a vote, and benign output is
+   allowed. Having a personal channel by itself never changes the decision.
    Bot-only invocation messages (one or more whitespace-separated `@...bot` usernames and no
    other content) are persisted separately. If a named bot responds with content classified as
    advertising, that invocation marks its human caller. The caller's next bot-only message bans
@@ -68,3 +75,6 @@
 - Sender profile context is wired: username/display name is stable from each message, while bio
   is best-effort and cached because Bot API may not expose it for ordinary group users. Explicitly
   spammy bio content is now a local ban signal, including on join service messages.
+- Personal-channel cross-checking is wired for suspicious message bodies. The latest three text or
+  caption values are read live and included in the LLM payload; no personal-channel cache/history
+  table or channel-content action-log snapshot is retained.

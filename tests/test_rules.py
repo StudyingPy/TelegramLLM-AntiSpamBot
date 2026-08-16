@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from telegram_llm_antispam.config import Settings
 from telegram_llm_antispam.features import build_message_features
 from telegram_llm_antispam.models import DecisionAction, FingerprintRecord, UserContext
-from telegram_llm_antispam.rules import RuleEngine
+from telegram_llm_antispam.rules import RuleEngine, should_crosscheck_personal_channel
 
 
 def _settings() -> Settings:
@@ -117,6 +117,68 @@ def test_unmatched_message_goes_to_llm_review():
 
     assert decision.action == DecisionAction.REVIEW
     assert decision.reason == "unmatched_message_needs_llm"
+    assert decision.should_call_llm is True
+
+
+def test_amount_per_day_message_requests_personal_channel_crosscheck():
+    assert should_crosscheck_personal_channel(_features("会演天2000")) is True
+    assert should_crosscheck_personal_channel(_features("2000+一天")) is True
+
+
+def test_message_and_personal_channel_crosscheck_requires_llm():
+    features = _features("2000+一天")
+    features.metadata["personal_chat"] = {
+        "title": "财天下飞机进群演员结算",
+        "username": None,
+        "messages": ("没及时回复的每天下午六点私聊我核对结算 @CaiG018",),
+    }
+
+    decision = RuleEngine(_settings()).evaluate(features)
+
+    assert decision.action == DecisionAction.REVIEW
+    assert decision.reason == "message_personal_channel_crosscheck_needs_llm"
+    assert decision.confidence == 0.65
+    assert decision.should_call_llm is True
+
+
+def test_code_trade_message_and_personal_channel_crosscheck_requires_llm():
+    features = _features("有码收资赖")
+    features.metadata["personal_chat"] = {
+        "title": "恒泰高聘换资车队有码就要",
+        "username": None,
+        "messages": ("微信支付宝来有码就要 无风险 日赚3000-8000 高效率稳定开工",),
+    }
+
+    decision = RuleEngine(_settings()).evaluate(features)
+
+    assert decision.action == DecisionAction.REVIEW
+    assert decision.reason == "message_personal_channel_crosscheck_needs_llm"
+    assert decision.should_call_llm is True
+
+
+def test_personal_channel_ad_does_not_ban_normal_group_message():
+    features = _features("今天天气不错")
+    features.metadata["personal_chat"] = {
+        "title": "高聘换资车队",
+        "messages": ("微信支付宝来有码就要 日赚3000",),
+    }
+
+    decision = RuleEngine(_settings()).evaluate(features)
+
+    assert decision.action != DecisionAction.BAN
+
+
+def test_suspicious_group_message_with_benign_personal_channel_still_asks_llm():
+    features = _features("2000+一天")
+    features.metadata["personal_chat"] = {
+        "title": "个人技术随笔",
+        "messages": ("今天修复了一个 Python 并发问题",),
+    }
+
+    decision = RuleEngine(_settings()).evaluate(features)
+
+    assert decision.action == DecisionAction.REVIEW
+    assert decision.reason == "message_personal_channel_crosscheck_needs_llm"
     assert decision.should_call_llm is True
 
 

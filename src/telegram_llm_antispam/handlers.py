@@ -38,8 +38,8 @@ from .notifications import (
     review_card_text,
 )
 from .og import fetch_og_for_features, should_fetch_og
-from .profile import get_sender_profile
-from .rules import RuleEngine
+from .profile import fetch_personal_chat_for_crosscheck, get_sender_profile
+from .rules import RuleEngine, should_crosscheck_personal_channel
 
 
 logger = logging.getLogger(__name__)
@@ -374,6 +374,20 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
             default_reputation=settings.default_reputation,
         )
         features.metadata["update_type"] = update_type
+        if (
+            update_type in {"message", "edited_message"}
+            and not sender_profile.is_bot
+            and should_crosscheck_personal_channel(features)
+        ):
+            personal_chat = await fetch_personal_chat_for_crosscheck(
+                message.bot,
+                user.id,
+            )
+            if personal_chat is not None:
+                # Live, transient evidence only. It is deliberately not written to
+                # user_profiles or a channel-history table: the rule evaluates the
+                # channel currently attached when the suspicious message is handled.
+                features.metadata["personal_chat"] = personal_chat
         if should_fetch_og(features, settings):
             og_preview = await fetch_og_for_features(features, settings)
             if og_preview is not None:
@@ -959,6 +973,10 @@ def _merge_llm_decision(
     settings: Settings,
 ) -> LocalDecision:
     llm_decision = decision_from_llm(judgement, features, settings)
+    if local_decision.reason == "message_personal_channel_crosscheck_needs_llm":
+        metadata = dict(local_decision.metadata)
+        metadata.update(llm_decision.metadata)
+        return replace(llm_decision, metadata=metadata)
     if local_decision.action in {DecisionAction.ALLOW, DecisionAction.REVIEW}:
         return llm_decision
 

@@ -6,6 +6,7 @@ from typing import Any
 
 from .config import Settings
 from .db import Database
+from .links import extract_message_text
 from .models import SenderProfile
 
 
@@ -58,3 +59,46 @@ def _should_fetch_bio(profile: SenderProfile, settings: Settings) -> bool:
     if profile.bio_fetched_at is None:
         return True
     return int(time.time()) - profile.bio_fetched_at >= settings.profile_bio_cache_ttl_seconds
+
+
+async def fetch_personal_chat_for_crosscheck(
+    bot: Any,
+    user_id: int,
+    *,
+    limit: int = 3,
+) -> dict[str, object] | None:
+    """Fetch the personal channel currently attached to a user's profile.
+
+    This deliberately has no database cache: callers invoke it only after the group
+    message itself contains a traffic-diversion signal. A spammer may join with a clean
+    profile and attach/change the channel later, so reusing the week-long bio cache here
+    would preserve exactly the bypass this check is meant to close.
+
+    The returned structure is transient feature input, not a channel-history snapshot.
+    """
+
+    try:
+        messages = await bot.get_user_personal_chat_messages(user_id=user_id, limit=limit)
+    except Exception as exc:  # pragma: no cover - depends on Telegram API version/state.
+        logger.info("Could not fetch personal channel for %s: %s", user_id, exc)
+        return None
+
+    if not messages:
+        return None
+
+    chat = _field(messages[0], "chat")
+    texts = tuple(
+        text
+        for message in messages
+        if (text := extract_message_text(message).strip())
+    )
+    title = _field(chat, "title")
+    username = _field(chat, "username")
+    if not title and not username and not texts:
+        return None
+
+    return {
+        "title": title,
+        "username": username,
+        "messages": texts,
+    }

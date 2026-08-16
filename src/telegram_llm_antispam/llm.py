@@ -380,7 +380,21 @@ def _feature_payload(features: MessageFeatures) -> dict[str, object]:
             for link in features.links
         ],
         "sender_profile": features.metadata.get("sender_profile"),
+        "personal_chat": _personal_chat_payload(features.metadata.get("personal_chat")),
         "og_preview": features.metadata.get("og_preview"),
+    }
+
+
+def _personal_chat_payload(value: object) -> dict[str, object] | None:
+    if not isinstance(value, dict):
+        return None
+    messages = value.get("messages")
+    return {
+        "title": str(value.get("title") or "")[:300] or None,
+        "username": str(value.get("username") or "")[:100] or None,
+        "messages": [str(item)[:1200] for item in messages[:3]]
+        if isinstance(messages, (list, tuple))
+        else [],
     }
 
 
@@ -477,6 +491,7 @@ _SYSTEM_PROMPT = """你是 Telegram 群组反广告审核器。你的目标是�
 - @xxx、@xxxbot、t.me、telegram 这类联系方式同时搭配“加群、拿码、收钱、赚钱、做单、刷单、看片、成人、调教、博彩”等词时，应判为明确广告。
 - 正文为空或只有标点但 preview/OG 文案含色情、博彩、刷单、导流等内容时，应按预览内容判为广告。
 - 用户名、昵称、bio 都是用户可控的弱信号；只能与消息内容、链接、行为信号合并判断。
+- personal_chat 是该用户当前主动挂在个人资料页的频道及其最近消息。群消息若只有含糊的金额、招募、演员结算、换资或码商话术，必须结合 personal_chat 判断：两侧语义相互印证为招揽、交易或导流时应判为广告并给高置信度；个人频道存在本身、或频道内容与群消息无关时不能定罪。
 - 如果正文为空或只有标点但有 preview URL，通常更可疑。
 - 你只输出 JSON，不输出解释文本。
 

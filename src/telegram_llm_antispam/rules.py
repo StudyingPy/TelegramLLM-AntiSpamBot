@@ -60,6 +60,10 @@ class RuleEngine:
         if profile_spam is not None:
             return profile_spam
 
+        personal_channel_spam = _personal_channel_crosscheck_decision(features)
+        if personal_channel_spam is not None:
+            return personal_channel_spam
+
         message_spam = _hard_spam_message_decision(features)
         if message_spam is not None:
             return message_spam
@@ -222,6 +226,31 @@ _WEAK_SPAM_TOKENS = (
     "私聊",
 )
 
+# A personal-channel lookup is intentionally gated by the group message. These are
+# recruitment/payment/code-trading phrases used by accounts that keep the explicit
+# pitch in the channel attached to their profile. The lookup alone never changes a
+# decision; _personal_channel_crosscheck_decision requires the live channel contents
+# to independently look promotional as well.
+_PROFILE_CHANNEL_MESSAGE_TOKENS = (
+    "进群",
+    "私聊",
+    "招聘",
+    "高聘",
+    "换资",
+    "车队",
+    "演员",
+    "会演",
+    "结算",
+    "有码",
+    "收码",
+    "收资",
+    "上车",
+)
+
+_AMOUNT_PER_TIME_RE = re.compile(
+    r"(?:\d{3,6}\+?\s*(?:一天|每天|每日|日结)|(?:一天|每天|每日|日结|天)\s*\d{3,6}\+?)"
+)
+
 # NOTE: WEAK tokens are deliberately NOT used by any auto-ban path. They appear in
 # normal users' bios AND in legitimate message bodies (anti-spam bot notifications,
 # customer-service replies, tutorial posts, real invitations). Both bio and message
@@ -245,6 +274,48 @@ def _profile_spam_decision(features: MessageFeatures) -> LocalDecision | None:
         confidence=0.96,
         should_call_llm=False,
         metadata={"profile_signal": "bio"},
+    )
+
+
+def should_crosscheck_personal_channel(features: MessageFeatures) -> bool:
+    """Whether the group message warrants one live personal-channel API lookup.
+
+    Messages already caught by the existing hard body rule need no extra network hop.
+    For the new bypass, the group text must carry a recruiting/payment/diversion hint;
+    an ordinary message never causes a profile-channel fetch.
+    """
+
+    if _hard_spam_message_decision(features) is not None:
+        return False
+    return _looks_like_profile_channel_message_signal(features.text)
+
+
+def _looks_like_profile_channel_message_signal(value: str) -> bool:
+    normalized = normalize_text(value)
+    if not normalized:
+        return False
+    return bool(
+        any(token in normalized for token in _STRONG_SPAM_TOKENS)
+        or any(token in normalized for token in _PROFILE_CHANNEL_MESSAGE_TOKENS)
+        or _AMOUNT_PER_TIME_RE.search(value)
+    )
+
+
+def _personal_channel_crosscheck_decision(
+    features: MessageFeatures,
+) -> LocalDecision | None:
+    personal_chat = features.metadata.get("personal_chat")
+    if not isinstance(personal_chat, dict):
+        return None
+    if not _looks_like_profile_channel_message_signal(features.text):
+        return None
+
+    return LocalDecision(
+        action=DecisionAction.REVIEW,
+        reason="message_personal_channel_crosscheck_needs_llm",
+        confidence=0.65,
+        should_call_llm=True,
+        metadata={"local_signal": "message_personal_channel_crosscheck"},
     )
 
 

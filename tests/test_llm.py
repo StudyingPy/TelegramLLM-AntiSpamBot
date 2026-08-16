@@ -384,6 +384,37 @@ def test_feature_payload_contains_sender_profile_metadata():
     }
 
 
+def test_feature_payload_contains_bounded_personal_chat_context():
+    message = SimpleNamespace(
+        message_id=1,
+        chat=SimpleNamespace(id=-1001),
+        from_user=SimpleNamespace(id=42),
+        text="2000+一天",
+    )
+    context = UserContext(chat_id=-1001, user_id=42, reputation_score=50, messages_seen=1)
+    features = build_message_features(message, context)
+    features.metadata["personal_chat"] = {
+        "title": "财天下飞机进群演员结算",
+        "username": "promo_channel",
+        "messages": (
+            "每天下午六点私聊我核对结算 @CaiG018",
+            "第二条",
+            "第三条",
+            "不应发送的第四条",
+        ),
+    }
+
+    payload = _feature_payload(features)
+
+    assert payload["personal_chat"] == {
+        "title": "财天下飞机进群演员结算",
+        "username": "promo_channel",
+        "messages": (
+            ["每天下午六点私聊我核对结算 @CaiG018", "第二条", "第三条"]
+        ),
+    }
+
+
 def test_llm_spam_at_ban_threshold_bans_for_normal_reputation():
     message = SimpleNamespace(
         message_id=1,
