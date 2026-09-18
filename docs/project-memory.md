@@ -25,3 +25,15 @@
 - Personal-channel data is transient feature input. Do not persist it in `user_profiles`, a history
   table, or action-log snapshots; API failures silently fall back to the original moderation path.
 - Full design and official references: `docs/personal-channel-mitigation.md`.
+
+## Rich-message GuestMode ads
+
+- Bot API 10.1 messages can carry `Message.rich_message` while `Message.text` is empty;
+  aiogram 3.28 keeps this newer field as an allowed extra, so always pass it through the
+  feature adapter instead of assuming the SDK has a typed field.
+- Flatten rich blocks and nested rich-text fragments into searchable text before link,
+  fingerprint, local-rule, and LLM processing. Extract explicit HTTP(S) URLs from rich-text
+  URL entities as well. Guest-mode bot output is still a message from another bot and must
+  not be skipped as if it were the moderation bot's own output.
+- The exported client JSON may use legacy `_type`/`texts` names, while Bot API uses `type`;
+  the extractor intentionally accepts both forms.

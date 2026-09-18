@@ -17,6 +17,7 @@ from telegram_llm_antispam.handlers import (
     _parse_whitelist_target,
     _same_user_open_vote_repeat_decision,
     _is_anonymous_admin_message,
+    _feature_message_for_user,
     _whitelist_add,
     _whitelist_list,
     _whitelist_remove,
@@ -48,6 +49,25 @@ def test_anonymous_admin_message_is_detected_by_sender_chat():
     )
 
     assert _is_anonymous_admin_message(message) is True
+
+
+def test_feature_message_for_user_preserves_rich_message():
+    rich_message = {"blocks": [{"type": "heading", "text": {"type": "plain_text", "text": "广告"}}]}
+    message = SimpleNamespace(
+        message_id=7,
+        chat=SimpleNamespace(id=-100123),
+        from_user=SimpleNamespace(id=42),
+        text=None,
+        caption=None,
+        entities=None,
+        caption_entities=None,
+        link_preview_options=None,
+        rich_message=rich_message,
+    )
+
+    feature_message = _feature_message_for_user(message, message.from_user)
+
+    assert feature_message.rich_message == rich_message
 
 
 def test_channel_sender_chat_is_not_treated_as_anonymous_admin():

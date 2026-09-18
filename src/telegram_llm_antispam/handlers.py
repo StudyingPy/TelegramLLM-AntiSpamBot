@@ -876,6 +876,7 @@ def _feature_message_for_user(message: Message, user: Any) -> Any:
         entities=getattr(message, "entities", None),
         caption_entities=getattr(message, "caption_entities", None),
         link_preview_options=getattr(message, "link_preview_options", None),
+        rich_message=getattr(message, "rich_message", None),
     )
 
 

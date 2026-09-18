@@ -52,8 +52,74 @@ def _iter_entities(message: Any) -> tuple[Any, ...]:
     return tuple(entities)
 
 
+def _rich_text(value: Any) -> str:
+    """Flatten Bot API 10.1 RichMessage content into searchable plain text.
+
+    aiogram versions predating RichMessage keep the unknown field in ``model_extra``
+    and expose it through ``getattr``.  The helper therefore accepts both mappings
+    and model-like objects, and also tolerates Telegram's older ``_type``/``texts``
+    representation seen in exported client JSON.
+    """
+
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+
+    text = _field(value, "text")
+    if isinstance(text, str):
+        return text
+    if text is not None:
+        nested = _rich_text(text)
+        if nested:
+            return nested
+
+    # A RichTextConcat stores adjacent fragments in ``texts``; these must not gain
+    # line breaks in the middle of mentions or words.
+    texts = _field(value, "texts")
+    if isinstance(texts, (list, tuple)):
+        return "".join(part for item in texts if (part := _rich_text(item)))
+
+    # Blocks, list items, table cells and similar containers are separate visible
+    # sections. Newlines preserve enough structure for the LLM and fingerprints.
+    parts: list[str] = []
+    for key in ("blocks", "items", "children", "content", "rows", "cells"):
+        children = _field(value, key)
+        if isinstance(children, (list, tuple)):
+            parts.extend(part for item in children if (part := _rich_text(item)))
+        elif children is not None:
+            part = _rich_text(children)
+            if part:
+                parts.append(part)
+    return "\n".join(parts)
+
+
+def _iter_rich_urls(value: Any) -> tuple[str, ...]:
+    """Collect explicit HTTP(S) URLs embedded in rich-text entities."""
+
+    if value is None or isinstance(value, str):
+        return ()
+    found: list[str] = []
+    url = _field(value, "url")
+    if isinstance(url, str) and url.lower().startswith(("http://", "https://", "www.")):
+        found.append(url)
+    for key in ("text", "texts", "blocks", "items", "children", "content", "rows", "cells"):
+        child = _field(value, key)
+        if isinstance(child, (list, tuple)):
+            for item in child:
+                found.extend(_iter_rich_urls(item))
+        elif child is not None:
+            found.extend(_iter_rich_urls(child))
+    return tuple(found)
+
+
 def extract_message_text(message: Any) -> str:
-    return _field(message, "text") or _field(message, "caption") or ""
+    return (
+        _field(message, "text")
+        or _field(message, "caption")
+        or _rich_text(_field(message, "rich_message"))
+        or ""
+    )
 
 
 def extract_links(message: Any) -> tuple[ExtractedLink, ...]:
@@ -68,6 +134,9 @@ def extract_links(message: Any) -> tuple[ExtractedLink, ...]:
         url = _field(entity, "url")
         if entity_type == "text_link" and url:
             collected.append((url, "entity"))
+
+    for url in _iter_rich_urls(_field(message, "rich_message")):
+        collected.append((url, "entity"))
 
     preview_options = _field(message, "link_preview_options")
     preview_url = _field(preview_options, "url")

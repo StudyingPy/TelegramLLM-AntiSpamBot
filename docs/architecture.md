@@ -10,7 +10,9 @@
    `WHITELISTED_USER_IDS` / `whitelisted_users` table) bypass moderation here too.
 3. Join service messages with `new_chat_members` are converted into profile checks for the
    joined users, so spammy profile bio can be handled even when the service message has no text.
-4. Feature extraction parses links from text, `text_link` entities, and link previews.
+4. Feature extraction parses links from text, `text_link` entities, rich-message URL entities,
+   and link previews. Bot API 10.1 RichMessage blocks are flattened when `text` is empty, so
+   GuestMode bot ads cannot hide their body in structured rich text.
 5. For short text or punctuation-only text with `link_preview_options.url`, the OG fetcher
    validates the URL, blocks private/internal destinations, limits redirects/bytes/time, and
    extracts title/description text for local rules and the LLM payload.

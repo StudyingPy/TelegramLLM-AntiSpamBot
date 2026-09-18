@@ -37,6 +37,49 @@ def test_extract_links_from_text_entity_and_preview():
     }
 
 
+def test_build_message_features_flattens_rich_message_blocks_and_urls():
+    message = _message(
+        rich_message={
+            "blocks": [
+                {
+                    "_type": "TL_iv$pageBlockHeading1",
+                    "text": {"_type": "TL_iv$textPlain", "text": "🔥项目广告"},
+                },
+                {
+                    "_type": "TL_iv$pageBlockHeading1",
+                    "text": {
+                        "_type": "TL_iv$textConcat",
+                        "texts": [
+                            {"_type": "TL_iv$textPlain", "text": "咨询 "},
+                            {
+                                "_type": "TL_iv$textMention",
+                                "text": {
+                                    "_type": "TL_iv$textPlain",
+                                    "text": "@promo_bot",
+                                },
+                            },
+                            {
+                                "_type": "TL_iv$textUrl",
+                                "text": {"_type": "TL_iv$textPlain", "text": " 官网"},
+                                "url": "https://promo.example/landing",
+                            },
+                        ],
+                    },
+                },
+            ]
+        }
+    )
+
+    features = build_message_features(message)
+
+    assert "项目广告" in features.text
+    assert "咨询 @promo_bot 官网" in features.text
+    assert features.mention_count == 1
+    assert [(link.source, link.domain) for link in features.links] == [
+        ("entity", "promo.example")
+    ]
+
+
 def test_normalize_text_strips_zero_width_digits_and_emoji():
     assert normalize_text("赚\u200b钱 123 🚀") == "赚钱"
 
@@ -97,4 +140,3 @@ def test_skeletonize_still_collapses_repeated_carriers_and_latin_words():
     assert skeleton_a == skeleton_b
     assert "<url>" in skeleton_a
     assert "<w>" in skeleton_a
-
