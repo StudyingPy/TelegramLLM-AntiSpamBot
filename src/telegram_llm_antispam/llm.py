@@ -192,11 +192,14 @@ class NewAPIJudge:
             return None, f"parse_error: {type(exc).__name__}: {exc}"
 
     def _build_client(self, provider: NewAPIProvider) -> AsyncOpenAI:
+        # aiapi.fengshengxiu.club blocks the SDK's default AsyncOpenAI UA.
+        # Keep the bot-identifying UA used by the former urllib client.
         return AsyncOpenAI(
             api_key=provider.api_key,
             base_url=provider.base_url,
             timeout=self._timeout,
             max_retries=0,  # we do our own retry across providers; SDK retry adds latency we'd misattribute
+            default_headers={"User-Agent": "TelegramLLMAntiSpamBot/0.1"},
         )
 
 
