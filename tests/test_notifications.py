@@ -121,6 +121,14 @@ def test_notify_admins_sends_one_combined_record_with_admin_ban_button(tmp_path)
             "display_name": "Promo Agent",
             "bio": "看片加群",
         }
+        features.metadata["personal_chat"] = {
+            "title": "财天下飞机进群演员结算",
+            "username": "promo_channel",
+            "messages": (
+                "每天下午六点私聊我核对结算 @CaiG018",
+                "微信支付宝来有码就要",
+            ),
+        }
         features.metadata["og_preview"] = {"title": "CRTV成人版", "description": "看片就选择CRTV"}
         decision = LocalDecision(
             DecisionAction.WITHDRAW_VOTE,
@@ -143,6 +151,10 @@ def test_notify_admins_sends_one_combined_record_with_admin_ban_button(tmp_path)
         assert "投票会话：<code>5</code>" in text
         assert "信号：看片" in text
         assert "用户资料：Promo Agent @promo_agent" in text
+        assert "个人频道：财天下飞机进群演员结算 @promo_channel" in text
+        assert "频道最近消息：" in text
+        assert "每天下午六点私聊我核对结算 @CaiG018" in text
+        assert "微信支付宝来有码就要" in text
         assert "OG：CRTV成人版 / 看片就选择CRTV" in text
         assert reply_markup is not None
         callbacks = {

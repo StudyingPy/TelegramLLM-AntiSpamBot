@@ -268,6 +268,24 @@ def _notification_text(
             f"\nBio：{_esc(str(bio)) if bio else '-'}"
         )
 
+    personal_chat = features.metadata.get("personal_chat")
+    personal_chat_text = ""
+    if isinstance(personal_chat, dict):
+        title = str(personal_chat.get("title") or "").strip()
+        username = str(personal_chat.get("username") or "").strip()
+        messages = personal_chat.get("messages")
+        message_lines = (
+            [f"- {_esc(str(item)[:500])}" for item in messages[:3] if str(item).strip()]
+            if isinstance(messages, (list, tuple))
+            else []
+        )
+        channel_label = _esc(title) if title else "-"
+        if username:
+            channel_label += f" @{_esc(username)}"
+        personal_chat_text = f"\n个人频道：{channel_label}"
+        if message_lines:
+            personal_chat_text += "\n频道最近消息：\n" + "\n".join(message_lines)
+
     og_preview = features.metadata.get("og_preview")
     og_text = ""
     if isinstance(og_preview, dict):
@@ -288,6 +306,7 @@ def _notification_text(
         f"消息：{message_link}\n"
         f"用户：<code>{features.user_id or '-'}</code>"
         f"{profile_text}\n"
+        f"{personal_chat_text}"
         f"触发：<code>{_esc(decision.reason)}</code>\n"
         f"处理：<b>{decision.action.value}</b> / {decision.confidence:.0%}\n"
         f"删除：{_fmt_bool(result.deleted)} 封禁：{_fmt_bool(result.banned)}\n"
