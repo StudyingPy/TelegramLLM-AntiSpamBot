@@ -56,6 +56,10 @@ class RuleEngine:
         if fingerprint_decision is not None and fingerprint_decision.action == DecisionAction.BAN:
             return fingerprint_decision
 
+        obfuscated_diversion = _obfuscated_diversion_decision(features)
+        if obfuscated_diversion is not None:
+            return obfuscated_diversion
+
         profile_spam = _profile_spam_decision(features)
         if profile_spam is not None:
             return profile_spam
@@ -173,9 +177,9 @@ class RuleEngine:
 
 # Hard signals split into two tiers:
 #
-# STRONG tokens almost only appear in ads / fraud / 引流 copy. A bio that mentions
-# any of these alongside a contact carrier is a confident BAN — false positives here
-# are rare enough that the trade-off is worth it.
+# STRONG tokens almost only appear in ads / fraud / 引流 copy. In a Bio they are
+# still only profile evidence: a local BAN additionally needs an advertising-looking
+# username/display name, while an uncorroborated Bio goes through the LLM.
 #
 # WEAK tokens (加群 / 客服 / 私聊 / 群一个 / 教程) DO appear in spam, but normal users
 # also write "私聊我 @xxx", "进 X 群一起讨论", "这个教程有用 https://...". Banning on
@@ -247,9 +251,34 @@ _PROFILE_CHANNEL_MESSAGE_TOKENS = (
     "上车",
 )
 
+_PROFILE_BIO_AD_TOKENS = (
+    "aff",
+    "推广",
+    "代理",
+    "返利",
+    "收益",
+    "招募",
+    "项目",
+)
+
+_PROFILE_USERNAME_STRONG_TOKENS = _STRONG_SPAM_TOKENS + (
+    "代发",
+    "群发",
+    "数据",
+    "开房",
+    "定位",
+)
+_PROFILE_USERNAME_SOFT_TOKENS = ("工作室", "推广", "客服", "招聘")
+
 _AMOUNT_PER_TIME_RE = re.compile(
     r"(?:\d{3,6}\+?\s*(?:一天|每天|每日|日结)|(?:一天|每天|每日|日结|天)\s*\d{3,6}\+?)"
 )
+
+# Deliberate homophone/typo substitutions used to hide the diversion phrase "进群".
+# Exact "进群" stays on the ordinary LLM path because it is common in legitimate
+# conversation. These obfuscated forms require a contact carrier before they can
+# force a vote, so the detector cannot fire on an isolated typo.
+_OBFUSCATED_JOIN_RE = re.compile(r"(?:近裙|进裙|近群|今裙|今群|晋裙|晋群)")
 
 # NOTE: WEAK tokens are deliberately NOT used by any auto-ban path. They appear in
 # normal users' bios AND in legitimate message bodies (anti-spam bot notifications,
@@ -268,12 +297,25 @@ def _profile_spam_decision(features: MessageFeatures) -> LocalDecision | None:
     if not _looks_like_spam_bio(bio):
         return None
 
+    username_text = " ".join(
+        str(profile.get(key) or "")
+        for key in ("username", "display_name", "first_name", "last_name")
+    )
+    if _looks_like_spam_username(username_text):
+        return LocalDecision(
+            action=DecisionAction.BAN,
+            reason="spam_profile_bio_and_username",
+            confidence=0.98,
+            should_call_llm=False,
+            metadata={"profile_signal": "bio_and_username"},
+        )
+
     return LocalDecision(
-        action=DecisionAction.BAN,
-        reason="spam_profile_bio",
-        confidence=0.96,
-        should_call_llm=False,
-        metadata={"profile_signal": "bio"},
+        action=DecisionAction.REVIEW,
+        reason="profile_bio_needs_llm",
+        confidence=0.35,
+        should_call_llm=True,
+        metadata={"profile_signal": "bio", "profile_only": not features.clean_text},
     )
 
 
@@ -316,6 +358,28 @@ def _personal_channel_crosscheck_decision(
         confidence=0.65,
         should_call_llm=True,
         metadata={"local_signal": "message_personal_channel_crosscheck"},
+    )
+
+
+def _obfuscated_diversion_decision(features: MessageFeatures) -> LocalDecision | None:
+    if not _has_message_carrier(features):
+        return None
+    matched = _OBFUSCATED_JOIN_RE.search(normalize_text(features.text))
+    if matched is None:
+        return None
+
+    # This signal is intentionally a vote fallback, not a local auto-ban. The LLM
+    # still runs and may upgrade to BAN; a false-negative LLM result cannot silently
+    # release the suspicious carrier-plus-obfuscation combination.
+    return LocalDecision(
+        action=DecisionAction.WITHDRAW_VOTE,
+        reason="obfuscated_diversion_with_carrier",
+        confidence=0.82,
+        should_call_llm=True,
+        metadata={
+            "local_signal": "obfuscated_diversion",
+            "matched_variant": matched.group(0),
+        },
     )
 
 
@@ -403,6 +467,19 @@ def _looks_like_spam_bio(value: str) -> bool:
     if not has_contact_or_link:
         return False
 
-    # Bio path uses only STRONG tokens — weak tokens like "私聊", "客服", "加群" appear
-    # in normal users' bios too often to safely auto-ban.
-    return any(token in normalized for token in _STRONG_SPAM_TOKENS)
+    # Weak contact-management phrases ("私聊", "客服", "加群") are deliberately
+    # excluded. AFF/推广 wording is only a soft profile signal and is safe because
+    # _profile_spam_decision requires an advertising username for a local BAN.
+    return bool(
+        any(token in normalized for token in _STRONG_SPAM_TOKENS)
+        or any(token in normalized for token in _PROFILE_BIO_AD_TOKENS)
+    )
+
+
+def _looks_like_spam_username(value: str) -> bool:
+    normalized = normalize_text(value)
+    if not normalized:
+        return False
+    if any(token in normalized for token in _PROFILE_USERNAME_STRONG_TOKENS):
+        return True
+    return sum(token in normalized for token in _PROFILE_USERNAME_SOFT_TOKENS) >= 2

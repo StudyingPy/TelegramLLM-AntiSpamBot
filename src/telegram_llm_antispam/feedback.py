@@ -207,6 +207,14 @@ def phrase_lookup_values(features: MessageFeatures) -> tuple[str, ...]:
 
 
 def _profile_and_message_phrase_candidates(features: MessageFeatures) -> tuple[str, ...]:
+    """Return phrase candidates from message content, not sender profile fields.
+
+    Bio and username text is user-controlled context and is deliberately excluded
+    from learned phrase enforcement. Otherwise a normal message with empty/short
+    content can inherit a phrase fingerprint from an unrelated user's Bio and open a
+    vote before the LLM gets a chance to weigh the actual message.
+    """
+
     texts: list[str] = []
     # Do not derive the secondary bare-username candidate ("zaoanyun") from a
     # carrier-only non-bot mention after filtering "@zaoanyun" itself. Skipping the
@@ -220,13 +228,6 @@ def _profile_and_message_phrase_candidates(features: MessageFeatures) -> tuple[s
         texts.extend(
             str(og_preview.get(key) or "")
             for key in ("title", "description", "site_name", "image_alt", "text")
-        )
-
-    sender_profile = features.metadata.get("sender_profile")
-    if isinstance(sender_profile, dict):
-        texts.extend(
-            str(sender_profile.get(key) or "")
-            for key in ("username", "display_name", "first_name", "last_name", "bio")
         )
 
     candidates: list[str] = []

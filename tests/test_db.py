@@ -432,6 +432,25 @@ def test_phrase_fingerprints_are_used_in_lookup(tmp_path):
         db.close()
 
 
+def test_bio_text_is_not_used_as_message_phrase_fingerprint_candidate():
+    message = SimpleNamespace(
+        message_id=13,
+        chat=SimpleNamespace(id=-1001),
+        from_user=SimpleNamespace(id=44),
+        text="",
+    )
+    context = UserContext(chat_id=-1001, user_id=44, reputation_score=50, messages_seen=0)
+    features = build_message_features(message, context)
+    features.metadata["sender_profile"] = {
+        "username": "normal_user",
+        "display_name": "Alice",
+        "bio": "一天稳定5万来找我 https://t.me/example",
+    }
+
+    assert phrase_fingerprint_value("一天稳定") not in phrase_lookup_values(features)
+    assert phrase_fingerprint_value("5万来找") not in phrase_lookup_values(features)
+
+
 def test_bare_human_mentions_are_not_phrase_fingerprints_but_bot_mentions_are(tmp_path):
     """A group administrator mention is an address, not advertising intent.
 

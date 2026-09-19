@@ -18,7 +18,10 @@
    extracts title/description text for local rules and the LLM payload.
 6. Text is normalized and converted to content/skeleton fingerprints.
 7. User profile context is cached from message sender fields. Bio is fetched best-effort via
-   `get_chat(user_id)` when Bot API exposes it, and explicit bio spam signals are handled locally.
+   `get_chat(user_id)` when Bot API exposes it. A suspicious Bio alone is sent through the
+   LLM; only a Bio signal corroborated by an advertising-looking username/display name can
+   trigger the local profile ban. Bio/username fields are never learned as message phrase
+   fingerprints.
    Separately, a group message containing recruitment, code-trading, settlement, or high daily-pay
    language triggers a live `getUserPersonalChatMessages(user_id, limit=3)` lookup. This lookup is
    not cached, so an account that attached an advertising channel after joining cannot reuse its

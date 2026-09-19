@@ -80,6 +80,34 @@ def test_build_message_features_flattens_rich_message_blocks_and_urls():
     ]
 
 
+def test_build_message_features_includes_inline_button_labels_and_urls():
+    message = _message(
+        text="AAA1S5DA46D4A6SD",
+        reply_markup={
+            "rows": [
+                {
+                    "buttons": [
+                        {"text": "🍗单人日赚3821+🍗", "url": "https://t.me/koulin023"},
+                        {"text": "🧧支付宝洗口令洗米🧧", "url": "https://t.me/koulin023"},
+                    ]
+                },
+                {
+                    "buttons": [
+                        {"text": "🅿️点击私聊客服了解🅿️", "url": "https://t.me/tianqipay66"}
+                    ]
+                },
+            ]
+        },
+    )
+
+    features = build_message_features(message)
+
+    assert "单人日赚3821+" in features.text
+    assert "支付宝洗口令洗米" in features.text
+    assert "点击私聊客服了解" in features.text
+    assert {link.domain for link in features.links} == {"t.me"}
+
+
 def test_normalize_text_strips_zero_width_digits_and_emoji():
     assert normalize_text("赚\u200b钱 123 🚀") == "赚钱"
 

@@ -37,3 +37,16 @@
   not be skipped as if it were the moderation bot's own output.
 - The exported client JSON may use legacy `_type`/`texts` names, while Bot API uses `type`;
   the extractor intentionally accepts both forms.
+- Inline keyboard labels and hidden button URLs are also message content. Bot API uses
+  `inline_keyboard`, while exported client JSON may expose `rows[].buttons[]`; both are
+  flattened before fingerprints and LLM evaluation.
+
+## Bio and username corroboration
+
+- Bio is contextual evidence, not a learned message phrase source. Never add Bio/username
+  text to phrase-fingerprint lookup candidates; otherwise an empty or punctuation-only group
+  message can inherit another user's Bio fingerprint and open a false-positive vote.
+- A Bio containing advertising/payment/recruitment wording plus an advertising-looking
+  display name or username may be locally banned. A suspicious Bio without username
+  corroboration goes through the LLM; weak patterns such as a personal-channel link or
+  `私聊：@xxxbot` do not create a profile-spam decision by themselves.

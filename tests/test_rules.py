@@ -62,14 +62,16 @@ def _settings() -> Settings:
     )
 
 
-def _message(text: str, preview_url: str | None = None):
-    return SimpleNamespace(
+def _message(text: str, preview_url: str | None = None, **kwargs):
+    message = dict(
         message_id=1,
         chat=SimpleNamespace(id=-1001),
         from_user=SimpleNamespace(id=42),
         text=text,
         link_preview_options=SimpleNamespace(url=preview_url) if preview_url else None,
     )
+    message.update(kwargs)
+    return SimpleNamespace(**message)
 
 
 def _features(text: str, preview_url: str | None = None, messages_seen: int = 0):
@@ -102,6 +104,35 @@ def test_external_link_goes_to_llm_review_without_first_message_signal():
     assert decision.should_call_llm is True
 
 
+def test_advertising_inline_buttons_are_hard_spam():
+    features = build_message_features(
+        _message(
+            "AAA1S5DA46D4A6SD",
+            reply_markup={
+                "rows": [
+                    {
+                        "buttons": [
+                            {
+                                "text": "🍗单人日赚3821+🍗",
+                                "url": "https://t.me/koulin023",
+                            },
+                            {
+                                "text": "🧧支付宝洗口令洗米🧧",
+                                "url": "https://t.me/koulin023",
+                            },
+                        ]
+                    }
+                ]
+            },
+        )
+    )
+
+    decision = RuleEngine(_settings()).evaluate(features)
+
+    assert decision.action == DecisionAction.BAN
+    assert decision.reason == "hard_spam_message"
+
+
 def test_first_message_whitelisted_link_goes_to_llm_review():
     decision = RuleEngine(_settings()).evaluate(
         _features("hello https://docs.trusted.example/a"),
@@ -123,6 +154,22 @@ def test_unmatched_message_goes_to_llm_review():
 def test_amount_per_day_message_requests_personal_channel_crosscheck():
     assert should_crosscheck_personal_channel(_features("会演天2000")) is True
     assert should_crosscheck_personal_channel(_features("2000+一天")) is True
+
+
+def test_obfuscated_join_with_mention_forces_llm_and_vote_fallback():
+    decision = RuleEngine(_settings()).evaluate(_features("近裙演员二十壹个 @gecai1"))
+
+    assert decision.action == DecisionAction.WITHDRAW_VOTE
+    assert decision.reason == "obfuscated_diversion_with_carrier"
+    assert decision.should_call_llm is True
+    assert decision.metadata["matched_variant"] == "近裙"
+
+
+def test_exact_join_phrase_stays_on_normal_llm_path():
+    decision = RuleEngine(_settings()).evaluate(_features("进群 @organizer"))
+
+    assert decision.reason == "unmatched_message_needs_llm"
+    assert decision.should_call_llm is True
 
 
 def test_message_and_personal_channel_crosscheck_requires_llm():
@@ -271,7 +318,7 @@ def test_high_weight_fingerprint_and_normal_reputation_bans_without_vote():
     assert decision.reason == "known_high_weight_fingerprint"
 
 
-def test_obvious_spam_bio_bans_even_when_message_text_is_benign():
+def test_obvious_spam_bio_without_ad_username_requires_llm():
     features = _features("签到", messages_seen=0)
     features.metadata["sender_profile"] = {
         "display_name": "Snsb",
@@ -281,11 +328,12 @@ def test_obvious_spam_bio_bans_even_when_message_text_is_benign():
 
     decision = RuleEngine(_settings()).evaluate(features)
 
-    assert decision.action == DecisionAction.BAN
-    assert decision.reason == "spam_profile_bio"
+    assert decision.action == DecisionAction.REVIEW
+    assert decision.reason == "profile_bio_needs_llm"
+    assert decision.should_call_llm is True
 
 
-def test_riru_guowan_bio_with_invite_link_bans_via_local_rules():
+def test_riru_guowan_bio_with_invite_link_requires_username_corroboration():
     """Regression: the bio '轻松日入过万： https://t.me/+...' was leaking through to
     the LLM hop (and then through to no decision when the LLM failed). The hard-token
     table was missing the 日入/日赚 family. Without that, '轻松日入过万' has no token
@@ -301,8 +349,8 @@ def test_riru_guowan_bio_with_invite_link_bans_via_local_rules():
 
     decision = RuleEngine(_settings()).evaluate(features)
 
-    assert decision.action == DecisionAction.BAN
-    assert decision.reason == "spam_profile_bio"
+    assert decision.action == DecisionAction.REVIEW
+    assert decision.reason == "profile_bio_needs_llm"
 
 
 def test_weak_token_in_bio_does_not_auto_ban():
@@ -329,22 +377,35 @@ def test_weak_token_in_bio_does_not_auto_ban():
     )
 
 
-def test_strong_token_in_bio_still_auto_bans():
-    """Bio matching is tightened, NOT disabled. Bios that mention strong tokens
-    (做单/拿码/日入/...) alongside a contact carrier still ban locally — these
-    almost never appear in legitimate user bios."""
+def test_strong_token_in_bio_and_ad_username_auto_bans():
+    """A strong Bio signal plus an advertising username is sufficient for a local ban."""
 
     features = _features("签到", messages_seen=0)
     features.metadata["sender_profile"] = {
-        "display_name": "X",
-        "username": None,
+        "display_name": "做单工作室",
+        "username": "boss_helper",
         "bio": "做单拿码 @bossbot https://t.me/+work",
     }
 
     decision = RuleEngine(_settings()).evaluate(features)
 
     assert decision.action == DecisionAction.BAN
-    assert decision.reason == "spam_profile_bio"
+    assert decision.reason == "spam_profile_bio_and_username"
+
+
+def test_strong_bio_with_personal_username_does_not_auto_ban():
+    features = _features("签到", messages_seen=0)
+    features.metadata["sender_profile"] = {
+        "display_name": "Alice",
+        "username": "alice_2026",
+        "bio": "AFF 项目推广 https://t.me/+work",
+    }
+
+    decision = RuleEngine(_settings()).evaluate(features)
+
+    assert decision.action == DecisionAction.REVIEW
+    assert decision.reason == "profile_bio_needs_llm"
+    assert decision.should_call_llm is True
 
 
 def test_weak_token_in_message_body_does_not_auto_ban():

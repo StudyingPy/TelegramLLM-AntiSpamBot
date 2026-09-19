@@ -63,11 +63,13 @@ def test_feature_message_for_user_preserves_rich_message():
         caption_entities=None,
         link_preview_options=None,
         rich_message=rich_message,
+        reply_markup=None,
     )
 
     feature_message = _feature_message_for_user(message, message.from_user)
 
     assert feature_message.rich_message == rich_message
+    assert feature_message.reply_markup is None
 
 
 def test_channel_sender_chat_is_not_treated_as_anonymous_admin():

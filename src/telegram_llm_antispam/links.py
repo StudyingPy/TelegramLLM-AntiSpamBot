@@ -113,13 +113,52 @@ def _iter_rich_urls(value: Any) -> tuple[str, ...]:
     return tuple(found)
 
 
+def _iter_reply_markup_buttons(reply_markup: Any) -> tuple[Any, ...]:
+    """Return buttons from Bot API and MTProto/exported reply-markup shapes."""
+
+    if reply_markup is None:
+        return ()
+    rows = _field(reply_markup, "inline_keyboard") or _field(reply_markup, "rows") or ()
+    buttons: list[Any] = []
+    for row in rows:
+        row_buttons = row if isinstance(row, (list, tuple)) else _field(row, "buttons") or ()
+        buttons.extend(row_buttons)
+    return tuple(buttons)
+
+
+def _reply_markup_text(reply_markup: Any) -> str:
+    return "\n".join(
+        str(text).strip()
+        for button in _iter_reply_markup_buttons(reply_markup)
+        if (text := _field(button, "text")) and str(text).strip()
+    )
+
+
+def _iter_reply_markup_urls(reply_markup: Any) -> tuple[str, ...]:
+    found: list[str] = []
+    for button in _iter_reply_markup_buttons(reply_markup):
+        candidates = (
+            _field(button, "url"),
+            _field(_field(button, "login_url"), "url"),
+            _field(_field(button, "web_app"), "url"),
+        )
+        for url in candidates:
+            if isinstance(url, str) and url.lower().startswith(
+                ("http://", "https://", "www.")
+            ):
+                found.append(url)
+    return tuple(found)
+
+
 def extract_message_text(message: Any) -> str:
-    return (
+    body = (
         _field(message, "text")
         or _field(message, "caption")
         or _rich_text(_field(message, "rich_message"))
         or ""
     )
+    button_text = _reply_markup_text(_field(message, "reply_markup"))
+    return "\n".join(part for part in (body, button_text) if part)
 
 
 def extract_links(message: Any) -> tuple[ExtractedLink, ...]:
@@ -136,6 +175,9 @@ def extract_links(message: Any) -> tuple[ExtractedLink, ...]:
             collected.append((url, "entity"))
 
     for url in _iter_rich_urls(_field(message, "rich_message")):
+        collected.append((url, "entity"))
+
+    for url in _iter_reply_markup_urls(_field(message, "reply_markup")):
         collected.append((url, "entity"))
 
     preview_options = _field(message, "link_preview_options")
