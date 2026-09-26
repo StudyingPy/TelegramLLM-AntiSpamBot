@@ -50,6 +50,16 @@ class RuleEngine:
         if fingerprint is not None and _is_low_entropy_fingerprint(fingerprint):
             fingerprint = None
 
+        # A watched account has a saved pre-edit baseline.  When its new revision
+        # contains any advertising carrier/signal, force the same LLM hop used by
+        # other suspicious content and keep a vote fallback if the model is unsure.
+        # This is deliberately before fingerprint/hard-ban shortcuts: an edit must
+        # not bypass contextual review merely because the new text matches a local
+        # rule, while harmless edits continue through the normal path.
+        edited_decision = _edited_message_decision(features)
+        if edited_decision is not None:
+            return edited_decision
+
         fingerprint_decision = (
             self._evaluate_fingerprint(features, fingerprint) if fingerprint is not None else None
         )
@@ -316,6 +326,39 @@ def _profile_spam_decision(features: MessageFeatures) -> LocalDecision | None:
         confidence=0.35,
         should_call_llm=True,
         metadata={"profile_signal": "bio", "profile_only": not features.clean_text},
+    )
+
+
+def _edited_message_decision(features: MessageFeatures) -> LocalDecision | None:
+    edited_from = features.metadata.get("edited_from")
+    if not isinstance(edited_from, dict):
+        return None
+    previous_text = str(edited_from.get("text") or "")
+    if previous_text == features.text[:4000]:
+        return None
+
+    has_carrier = _has_message_carrier(features)
+    normalized = normalize_text(features.text)
+    suspicious = bool(
+        features.links
+        or features.mention_count
+        or features.has_preview_url
+        or _looks_like_hard_spam_text(features.text, has_carrier=has_carrier)
+        or _looks_like_profile_channel_message_signal(features.text)
+        or _OBFUSCATED_JOIN_RE.search(normalized)
+    )
+    if not suspicious:
+        return None
+
+    return LocalDecision(
+        action=DecisionAction.WITHDRAW_VOTE,
+        reason="edited_message_needs_llm",
+        confidence=0.80,
+        should_call_llm=True,
+        metadata={
+            "local_signal": "watched_message_edited",
+            "edited_from_content_hash": edited_from.get("content_hash"),
+        },
     )
 
 

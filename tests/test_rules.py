@@ -148,6 +148,24 @@ def test_unmatched_message_goes_to_llm_review():
 
     assert decision.action == DecisionAction.REVIEW
     assert decision.reason == "unmatched_message_needs_llm"
+
+
+def test_watched_ad_edit_forces_llm_vote_path():
+    features = replace(
+        _features("兼职拿码 @support https://t.me/example"),
+        metadata={
+            "edited_from": {
+                "text": "刚进群，大家好",
+                "content_hash": "old-hash",
+            }
+        },
+    )
+
+    decision = RuleEngine(_settings()).evaluate(features)
+
+    assert decision.action == DecisionAction.WITHDRAW_VOTE
+    assert decision.reason == "edited_message_needs_llm"
+    assert decision.should_call_llm is True
     assert decision.should_call_llm is True
 
 

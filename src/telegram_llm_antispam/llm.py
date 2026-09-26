@@ -385,6 +385,7 @@ def _feature_payload(features: MessageFeatures) -> dict[str, object]:
         "sender_profile": features.metadata.get("sender_profile"),
         "personal_chat": _personal_chat_payload(features.metadata.get("personal_chat")),
         "og_preview": features.metadata.get("og_preview"),
+        "edited_from": _edited_from_payload(features.metadata.get("edited_from")),
     }
 
 
@@ -398,6 +399,16 @@ def _personal_chat_payload(value: object) -> dict[str, object] | None:
         "messages": [str(item)[:1200] for item in messages[:3]]
         if isinstance(messages, (list, tuple))
         else [],
+    }
+
+
+def _edited_from_payload(value: object) -> dict[str, object] | None:
+    """Bound the previous revision included in an edit-review LLM request."""
+    if not isinstance(value, dict):
+        return None
+    return {
+        "text": str(value.get("text") or "")[:4000],
+        "content_hash": str(value.get("content_hash") or "")[:128] or None,
     }
 
 

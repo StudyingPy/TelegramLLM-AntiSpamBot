@@ -46,6 +46,12 @@ logger = logging.getLogger(__name__)
 
 ADMIN_VERIFY_ACTIONS = {"status", "allow_chat", "deny_chat"}
 
+# Telegram does not send the previous revision with edited_message.  Keep a small,
+# expiring baseline only for accounts most likely to abuse edits; established users
+# continue through the ordinary moderation path without per-message tracking.
+EDIT_WATCH_MAX_MESSAGES = 5
+EDIT_WATCH_TTL_SECONDS = 24 * 60 * 60
+
 # Telegram's own service account. 777000 ("Telegram") is the sender of channel posts
 # auto-forwarded into a linked discussion group, and of login/service notifications.
 # It is never a real group member submitting spam, so it bypasses moderation
@@ -374,6 +380,23 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
             default_reputation=settings.default_reputation,
         )
         features.metadata["update_type"] = update_type
+        db.purge_expired_edit_watch_snapshots()
+        edit_snapshot = None
+        if is_edit:
+            edit_snapshot = db.get_edit_watch_snapshot(
+                features.chat_id,
+                features.message_id,
+            )
+            if edit_snapshot is not None:
+                previous_text = str(edit_snapshot.get("text_snapshot") or "")
+                if previous_text != features.text[:4000]:
+                    # Keep the original text bounded both for action logs and for the
+                    # LLM payload.  The current revision remains features.text.
+                    features.metadata["edited_from"] = {
+                        "text": previous_text,
+                        "content_hash": edit_snapshot.get("content_hash"),
+                        "created_at": edit_snapshot.get("created_at"),
+                    }
         if (
             update_type in {"message", "edited_message"}
             and not sender_profile.is_bot
@@ -480,6 +503,28 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
         if not is_edit:
             db.record_message_seen(features, reputation_delta=reputation_reward)
         db.record_observation(features)
+        if sender_profile.is_bot:
+            db.delete_edit_watch_snapshot(features.chat_id, features.message_id)
+        elif is_edit and edit_snapshot is not None:
+            # Keep the original baseline while a suspicious edit is under vote.  A
+            # clean edit becomes the new baseline so a later revision can still be
+            # compared without tracking every member of the group.
+            if decision.action in {DecisionAction.BAN, DecisionAction.WITHDRAW_VOTE}:
+                pass
+            else:
+                db.save_edit_watch_snapshot(
+                    features,
+                    ttl_seconds=EDIT_WATCH_TTL_SECONDS,
+                )
+        elif (
+            not is_edit
+            and _should_watch_edits(user_context, sender_profile, settings)
+            and decision.action in {DecisionAction.ALLOW, DecisionAction.REVIEW}
+        ):
+            db.save_edit_watch_snapshot(
+                features,
+                ttl_seconds=EDIT_WATCH_TTL_SECONDS,
+            )
         await notify_admins(message.bot, db, settings, features, decision, result)
 
     @router.callback_query(F.data.startswith("vote:"))
@@ -672,6 +717,21 @@ def _is_whitelisted_sender(db: Database, settings: Settings, user_id: int) -> bo
     if user_id in TELEGRAM_SERVICE_USER_IDS:
         return True
     return db.is_user_whitelisted(user_id, settings.whitelisted_user_ids)
+
+
+def _should_watch_edits(
+    user_context: Any,
+    sender_profile: Any,
+    settings: Settings,
+) -> bool:
+    """Limit revision baselines to new or low-reputation human accounts."""
+    if getattr(sender_profile, "is_bot", False):
+        return False
+    return bool(
+        getattr(user_context, "messages_seen", 0) < EDIT_WATCH_MAX_MESSAGES
+        or getattr(user_context, "reputation_score", 100)
+        <= settings.low_reputation_threshold
+    )
 
 
 def _is_automatic_channel_forward(message: Message) -> bool:

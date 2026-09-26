@@ -139,6 +139,21 @@ CREATE TABLE IF NOT EXISTS message_observations (
     created_at INTEGER NOT NULL
 );
 
+-- Only messages from new / low-reputation users are retained here.  Telegram's
+-- edited_message update contains the new body, not the previous revision, so a
+-- short-lived baseline is required to tell an innocent edit from an edit that
+-- turns an ordinary message into an advertisement.
+CREATE TABLE IF NOT EXISTS edit_watch_messages (
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    text_snapshot TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, message_id)
+);
+
 CREATE TABLE IF NOT EXISTS bot_only_messages (
     chat_id INTEGER NOT NULL,
     message_id INTEGER NOT NULL,
@@ -161,6 +176,8 @@ CREATE INDEX IF NOT EXISTS idx_admin_notifications_vote_session
     ON admin_notifications(vote_session_id);
 CREATE INDEX IF NOT EXISTS idx_observations_skeleton_time
     ON message_observations(skeleton_hash, created_at);
+CREATE INDEX IF NOT EXISTS idx_edit_watch_expiry
+    ON edit_watch_messages(expires_at);
 CREATE INDEX IF NOT EXISTS idx_bot_only_messages_caller
     ON bot_only_messages(chat_id, caller_user_id, ad_bot_confirmed, message_id);
 CREATE INDEX IF NOT EXISTS idx_bot_only_messages_time
@@ -977,7 +994,93 @@ class Database:
                 (status, _now(), session_id, *allowed_from),
             )
             conn.commit()
+
         return cursor.rowcount > 0
+
+    def purge_expired_edit_watch_snapshots(self, *, now: int | None = None) -> int:
+        """Delete expired edit baselines and return the number removed."""
+        cutoff = _now() if now is None else now
+        with self._locked_conn() as conn:
+            cursor = conn.execute(
+                "DELETE FROM edit_watch_messages WHERE expires_at <= ?",
+                (cutoff,),
+            )
+            conn.commit()
+        return int(cursor.rowcount)
+
+    def get_edit_watch_snapshot(
+        self,
+        chat_id: int,
+        message_id: int,
+        *,
+        now: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Return a watched message's original content, if its TTL has not elapsed."""
+        cutoff = _now() if now is None else now
+        with self._locked_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT chat_id, message_id, user_id, text_snapshot, content_hash,
+                    created_at, expires_at
+                FROM edit_watch_messages
+                WHERE chat_id = ? AND message_id = ? AND expires_at > ?
+                """,
+                (chat_id, message_id, cutoff),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "DELETE FROM edit_watch_messages WHERE chat_id = ? AND message_id = ?",
+                    (chat_id, message_id),
+                )
+                conn.commit()
+                return None
+        return dict(row)
+
+    def save_edit_watch_snapshot(
+        self,
+        features: MessageFeatures,
+        *,
+        ttl_seconds: int = 86_400,
+    ) -> None:
+        """Store a bounded baseline for a message whose author is worth watching."""
+        if features.user_id is None:
+            return
+        now = _now()
+        text = features.text[:4000]
+        with self._locked_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO edit_watch_messages (
+                    chat_id, message_id, user_id, text_snapshot, content_hash,
+                    created_at, expires_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, message_id) DO UPDATE SET
+                    user_id = excluded.user_id,
+                    text_snapshot = excluded.text_snapshot,
+                    content_hash = excluded.content_hash,
+                    created_at = excluded.created_at,
+                    expires_at = excluded.expires_at
+                """,
+                (
+                    features.chat_id,
+                    features.message_id,
+                    features.user_id,
+                    text,
+                    features.content_hash,
+                    now,
+                    now + max(60, int(ttl_seconds)),
+                ),
+            )
+            conn.commit()
+
+    def delete_edit_watch_snapshot(self, chat_id: int, message_id: int) -> None:
+        with self._locked_conn() as conn:
+            conn.execute(
+                "DELETE FROM edit_watch_messages WHERE chat_id = ? AND message_id = ?",
+                (chat_id, message_id),
+            )
+            conn.commit()
 
     def record_bot_only_message(
         self,

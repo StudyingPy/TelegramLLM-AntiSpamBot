@@ -432,6 +432,25 @@ def test_phrase_fingerprints_are_used_in_lookup(tmp_path):
         db.close()
 
 
+def test_edit_watch_snapshot_round_trip_and_expiry(tmp_path):
+    db = _db(tmp_path)
+    try:
+        features = _features()
+        db.save_edit_watch_snapshot(features, ttl_seconds=60)
+
+        snapshot = db.get_edit_watch_snapshot(features.chat_id, features.message_id)
+        assert snapshot is not None
+        assert snapshot["user_id"] == features.user_id
+        assert snapshot["text_snapshot"] == features.text
+
+        assert db.purge_expired_edit_watch_snapshots(
+            now=int(snapshot["expires_at"]) + 1
+        ) == 1
+        assert db.get_edit_watch_snapshot(features.chat_id, features.message_id) is None
+    finally:
+        db.close()
+
+
 def test_bio_text_is_not_used_as_message_phrase_fingerprint_candidate():
     message = SimpleNamespace(
         message_id=13,
