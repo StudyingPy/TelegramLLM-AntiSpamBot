@@ -130,6 +130,7 @@ def test_notify_admins_sends_one_combined_record_with_admin_ban_button(tmp_path)
             ),
         }
         features.metadata["og_preview"] = {"title": "CRTV成人版", "description": "看片就选择CRTV"}
+        features.metadata["edited_from"] = {"text": "大家好，刚进群"}
         decision = LocalDecision(
             DecisionAction.WITHDRAW_VOTE,
             "llm_spam",
@@ -156,6 +157,8 @@ def test_notify_admins_sends_one_combined_record_with_admin_ban_button(tmp_path)
         assert "每天下午六点私聊我核对结算 @CaiG018" in text
         assert "微信支付宝来有码就要" in text
         assert "OG：CRTV成人版 / 看片就选择CRTV" in text
+        assert "编辑前正文：" in text
+        assert "大家好，刚进群" in text
         assert reply_markup is not None
         callbacks = {
             button.callback_data

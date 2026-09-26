@@ -299,6 +299,13 @@ def _notification_text(
 
     links = ", ".join(link.url for link in features.links) or "-"
     snapshot = features.text[:800] or "(empty)"
+    edited_from = features.metadata.get("edited_from")
+    previous_snapshot = ""
+    if isinstance(edited_from, dict):
+        previous_text = str(edited_from.get("text") or "")[:800] or "(empty)"
+        previous_snapshot = (
+            f"\n编辑前正文：\n<blockquote>{_esc(previous_text)}</blockquote>"
+        )
     message_link = _message_link(features.chat_id, features.message_id)
     return (
         "反广告处理记录\n"
@@ -316,6 +323,7 @@ def _notification_text(
         f"{og_text}"
         f"{llm_text}\n"
         f"正文：\n<blockquote>{_esc(snapshot)}</blockquote>"
+        f"{previous_snapshot}"
     )
 
 
