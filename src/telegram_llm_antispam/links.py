@@ -150,6 +150,71 @@ def _iter_reply_markup_urls(reply_markup: Any) -> tuple[str, ...]:
     return tuple(found)
 
 
+def _checklist_value(message: Any) -> tuple[Any, bool]:
+    """Return the checklist plus whether it uses the legacy MTProto/export shape.
+
+    Bot API 9.1 exposes ``Message.checklist`` with ``title`` and ``tasks[].text``.
+    Telegram client exports represent the same media as
+    ``message.media.todo`` with ``title.text`` and ``list[].title.text``.  Accept
+    both so fixtures captured from clients exercise the same extraction path as
+    production Bot API updates.
+    """
+
+    checklist = _field(message, "checklist")
+    if checklist is not None:
+        return checklist, False
+    todo = _field(_field(message, "media"), "todo")
+    return todo, True
+
+
+def _text_with_entities_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    text = _field(value, "text")
+    return text if isinstance(text, str) else ""
+
+
+def _checklist_text(message: Any) -> str:
+    checklist, legacy = _checklist_value(message)
+    if checklist is None:
+        return ""
+
+    if legacy:
+        title = _text_with_entities_text(_field(checklist, "title"))
+        tasks = _field(checklist, "list") or ()
+        task_texts = (
+            _text_with_entities_text(_field(task, "title")) for task in tasks
+        )
+    else:
+        title = _text_with_entities_text(_field(checklist, "title"))
+        tasks = _field(checklist, "tasks") or ()
+        task_texts = (
+            _text_with_entities_text(_field(task, "text")) for task in tasks
+        )
+
+    return "\n".join(
+        part.strip() for part in (title, *task_texts) if part and part.strip()
+    )
+
+
+def _iter_checklist_entities(message: Any) -> tuple[Any, ...]:
+    checklist, legacy = _checklist_value(message)
+    if checklist is None:
+        return ()
+
+    entities: list[Any] = []
+    if legacy:
+        title = _field(checklist, "title")
+        entities.extend(_field(title, "entities") or ())
+        for task in _field(checklist, "list") or ():
+            entities.extend(_field(_field(task, "title"), "entities") or ())
+    else:
+        entities.extend(_field(checklist, "title_entities") or ())
+        for task in _field(checklist, "tasks") or ():
+            entities.extend(_field(task, "text_entities") or ())
+    return tuple(entities)
+
+
 def extract_message_text(message: Any) -> str:
     body = (
         _field(message, "text")
@@ -157,8 +222,9 @@ def extract_message_text(message: Any) -> str:
         or _rich_text(_field(message, "rich_message"))
         or ""
     )
+    checklist_text = _checklist_text(message)
     button_text = _reply_markup_text(_field(message, "reply_markup"))
-    return "\n".join(part for part in (body, button_text) if part)
+    return "\n".join(part for part in (body, checklist_text, button_text) if part)
 
 
 def extract_links(message: Any) -> tuple[ExtractedLink, ...]:
@@ -169,6 +235,12 @@ def extract_links(message: Any) -> tuple[ExtractedLink, ...]:
         collected.append((match.group(0), "text"))
 
     for entity in _iter_entities(message):
+        entity_type = _enum_value(_field(entity, "type"))
+        url = _field(entity, "url")
+        if entity_type == "text_link" and url:
+            collected.append((url, "entity"))
+
+    for entity in _iter_checklist_entities(message):
         entity_type = _enum_value(_field(entity, "type"))
         url = _field(entity, "url")
         if entity_type == "text_link" and url:

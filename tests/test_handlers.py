@@ -51,8 +51,10 @@ def test_anonymous_admin_message_is_detected_by_sender_chat():
     assert _is_anonymous_admin_message(message) is True
 
 
-def test_feature_message_for_user_preserves_rich_message():
+def test_feature_message_for_user_preserves_structured_message_fields():
     rich_message = {"blocks": [{"type": "heading", "text": {"type": "plain_text", "text": "广告"}}]}
+    checklist = {"title": "核对清单", "tasks": [{"id": 1, "text": "广告"}]}
+    media = {"todo": {"title": {"text": "旧版清单"}, "list": []}}
     message = SimpleNamespace(
         message_id=7,
         chat=SimpleNamespace(id=-100123),
@@ -63,12 +65,16 @@ def test_feature_message_for_user_preserves_rich_message():
         caption_entities=None,
         link_preview_options=None,
         rich_message=rich_message,
+        checklist=checklist,
+        media=media,
         reply_markup=None,
     )
 
     feature_message = _feature_message_for_user(message, message.from_user)
 
     assert feature_message.rich_message == rich_message
+    assert feature_message.checklist == checklist
+    assert feature_message.media == media
     assert feature_message.reply_markup is None
 
 

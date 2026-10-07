@@ -108,6 +108,76 @@ def test_build_message_features_includes_inline_button_labels_and_urls():
     assert {link.domain for link in features.links} == {"t.me"}
 
 
+def test_build_message_features_flattens_bot_api_checklist_and_hidden_links():
+    message = _message(
+        checklist={
+            "title": "一手假钞假币包过验钞机可找妹嫖娼",
+            "title_entities": [],
+            "tasks": [
+                {"id": 1, "text": "可面交 可快递", "text_entities": []},
+                {
+                    "id": 2,
+                    "text": "点击客服加入洗钱交流群",
+                    "text_entities": [
+                        {
+                            "type": "text_link",
+                            "offset": 2,
+                            "length": 2,
+                            "url": "https://t.me/hidden_promo",
+                        }
+                    ],
+                },
+                {
+                    "id": 3,
+                    "text": "https://t.me/+zx2lNSHe1PZkZjE1",
+                    "text_entities": [{"type": "url", "offset": 0, "length": 30}],
+                },
+            ],
+        }
+    )
+
+    features = build_message_features(message)
+
+    assert "一手假钞假币包过验钞机可找妹嫖娼" in features.text
+    assert "点击客服加入洗钱交流群" in features.text
+    assert {link.url for link in features.links} == {
+        "https://t.me/hidden_promo",
+        "https://t.me/+zx2lNSHe1PZkZjE1",
+    }
+    assert features.link_domains == ("t.me",)
+
+
+def test_build_message_features_flattens_legacy_media_todo_export():
+    message = _message(
+        media={
+            "todo": {
+                "title": {"text": "核对清单", "entities": []},
+                "list": [
+                    {"id": 1, "title": {"text": "可找妹 可嫖娼", "entities": []}},
+                    {
+                        "id": 2,
+                        "title": {
+                            "text": "https://t.me/+zx2lNSHe1PZkZjE1",
+                            "entities": [],
+                        },
+                    },
+                ],
+            }
+        }
+    )
+
+    features = build_message_features(message)
+
+    assert features.text.splitlines() == [
+        "核对清单",
+        "可找妹 可嫖娼",
+        "https://t.me/+zx2lNSHe1PZkZjE1",
+    ]
+    assert [link.url for link in features.links] == [
+        "https://t.me/+zx2lNSHe1PZkZjE1"
+    ]
+
+
 def test_normalize_text_strips_zero_width_digits_and_emoji():
     assert normalize_text("赚\u200b钱 123 🚀") == "赚钱"
 
