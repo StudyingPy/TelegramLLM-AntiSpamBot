@@ -296,6 +296,20 @@ def _notification_text(
         )
 
     llm_text = _format_llm_section(decision)
+    context = decision.metadata.get("user_trust")
+    trust_text = ""
+    if isinstance(context, dict):
+        tier = {"trusted": "老用户保护", "observed": "观察期", "low_reputation": "低信誉", "bot": "Bot"}
+        trust_text = (
+            f"\n用户分层：{tier.get(str(context.get('tier')), '未知')}"
+            f" / 信誉 {context.get('reputation_score', '-')}"
+            f" / 正常消息 {context.get('normal_messages_seen', 0)}"
+        )
+    original = decision.metadata.get("local_rule_reason")
+    if original:
+        trust_text += f"\n原规则：{_esc(str(original))}"
+    if decision.metadata.get("fingerprint_id") is not None:
+        trust_text += f"\n命中指纹：{decision.metadata['fingerprint_id']}"
 
     links = ", ".join(link.url for link in features.links) or "-"
     snapshot = features.text[:800] or "(empty)"
@@ -315,6 +329,7 @@ def _notification_text(
         f"{profile_text}\n"
         f"{personal_chat_text}"
         f"触发：<code>{_esc(decision.reason)}</code>\n"
+        f"{trust_text}\n"
         f"处理：<b>{decision.action.value}</b> / {decision.confidence:.0%}\n"
         f"删除：{_fmt_bool(result.deleted)} 封禁：{_fmt_bool(result.banned)}\n"
         f"日志：<code>{result.action_log_id or '-'}</code>\n"

@@ -145,7 +145,7 @@ def test_router_registers_catchup_review_callbacks(tmp_path):
         router = create_router(_settings(), db)
 
         # vote, admin_verify, admin_ban, admin_release, review_ban, review_keep.
-        assert len(router.callback_query.handlers) == 6
+        assert len(router.callback_query.handlers) == 7
     finally:
         db.close()
 

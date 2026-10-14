@@ -36,6 +36,11 @@
    including fingerprint and repeat shortcuts. Benign output releases them; LLM failure or
    disablement leaves the message intact and logs review. Short-message rules retain their
    existing behavior, except `几百`/`几千` are no longer hard advertising tokens.
+   Trust protection additionally requires a 72-hour observation period, 30 distinct new
+   messages explicitly judged benign by the LLM, and reputation >=80. A trusted user's
+   local enforcement shortcuts go through the LLM; benign releases, spam >=70% votes,
+   and failure logs review. Verified global/group administrators and own-group anonymous
+   administrators bypass moderation. New-member checks target the invitee, not the inviter.
    Bot-only invocation messages (one or more whitespace-separated `@...bot` usernames and no
    other content) are persisted separately. If a named bot responds with content classified as
    advertising, that invocation marks its human caller. The caller's next bot-only message bans
@@ -61,6 +66,11 @@
    - each new message explicitly judged non-spam by the LLM adds a small reputation reward
    - bare human `@username` mentions are excluded from phrase fingerprints; only usernames
      ending in `bot` retain carrier-only phrase matching
+14. A separate fingerprint quality worker starts on boot and runs daily with persisted
+    progress: at most 1,000 entries per run, at most 10 per serial LLM request. It recovers
+    historical phrases, keeps three bounded message samples, and proposes high-confidence
+    retirements. Only user 5439265612 receives the daily digest and can keep, disable or
+    restore entries. Disabled entries do not match and cannot be re-enabled by learning.
 
 ## Phase Status
 

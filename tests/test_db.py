@@ -33,7 +33,7 @@ def _db(tmp_path: Path) -> Database:
     return db
 
 
-def _features():
+def _features(text="加群送码拿钱 详细教程 https://spam.example"):
     """Build a MessageFeatures with a multi-word skeleton that is NOT classified as
     low-entropy. The previous fixture text 'spam https://spam.example' produces
     skeleton '<w> <url>' which is now correctly rejected by feedback filters as a
@@ -43,7 +43,7 @@ def _features():
         message_id=10,
         chat=SimpleNamespace(id=-1001),
         from_user=SimpleNamespace(id=42),
-        text="加群送码拿钱 详细教程 https://spam.example",
+        text=text,
     )
     context = UserContext(chat_id=-1001, user_id=42, reputation_score=50, messages_seen=1)
     return build_message_features(message, context)
@@ -81,13 +81,15 @@ def test_normal_message_reward_updates_reputation_with_message_count(tmp_path):
         assert first.messages_seen == 1
         assert first.reputation_score == 52
 
-        db.record_message_seen(features, reputation_delta=2)
+        from dataclasses import replace
+
+        db.record_message_seen(replace(features, message_id=features.message_id + 1), reputation_delta=2)
         second = db.get_user_context(features.chat_id, features.user_id or 0)
         assert second.messages_seen == 2
         assert second.reputation_score == 54
 
         # Reputation remains bounded even after a large positive reward.
-        db.record_message_seen(features, reputation_delta=100)
+        db.record_message_seen(replace(features, message_id=features.message_id + 2), reputation_delta=100)
         capped = db.get_user_context(features.chat_id, features.user_id or 0)
         assert capped.reputation_score == 100
     finally:
@@ -267,6 +269,7 @@ def test_vote_feedback_boosts_and_downgrades_fingerprints(tmp_path):
         assert boosted is not None
         assert boosted.weight == settings.vote_confirmed_fingerprint_weight
 
+        db.close_vote_session(session_id, "released")
         record_vote_ham_feedback(db, session, settings)
         downgraded = db.get_fingerprint(session.skeleton_hash or "")
         assert downgraded is not None
@@ -363,7 +366,7 @@ def test_allowed_chat_can_come_from_env_or_database(tmp_path):
 def test_llm_spam_feedback_creates_medium_weight_fingerprints(tmp_path):
     db = _db(tmp_path)
     settings = _settings()
-    features = _features()
+    features = _features("日赚过万 click here @helperbot https://spam.example")
     try:
         record_llm_spam_feedback(
             db,
@@ -400,7 +403,7 @@ def test_phrase_fingerprints_are_used_in_lookup(tmp_path):
     want to match anyway."""
     db = _db(tmp_path)
     settings = _settings()
-    learned = _features()
+    learned = _features("日赚过万 click here @helperbot https://spam.example")
     try:
         record_llm_spam_feedback(
             db,
@@ -481,7 +484,7 @@ def test_bare_human_mentions_are_not_phrase_fingerprints_but_bot_mentions_are(tm
 
     db = _db(tmp_path)
     settings = _settings()
-    learned = _features()
+    learned = _features("日赚过万 click here @helperbot https://spam.example")
     human_value = phrase_fingerprint_value("@zaoanyun")
     bot_value = phrase_fingerprint_value("@helperbot")
     assert human_value is not None
@@ -608,7 +611,7 @@ def test_llm_spam_feedback_refuses_to_promote_short_phrases(tmp_path):
     or 4 Latin chars."""
     db = _db(tmp_path)
     settings = _settings()
-    features = _features()
+    features = _features("日赚过万 click here @helperbot https://spam.example")
     try:
         record_llm_spam_feedback(
             db,

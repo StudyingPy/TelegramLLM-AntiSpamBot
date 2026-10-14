@@ -7,6 +7,7 @@ from .fingerprints import LOW_ENTROPY_SKELETON_HASHES, stable_hash
 from .links import is_whitelisted_domain
 from .models import DecisionAction, FingerprintRecord, LocalDecision, MessageFeatures
 from .text import normalize_text, strip_zero_width
+from .reputation import is_trusted_sender, route_trusted_message_to_llm
 
 
 # stable_hash("") — any fingerprint stored under this value is a universal trap
@@ -42,6 +43,7 @@ class RuleEngine:
         fingerprint: FingerprintRecord | None = None,
     ) -> LocalDecision:
         decision = self._evaluate(features, fingerprint)
+        decision = route_trusted_message_to_llm(features, decision)
         return route_long_message_to_llm(self._settings, features, decision)
 
     def _evaluate(
@@ -55,7 +57,9 @@ class RuleEngine:
         # filter existed) cannot leak through to produce a 95%-confidence BAN or
         # WITHDRAW_VOTE against any empty/whitespace/emoji-only / bare-URL / bare-
         # mention / single-word message.
-        if fingerprint is not None and _is_low_entropy_fingerprint(fingerprint):
+        if fingerprint is not None and (
+            not fingerprint.enabled or _is_low_entropy_fingerprint(fingerprint)
+        ):
             fingerprint = None
 
         # A watched account has a saved pre-edit baseline.  When its new revision
@@ -127,7 +131,7 @@ class RuleEngine:
     ) -> LocalDecision:
         high_weight = fingerprint.weight >= self._settings.fingerprint_ban_weight
         low_rep = features.sender_reputation <= self._settings.reputation_ban_threshold
-        high_rep = features.sender_reputation >= self._settings.high_reputation_threshold
+        high_rep = is_trusted_sender(features)
         # Only the strictest fingerprint type (full normalized-content hash) is allowed
         # to escalate to BAN. Skeleton/phrase types over-generalize by construction,
         # so a single misclassified ad would otherwise auto-ban every later message

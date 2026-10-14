@@ -135,12 +135,25 @@ def record_llm_spam_feedback(
             features.skeleton_hash,
             settings.llm_fingerprint_initial_weight,
             "llm_spam",
+            pattern_text=features.skeleton,
         )
+        db.add_fingerprint_evidence(features.skeleton_hash, features, "llm_spam")
     for phrase in judgement.signal_phrases:
         # LLM is free to return "可以" / "OK" / "see" as signal phrases. We must NOT
         # promote those to fingerprint candidates regardless of how confident the
         # judgement was — they will collide with every innocent message.
         if not _is_allowed_phrase_carrier(phrase) or not _phrase_passes_min_length(phrase):
+            continue
+        preview = features.metadata.get("og_preview")
+        public_context = features.clean_text
+        if isinstance(preview, dict):
+            public_context += " " + normalize_text(" ".join(
+                str(preview.get(key) or "")
+                for key in ("title", "description", "site_name", "image_alt", "text")
+            ))
+        if normalize_text(phrase) not in public_context:
+            # Profile/personal-channel text is transient context, not a source of
+            # newly persisted readable group-message fingerprints.
             continue
         value = phrase_fingerprint_value(phrase)
         if _is_meaningful_fingerprint_value(value):
@@ -149,7 +162,9 @@ def record_llm_spam_feedback(
                 value,
                 settings.llm_fingerprint_initial_weight,
                 "llm_spam_phrase",
+                pattern_text=phrase,
             )
+            db.add_fingerprint_evidence(value, features, "llm_spam")
 
 
 def record_vote_spam_feedback(db: Database, session: VoteSession, settings: Settings) -> None:
@@ -166,6 +181,7 @@ def record_vote_spam_feedback(db: Database, session: VoteSession, settings: Sett
             settings.vote_confirmed_fingerprint_weight,
             "vote_confirmed",
         )
+
     if _is_meaningful_fingerprint_value(session.content_hash):
         db.upsert_fingerprint(
             "content",
@@ -173,12 +189,11 @@ def record_vote_spam_feedback(db: Database, session: VoteSession, settings: Sett
             settings.vote_confirmed_fingerprint_weight,
             "vote_confirmed",
         )
+    db.add_vote_spam_evidence(session)
 
 
 def record_vote_ham_feedback(db: Database, session: VoteSession, settings: Settings) -> None:
-    for value in (session.skeleton_hash, session.content_hash):
-        if _is_meaningful_fingerprint_value(value):
-            db.mark_fingerprint_false_positive(value, settings.fingerprint_false_positive_penalty)
+    db.apply_vote_ham_feedback(session.id, settings.fingerprint_false_positive_penalty)
 
 
 def phrase_fingerprint_value(phrase: str) -> str | None:

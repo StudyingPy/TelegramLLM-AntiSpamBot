@@ -5,6 +5,7 @@ from typing import Any
 from .fingerprints import content_hash, simhash, skeletonize, stable_hash
 from .links import extract_domains, extract_links, extract_message_text
 from .models import MessageFeatures, SenderProfile, UserContext
+from .reputation import trust_context
 from .text import count_mentions, is_empty_or_punctuation, normalize_text
 
 
@@ -47,6 +48,8 @@ def build_message_features(
     }
     if sender_profile is not None:
         metadata["sender_profile"] = sender_profile.to_payload()
+    if user_context is not None:
+        metadata["user_trust"] = trust_context(user_context)
 
     return MessageFeatures(
         chat_id=chat_id,

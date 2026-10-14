@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import Settings
+from .fingerprint_store import FingerprintStore
 from .models import (
     AdminNotification,
     FingerprintRecord,
@@ -185,16 +186,23 @@ CREATE INDEX IF NOT EXISTS idx_bot_only_messages_time
 """
 
 
-class Database:
-    def __init__(self, path: Path, default_reputation: float = 50) -> None:
+class Database(FingerprintStore):
+    def __init__(
+        self, path: Path, default_reputation: float = 50,
+        fingerprint_false_positive_penalty: float = 30,
+    ) -> None:
         self._path = path
         self._default_reputation = default_reputation
+        self._fingerprint_false_positive_penalty = fingerprint_false_positive_penalty
         self._conn: sqlite3.Connection | None = None
         self._lock = threading.RLock()
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "Database":
-        return cls(settings.database_path, default_reputation=settings.default_reputation)
+        return cls(
+            settings.database_path, default_reputation=settings.default_reputation,
+            fingerprint_false_positive_penalty=settings.fingerprint_false_positive_penalty,
+        )
 
     def connect(self) -> None:
         if self._path != Path(":memory:"):
@@ -211,6 +219,7 @@ class Database:
         with self._locked_conn() as conn:
             conn.executescript(SCHEMA_SQL)
             self._ensure_columns(conn)
+            self._migrate_fingerprint_store(conn)
             conn.commit()
 
     def _ensure_columns(self, conn: sqlite3.Connection) -> None:
@@ -223,6 +232,16 @@ class Database:
         """
         for table, column, ddl in (
             ("vote_sessions", "detail_text", "ALTER TABLE vote_sessions ADD COLUMN detail_text TEXT"),
+            ("user_reputation", "joined_at", "ALTER TABLE user_reputation ADD COLUMN joined_at INTEGER"),
+            ("user_reputation", "normal_messages_seen",
+             "ALTER TABLE user_reputation ADD COLUMN normal_messages_seen INTEGER NOT NULL DEFAULT 0"),
+            ("fingerprints", "enabled",
+             "ALTER TABLE fingerprints ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1"),
+            ("fingerprints", "pattern_text", "ALTER TABLE fingerprints ADD COLUMN pattern_text TEXT"),
+            ("fingerprints", "last_audited_at",
+             "ALTER TABLE fingerprints ADD COLUMN last_audited_at INTEGER"),
+            ("fingerprints", "last_audit_signature",
+             "ALTER TABLE fingerprints ADD COLUMN last_audit_signature TEXT"),
         ):
             existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
             if column not in existing:
@@ -394,7 +413,8 @@ class Database:
         with self._locked_conn() as conn:
             row = conn.execute(
                 """
-                SELECT chat_id, user_id, reputation_score, first_seen_at, last_seen_at, messages_seen
+                SELECT chat_id, user_id, reputation_score, first_seen_at, last_seen_at, messages_seen,
+                    joined_at, normal_messages_seen
                 FROM user_reputation
                 WHERE chat_id = ? AND user_id = ?
                 """,
@@ -418,12 +438,28 @@ class Database:
             messages_seen=row["messages_seen"],
             first_seen_at=row["first_seen_at"],
             last_seen_at=row["last_seen_at"],
+            joined_at=row["joined_at"],
+            normal_messages_seen=row["normal_messages_seen"],
         )
+
+    def record_user_join(self, chat_id: int, user_id: int, joined_at: int | None = None) -> None:
+        now = _now()
+        with self._locked_conn() as conn:
+            conn.execute(
+                """INSERT INTO user_reputation
+                   (chat_id,user_id,reputation_score,first_seen_at,last_seen_at,joined_at)
+                   VALUES (?,?,?,?,?,?) ON CONFLICT(chat_id,user_id)
+                   DO UPDATE SET joined_at=excluded.joined_at""",
+                (chat_id, user_id, self._default_reputation, now, now,
+                 now if joined_at is None else joined_at),
+            )
+            conn.commit()
 
     def record_message_seen(
         self,
         features: MessageFeatures,
         reputation_delta: float = 0,
+        confirmed_normal: bool = False,
     ) -> None:
         if features.user_id is None:
             return
@@ -433,15 +469,26 @@ class Database:
             min(100, self._default_reputation + reputation_delta),
         )
         with self._locked_conn() as conn:
+            inserted = conn.execute(
+                "INSERT OR IGNORE INTO processed_messages VALUES (?,?,?,?,?)",
+                (features.chat_id, features.message_id, features.user_id,
+                 int(confirmed_normal), now),
+            ).rowcount
+            if not inserted:
+                conn.commit()
+                return
             conn.execute(
                 """
                 INSERT INTO user_reputation (
-                    chat_id, user_id, reputation_score, first_seen_at, last_seen_at, messages_seen
+                    chat_id, user_id, reputation_score, first_seen_at, last_seen_at, messages_seen,
+                    normal_messages_seen
                 )
-                VALUES (?, ?, ?, ?, ?, 1)
+                VALUES (?, ?, ?, ?, ?, 1, ?)
                 ON CONFLICT(chat_id, user_id) DO UPDATE SET
                     last_seen_at = excluded.last_seen_at,
                     messages_seen = user_reputation.messages_seen + 1,
+                    normal_messages_seen = user_reputation.normal_messages_seen
+                        + excluded.normal_messages_seen,
                     reputation_score = max(
                         0,
                         min(100, user_reputation.reputation_score + ?)
@@ -453,10 +500,18 @@ class Database:
                     initial_reputation,
                     now,
                     now,
+                    int(confirmed_normal),
                     reputation_delta,
                 ),
             )
             conn.commit()
+
+    def was_message_processed(self, chat_id: int, message_id: int) -> bool:
+        with self._locked_conn() as conn:
+            return conn.execute(
+                "SELECT 1 FROM processed_messages WHERE chat_id=? AND message_id=?",
+                (chat_id, message_id),
+            ).fetchone() is not None
 
     def record_observation(self, features: MessageFeatures) -> None:
         with self._locked_conn() as conn:
@@ -485,7 +540,8 @@ class Database:
         with self._locked_conn() as conn:
             row = conn.execute(
                 """
-                SELECT id, fingerprint_type, value, weight, hit_count, false_positive_count, source
+                SELECT id, fingerprint_type, value, weight, hit_count, false_positive_count, source,
+                    enabled
                 FROM fingerprints
                 WHERE value = ?
                 """,
@@ -502,6 +558,7 @@ class Database:
             hit_count=row["hit_count"],
             false_positive_count=row["false_positive_count"],
             source=row["source"],
+            enabled=bool(row["enabled"]),
         )
 
     def get_strongest_fingerprint(self, values: tuple[tuple[str, str], ...]) -> FingerprintRecord | None:
@@ -512,9 +569,10 @@ class Database:
             for fingerprint_type, value in values:
                 row = conn.execute(
                     """
-                    SELECT id, fingerprint_type, value, weight, hit_count, false_positive_count, source
+                    SELECT id, fingerprint_type, value, weight, hit_count, false_positive_count, source,
+                        enabled
                     FROM fingerprints
-                    WHERE fingerprint_type = ? AND value = ?
+                    WHERE fingerprint_type = ? AND value = ? AND enabled=1
                     """,
                     (fingerprint_type, value),
                 ).fetchone()
@@ -532,6 +590,7 @@ class Database:
             hit_count=row["hit_count"],
             false_positive_count=row["false_positive_count"],
             source=row["source"],
+            enabled=bool(row["enabled"]),
         )
 
     def record_fingerprint_hit(
@@ -540,6 +599,7 @@ class Database:
         *,
         weight_increment: float = 0.0,
         weight_cap: float = 0.0,
+        count_hit: bool = True,
     ) -> float | None:
         """Record a hit and optionally bump the fingerprint weight.
 
@@ -553,20 +613,21 @@ class Database:
         Returns the resulting weight, or ``None`` if the fingerprint was gone.
         """
         with self._locked_conn() as conn:
-            conn.execute(
-                """
-                UPDATE fingerprints
-                SET hit_count = hit_count + 1, last_hit_at = ?
-                WHERE id = ?
-                """,
-                (_now(), fingerprint_id),
-            )
+            if count_hit:
+                conn.execute(
+                    """
+                    UPDATE fingerprints
+                    SET hit_count = hit_count + 1, last_hit_at = ?
+                    WHERE id = ? AND enabled=1
+                    """,
+                    (_now(), fingerprint_id),
+                )
             if weight_increment > 0:
                 conn.execute(
                     """
                     UPDATE fingerprints
                     SET weight = max(weight, min(weight + ?, ?))
-                    WHERE id = ?
+                    WHERE id = ? AND enabled=1
                     """,
                     (weight_increment, weight_cap, fingerprint_id),
                 )
@@ -583,6 +644,7 @@ class Database:
         value: str,
         weight: float,
         source: str,
+        pattern_text: str | None = None,
     ) -> None:
         now = _now()
         bounded_weight = max(0.0, min(100.0, weight))
@@ -591,16 +653,19 @@ class Database:
                 """
                 INSERT INTO fingerprints (
                     fingerprint_type, value, weight, hit_count, false_positive_count,
-                    source, last_hit_at, created_at
+                    source, last_hit_at, created_at, pattern_text
                 )
-                VALUES (?, ?, ?, 0, 0, ?, ?, ?)
+                VALUES (?, ?, ?, 0, 0, ?, ?, ?, ?)
                 ON CONFLICT(value) DO UPDATE SET
                     fingerprint_type = excluded.fingerprint_type,
                     weight = max(fingerprints.weight, excluded.weight),
                     source = excluded.source,
-                    last_hit_at = excluded.last_hit_at
+                    last_hit_at = excluded.last_hit_at,
+                    pattern_text = coalesce(excluded.pattern_text, fingerprints.pattern_text)
+                WHERE fingerprints.enabled=1
                 """,
-                (fingerprint_type, value, bounded_weight, source, now, now),
+                (fingerprint_type, value, bounded_weight, source, now, now,
+                 pattern_text[:4000] if pattern_text else None),
             )
             conn.commit()
 

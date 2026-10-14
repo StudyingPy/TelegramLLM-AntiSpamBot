@@ -30,6 +30,8 @@ class UserContext:
     messages_seen: int
     first_seen_at: int | None = None
     last_seen_at: int | None = None
+    joined_at: int | None = None
+    normal_messages_seen: int = 0
 
     @property
     def is_first_message(self) -> bool:
@@ -98,6 +100,7 @@ class FingerprintRecord:
     hit_count: int
     false_positive_count: int
     source: str
+    enabled: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +167,21 @@ class LLMOutcome:
     @property
     def is_spam(self) -> bool:
         return self.judgement is not None and self.judgement.is_spam
+
+
+@dataclass(frozen=True, slots=True)
+class FingerprintAuditResult:
+    fingerprint_id: int
+    decision: str
+    confidence: float
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class FingerprintAuditOutcome:
+    status: LLMOutcomeStatus
+    results: tuple[FingerprintAuditResult, ...] = ()
+    error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

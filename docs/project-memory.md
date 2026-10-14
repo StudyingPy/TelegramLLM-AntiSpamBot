@@ -98,3 +98,62 @@
 - Local Git HTTPS network commands need per-command
   `git -c http.proxy=http://127.0.0.1:2235 ...`. Keep unrelated JEV files, `.gitignore`,
   `pyproject.toml` and pre-existing memory edits out of production commits.
+- PowerShell here-string pipelines to `ssh ... bash -s` can append a trailing CR
+  to the last command argument. Prefer a directly quoted SSH command for health
+  checks, or explicitly strip CR from streamed shell scripts before Bash reads them.
+- 2026-10-14: deployed `46d07a7` using update mode; remote worktree clean, 500-character
+  threshold effective, 3 LLM providers enabled, service active with zero restart-loop
+  count and Bot polling restored. Remote offline rule/merge smoke checks passed.
+
+## Generic phrase fingerprints and release feedback (2026-10-15)
+
+- Read-only production audit: action 19780 / vote 1070 (`居然机器人没头像`) matched
+  phrase fingerprint 9055, `机器人`, source `llm_spam_phrase`, weight 60, two hits.
+  The LLM said benign at 0.99, but short-message `_merge_llm_decision` keeps the
+  local fingerprint WITHDRAW_VOTE. Earlier action 18310 (`机器人又来刷屏了`)
+  also matched this phrase and received a benign LLM judgement.
+- The current phrase minimum allows ordinary three-character nouns such as `机器人`.
+  Length alone does not ensure an advertising phrase is distinctive.
+- Administrator release calls `record_vote_ham_feedback`, which only penalizes the
+  session's content/skeleton hashes. It misses the actual phrase fingerprint ID in
+  the original action metadata. Fingerprint 9055 consequently still had weight 60
+  and false_positive_count 0 after vote 1070 was released. Future fixes should
+  target the actual matched fingerprint, preserving the release idempotency gate.
+- This audit changed neither production data nor moderation logic.
+
+## Trust tiers and fingerprint quality review (2026-10-15)
+
+- Implemented protection requires all three: 72 observation hours, 30 distinct
+  model-benign new messages, reputation >=80. Rejoin resets `joined_at`; legacy
+  accounts use `first_seen_at`. Normal history is independent of ALLOW-only +2
+  rewards; edits, joins and duplicate message IDs do not count. Existing reputation
+  is preserved and historical positive-reward records are backfilled without rewards.
+- Global/group/anonymous administrators bypass message moderation. New-member
+  moderation targets invitees even when the inviter is an administrator/whitelisted.
+  Role caches live 300 seconds and are invalidated by chat_member updates, which
+  also record joins. Identity lookup failures suppress destructive enforcement.
+- `user_trust` is the shared protection flag for rules, repeat shortcuts and LLM
+  decisions. Trusted local BAN/VOTE hits become REVIEW before calling the model;
+  benign releases, spam >=70% votes, model failure remains REVIEW. Confirmed ad-Bot
+  repeat invocation and human-confirmed ban execution retain their existing paths.
+- FingerprintStore extends SQLite with additive columns and idempotent maintenance
+  marks: `trusted_history_v1`, `fingerprint_evidence_v1`, `phrase_ham_feedback_v1`.
+  Actual matched phrase IDs receive release feedback once per session/ID; timeout
+  releases are excluded. Match counts alone do not strengthen weights.
+- Daily audit defaults: 1,000 entries/run, <=10 entries/request, bounded request
+  context, three <=800-character message samples. Missing readable patterns are
+  insufficient evidence. Failed batches remain pending and retry after 300 seconds;
+  restart resumes the same run. A completed run waits 24 hours before the next.
+- New readable learning only comes from group/OG content; Bio/personal-channel
+  context is not added to persistent evidence. Unknown historical local hits are
+  labeled `local_hit`, not invented LLM or human spam confirmation.
+- Audit output must contain exactly the supplied IDs and valid keep/disable/
+  insufficient_evidence decisions. Disable confidence >=0.90 creates a proposal,
+  never an automatic disable. Keep decisions and pending proposals suppress duplicate
+  recommendations for unchanged evidence. Disabled fingerprints reject automatic upserts.
+- Digest and all private `/fingerprints`, `fp_review` deep-link and `fp:` callbacks
+  are limited to configured reviewer 5439265612. One digest per 24 hours; send failure
+  retains unnotified proposals. Disable/keep/restore callbacks are transactional and
+  idempotent; an operation ledger preserves prior actions. Disabled entries are restorable.
+- Deployment backup created with SQLite backup API (integrity_check passed):
+  `/opt/telegram-llm-antispam-bot/data/backups/bot-pre-trust-review-20261015-025342-846566.sqlite`.

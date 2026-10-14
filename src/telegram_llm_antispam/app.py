@@ -14,6 +14,7 @@ from .config import Settings
 from .db import Database
 from .handlers import create_router
 from .llm import create_llm_judge
+from .fingerprint_audit import sweep_fingerprints
 from .logging_config import configure_logging
 
 
@@ -36,7 +37,8 @@ async def run() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dispatcher = Dispatcher()
-    dispatcher.include_router(create_router(settings, db, llm=create_llm_judge(settings)))
+    judge = create_llm_judge(settings)
+    dispatcher.include_router(create_router(settings, db, llm=judge))
     await bot.set_my_commands(
         [
             BotCommand(command="start", description="显示帮助"),
@@ -47,18 +49,22 @@ async def run() -> None:
             BotCommand(command="whitelist", description="加入全局白名单（仅全局管理员）"),
             BotCommand(command="unwhitelist", description="移出全局白名单（仅全局管理员）"),
             BotCommand(command="list_whitelist", description="查看全局白名单（仅全局管理员）"),
+            BotCommand(command="fingerprints", description="指纹复核（仅指定复核人）"),
         ]
     )
     vote_sweeper = asyncio.create_task(
         _sweep_expired_votes(settings, bot, ModerationActions(settings, db))
     )
+    fingerprint_sweeper = asyncio.create_task(sweep_fingerprints(settings, bot, db, judge))
 
     try:
         await dispatcher.start_polling(bot)
     finally:
-        vote_sweeper.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await vote_sweeper
+        for task in (vote_sweeper, fingerprint_sweeper):
+            task.cancel()
+        for task in (vote_sweeper, fingerprint_sweeper):
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         db.close()
         await bot.session.close()
 

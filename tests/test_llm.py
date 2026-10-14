@@ -442,7 +442,10 @@ def test_llm_spam_at_ban_threshold_still_votes_for_high_reputation():
         from_user=SimpleNamespace(id=42),
         text="join https://spam.example",
     )
-    context = UserContext(chat_id=-1001, user_id=42, reputation_score=85, messages_seen=30)
+    context = UserContext(
+        chat_id=-1001, user_id=42, reputation_score=85, messages_seen=30,
+        normal_messages_seen=30, first_seen_at=1,
+    )
     features = build_message_features(message, context)
 
     decision = decision_from_llm(

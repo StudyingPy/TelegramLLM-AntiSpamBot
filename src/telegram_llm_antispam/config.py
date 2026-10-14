@@ -113,6 +113,13 @@ class Settings:
     profile_bio_cache_ttl_seconds: int
 
     long_message_llm_min_chars: int = 500
+    new_user_observation_hours: int = 72
+    trusted_normal_message_min_count: int = 30
+    fingerprint_audit_enabled: bool = True
+    fingerprint_audit_interval_hours: int = 24
+    fingerprint_audit_max_per_run: int = 1000
+    fingerprint_audit_batch_size: int = 10
+    fingerprint_review_user_id: int = 5439265612
 
     @property
     def has_newapi(self) -> bool:
@@ -178,4 +185,11 @@ class Settings:
             profile_bio_fetch_enabled=_env_bool("PROFILE_BIO_FETCH_ENABLED", True),
             profile_bio_cache_ttl_seconds=_env_int("PROFILE_BIO_CACHE_TTL_SECONDS", 604_800),
             long_message_llm_min_chars=_env_int("LONG_MESSAGE_LLM_MIN_CHARS", 500),
+            new_user_observation_hours=_env_int("NEW_USER_OBSERVATION_HOURS", 72),
+            trusted_normal_message_min_count=_env_int("TRUSTED_NORMAL_MESSAGE_MIN_COUNT", 30),
+            fingerprint_audit_enabled=_env_bool("FINGERPRINT_AUDIT_ENABLED", True),
+            fingerprint_audit_interval_hours=_env_int("FINGERPRINT_AUDIT_INTERVAL_HOURS", 24),
+            fingerprint_audit_max_per_run=_env_int("FINGERPRINT_AUDIT_MAX_PER_RUN", 1000),
+            fingerprint_audit_batch_size=_env_int("FINGERPRINT_AUDIT_BATCH_SIZE", 10),
+            fingerprint_review_user_id=_env_int("FINGERPRINT_REVIEW_USER_ID", 5439265612),
         )

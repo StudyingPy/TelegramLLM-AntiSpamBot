@@ -12,7 +12,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from .actions import ModerationActions
-from .admin import can_manage_chat, is_chat_allowed, is_global_admin
+from .admin import ChatAdminCache, can_manage_chat, is_chat_allowed, is_global_admin
 from .config import Settings
 from .db import Database
 from .feedback import (
@@ -21,6 +21,7 @@ from .feedback import (
     record_llm_spam_feedback,
 )
 from .features import build_message_features
+from .fingerprint_audit import REVIEW_PREFIX, handle_review_callback, show_reviews
 from .fingerprints import is_low_entropy_skeleton
 from .llm import LLMJudge, NullLLMJudge, decision_from_llm
 from .models import (
@@ -40,6 +41,7 @@ from .notifications import (
 from .og import fetch_og_for_features, should_fetch_og
 from .profile import fetch_personal_chat_for_crosscheck, get_sender_profile
 from .rules import RuleEngine, route_long_message_to_llm, should_crosscheck_personal_channel
+from .reputation import is_trusted_sender, route_trusted_message_to_llm, trust_context
 
 
 logger = logging.getLogger(__name__)
@@ -49,7 +51,6 @@ ADMIN_VERIFY_ACTIONS = {"status", "allow_chat", "deny_chat"}
 # Telegram does not send the previous revision with edited_message.  Keep a small,
 # expiring baseline only for accounts most likely to abuse edits; established users
 # continue through the ordinary moderation path without per-message tracking.
-EDIT_WATCH_MAX_MESSAGES = 5
 EDIT_WATCH_TTL_SECONDS = 24 * 60 * 60
 
 # Telegram's own service account. 777000 ("Telegram") is the sender of channel posts
@@ -72,6 +73,22 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
     rule_engine = RuleEngine(settings)
     llm_judge = llm or NullLLMJudge()
     actions = ModerationActions(settings, db)
+    admin_cache = ChatAdminCache()
+
+    @router.chat_member()
+    async def on_member_role_changed(event) -> None:
+        admin_cache.invalidate(event.chat.id)
+        old = getattr(event, "old_chat_member", None)
+        new = getattr(event, "new_chat_member", None)
+        if old is None or new is None:
+            return
+        def present(member):
+            status = str(getattr(member.status, "value", member.status))
+            return status in {"member", "administrator", "creator"} or (
+                status == "restricted" and getattr(member, "is_member", False)
+            )
+        if not present(old) and present(new) and is_chat_allowed(settings, db, event.chat.id):
+            db.record_user_join(event.chat.id, new.user.id, int(event.date.timestamp()))
 
     # Cache our own bot id so we can distinguish "this is OUR bot replying" (skip,
     # we don't moderate our own messages) from "this is SOME OTHER bot posting"
@@ -96,6 +113,9 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
         # A `/start review_<id>` deep link (from the catch-up button on a timed-out
         # group vote) opens the private-chat review flow instead of the help text.
         payload = (command.args or "").strip()
+        if payload == REVIEW_PREFIX:
+            await show_reviews(message, settings, db)
+            return
         if payload.startswith(REVIEW_DEEPLINK_PREFIX):
             await _handle_review_deeplink(message, payload)
             return
@@ -254,6 +274,14 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
             return
         await message.answer(_whitelist_list(db, settings))
 
+    @router.message(Command("fingerprints"))
+    async def on_fingerprint_reviews(message: Message) -> None:
+        await show_reviews(message, settings, db)
+
+    @router.callback_query(F.data.startswith("fp:"))
+    async def on_fingerprint_review_action(callback: CallbackQuery) -> None:
+        await handle_review_callback(callback, settings, db)
+
     @router.message()
     async def on_message(message: Message) -> None:
         await _process_group_message(message, is_edit=False)
@@ -285,11 +313,15 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
         # whitelist is the right ergonomic answer for "this user is known to be safe,
         # never touch their messages". Applied to BOTH message events and new-member
         # events; we don't want to write fingerprints off a whitelisted user's text either.
-        sender_id = message.from_user.id if message.from_user else None
-        if sender_id is not None and _is_whitelisted_sender(db, settings, sender_id):
-            return
-
         new_members = _new_chat_members(message)
+        sender_id = message.from_user.id if message.from_user else None
+        if (
+            not new_members and sender_id is not None
+            and _is_whitelisted_sender(db, settings, sender_id)
+        ):
+            return
+        if not new_members and _is_anonymous_admin_message(message):
+            return
         bot_usernames: tuple[str, ...] = ()
         had_ad_invocation = False
         if (
@@ -371,6 +403,19 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
         bot_usernames: tuple[str, ...] = (),
         had_ad_invocation: bool = False,
     ) -> None:
+        if is_global_admin(settings, user.id):
+            return
+        admin_status = await admin_cache.is_admin(
+            message.bot, message.chat.id, user.id, is_bot=getattr(user, "is_bot", False)
+        )
+        if admin_status is True:
+            return
+        if update_type == "new_chat_member":
+            date = getattr(message, "date", None)
+            db.record_user_join(
+                message.chat.id, user.id,
+                int(date.timestamp()) if hasattr(date, "timestamp") else None,
+            )
         user_context = db.get_user_context(message.chat.id, user.id)
         sender_profile = await get_sender_profile(message.bot, db, user, settings)
         features = build_message_features(
@@ -380,6 +425,10 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
             default_reputation=settings.default_reputation,
         )
         features.metadata["update_type"] = update_type
+        features.metadata["user_trust"] = trust_context(user_context, settings)
+        if sender_profile.is_bot:
+            features.metadata["user_trust"]["is_trusted"] = False
+            features.metadata["user_trust"]["tier"] = "bot"
         db.purge_expired_edit_watch_snapshots()
         edit_snapshot = None
         if is_edit:
@@ -440,13 +489,7 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
 
         fingerprint = db.get_strongest_fingerprint(fingerprint_lookup_values(features))
         if fingerprint is not None:
-            new_weight = db.record_fingerprint_hit(
-                fingerprint.id,
-                weight_increment=settings.fingerprint_hit_weight_increment,
-                weight_cap=settings.fingerprint_hit_weight_cap,
-            )
-            if new_weight is not None and new_weight != fingerprint.weight:
-                fingerprint = replace(fingerprint, weight=new_weight)
+            db.record_fingerprint_hit(fingerprint.id)
 
         same_user_repeat_decision = _same_user_open_vote_repeat_decision(settings, db, features)
         repeat_decision = _repeat_decision(settings, db, features)
@@ -459,6 +502,10 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
         # Repeat shortcuts run before RuleEngine; long texts must get the same
         # contextual review even when one of those shortcuts supplied the hit.
         decision = route_long_message_to_llm(settings, features, decision)
+        decision = route_trusted_message_to_llm(features, decision)
+        local_decision = decision
+
+        confirmed_normal = False
 
         if decision.should_call_llm:
             try:
@@ -471,9 +518,36 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
                     error=f"{type(exc).__name__}: {exc}",
                 )
             if outcome.status == LLMOutcomeStatus.OK and outcome.judgement is not None:
+                confirmed_normal = outcome.judgement.is_spam is False
                 record_llm_spam_feedback(db, features, outcome.judgement, settings)
+                if fingerprint is not None:
+                    db.add_fingerprint_evidence(
+                        fingerprint.value, features,
+                        "llm_benign" if confirmed_normal else "llm_spam",
+                    )
+                    if outcome.judgement.is_spam:
+                        db.record_fingerprint_hit(
+                            fingerprint.id,
+                            weight_increment=settings.fingerprint_hit_weight_increment,
+                            weight_cap=settings.fingerprint_hit_weight_cap,
+                            count_hit=False,
+                        )
                 decision = _merge_llm_decision(decision, outcome.judgement, features, settings)
             decision = _annotate_with_llm_outcome(decision, outcome)
+
+        metadata = dict(decision.metadata)
+        metadata.setdefault("local_rule_reason", local_decision.metadata.get(
+            "local_rule_reason", local_decision.reason
+        ))
+        metadata["user_trust"] = features.metadata["user_trust"]
+        metadata["update_type"] = update_type
+        if fingerprint is not None:
+            metadata.setdefault("fingerprint_id", fingerprint.id)
+            metadata.setdefault("fingerprint_type", fingerprint.fingerprint_type)
+        if admin_status is None and decision.action in {DecisionAction.BAN, DecisionAction.WITHDRAW_VOTE}:
+            metadata["local_rule_reason"] = decision.reason
+            decision = replace(decision, action=DecisionAction.REVIEW, reason="admin_identity_unverified")
+        decision = replace(decision, metadata=metadata)
 
         if (
             update_type == "message"
@@ -497,14 +571,18 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
             update_type=update_type,
             is_edit=is_edit,
         )
+        if db.was_message_processed(features.chat_id, features.message_id):
+            reputation_reward = 0
         if reputation_reward:
             metadata = dict(decision.metadata)
             metadata["reputation_reward"] = reputation_reward
             decision = replace(decision, metadata=metadata)
 
         result = await actions.apply(message, features, decision)
-        if not is_edit:
-            db.record_message_seen(features, reputation_delta=reputation_reward)
+        if not is_edit and update_type == "message":
+            db.record_message_seen(
+                features, reputation_delta=reputation_reward, confirmed_normal=confirmed_normal
+            )
         db.record_observation(features)
         if sender_profile.is_bot:
             db.delete_edit_watch_snapshot(features.chat_id, features.message_id)
@@ -731,7 +809,7 @@ def _should_watch_edits(
     if getattr(sender_profile, "is_bot", False):
         return False
     return bool(
-        getattr(user_context, "messages_seen", 0) < EDIT_WATCH_MAX_MESSAGES
+        not trust_context(user_context, settings)["is_trusted"]
         or getattr(user_context, "reputation_score", 100)
         <= settings.low_reputation_threshold
     )
@@ -953,7 +1031,7 @@ def _same_user_open_vote_repeat_decision(
 ) -> LocalDecision | None:
     if features.user_id is None:
         return None
-    if features.sender_reputation >= settings.high_reputation_threshold:
+    if is_trusted_sender(features):
         return None
 
     sessions = db.list_vote_sessions_for_user(
@@ -1003,7 +1081,7 @@ def _repeat_decision(
 ) -> LocalDecision | None:
     if not features.links:
         return None
-    if features.sender_reputation >= settings.high_reputation_threshold:
+    if is_trusted_sender(features):
         return None
     # The empty-text hash collides across every empty/whitespace-normalized message.
     # Counting "distinct senders of the empty-skeleton hash" is meaningless — N new
@@ -1043,6 +1121,7 @@ def _merge_llm_decision(
     if local_decision.reason in {
         "message_personal_channel_crosscheck_needs_llm",
         "long_message_needs_llm",
+        "trusted_user_needs_llm",
     }:
         metadata = dict(local_decision.metadata)
         metadata.update(llm_decision.metadata)
