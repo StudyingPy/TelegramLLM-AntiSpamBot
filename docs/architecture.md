@@ -31,6 +31,11 @@
    personal channel forces an LLM hop with both contexts. The normal LLM thresholds then apply:
    high-confidence spam is auto-banned, medium-confidence spam opens a vote, and benign output is
    allowed. Having a personal channel by itself never changes the decision.
+   Messages with at least `LONG_MESSAGE_LLM_MIN_CHARS` non-whitespace/non-zero-width characters
+   (default 500) that would be locally banned or voted on are routed to LLM review instead,
+   including fingerprint and repeat shortcuts. Benign output releases them; LLM failure or
+   disablement leaves the message intact and logs review. Short-message rules retain their
+   existing behavior, except `几百`/`几千` are no longer hard advertising tokens.
    Bot-only invocation messages (one or more whitespace-separated `@...bot` usernames and no
    other content) are persisted separately. If a named bot responds with content classified as
    advertising, that invocation marks its human caller. The caller's next bot-only message bans

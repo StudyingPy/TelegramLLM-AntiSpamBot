@@ -39,7 +39,7 @@ from .notifications import (
 )
 from .og import fetch_og_for_features, should_fetch_og
 from .profile import fetch_personal_chat_for_crosscheck, get_sender_profile
-from .rules import RuleEngine, should_crosscheck_personal_channel
+from .rules import RuleEngine, route_long_message_to_llm, should_crosscheck_personal_channel
 
 
 logger = logging.getLogger(__name__)
@@ -456,6 +456,9 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
             or repeat_decision
             or rule_engine.evaluate(features, fingerprint=fingerprint)
         )
+        # Repeat shortcuts run before RuleEngine; long texts must get the same
+        # contextual review even when one of those shortcuts supplied the hit.
+        decision = route_long_message_to_llm(settings, features, decision)
 
         if decision.should_call_llm:
             try:
@@ -1037,7 +1040,10 @@ def _merge_llm_decision(
     settings: Settings,
 ) -> LocalDecision:
     llm_decision = decision_from_llm(judgement, features, settings)
-    if local_decision.reason == "message_personal_channel_crosscheck_needs_llm":
+    if local_decision.reason in {
+        "message_personal_channel_crosscheck_needs_llm",
+        "long_message_needs_llm",
+    }:
         metadata = dict(local_decision.metadata)
         metadata.update(llm_decision.metadata)
         return replace(llm_decision, metadata=metadata)

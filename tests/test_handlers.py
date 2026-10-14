@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from telegram_llm_antispam.db import Database
 from telegram_llm_antispam.handlers import (
     _admin_verify_keyboard,
@@ -26,6 +28,7 @@ from telegram_llm_antispam.handlers import (
 from telegram_llm_antispam.features import build_message_features
 from telegram_llm_antispam.models import (
     DecisionAction,
+    ActionResult,
     LLMJudgement,
     LLMOutcome,
     LLMOutcomeStatus,
@@ -1351,3 +1354,114 @@ def test_known_fingerprint_vote_survives_llm_not_spam():
 
     assert merged.action == DecisionAction.WITHDRAW_VOTE
     assert merged.reason == "known_fingerprint"
+
+
+@pytest.mark.parametrize(
+    "source, outcome_kind, expected_action",
+    [
+        ("body", "benign", DecisionAction.ALLOW),
+        ("body", "spam", DecisionAction.BAN),
+        ("body", "failed", DecisionAction.REVIEW),
+        ("body", "disabled", DecisionAction.REVIEW),
+        ("repeated_open_vote", "benign", DecisionAction.ALLOW),
+        ("repeated_senders", "benign", DecisionAction.ALLOW),
+        ("content_fingerprint", "benign", DecisionAction.ALLOW),
+    ],
+)
+def test_router_long_local_hits_use_llm_result(
+    tmp_path, monkeypatch, source, outcome_kind, expected_action
+):
+    import asyncio
+
+    applied = []
+    judged = []
+
+    async def capture_apply(_self, _message, _features, decision):
+        applied.append(decision)
+        return ActionResult()
+
+    monkeypatch.setattr(
+        "telegram_llm_antispam.handlers.ModerationActions.apply", capture_apply
+    )
+
+    class Judge:
+        async def judge(self, features):
+            judged.append(features.text)
+            if outcome_kind in {"failed", "disabled"}:
+                return LLMOutcome(
+                    status=(
+                        LLMOutcomeStatus.FAILED
+                        if outcome_kind == "failed"
+                        else LLMOutcomeStatus.DISABLED
+                    ),
+                    provider_count=1 if outcome_kind == "failed" else 0,
+                )
+            return LLMOutcome(
+                status=LLMOutcomeStatus.OK,
+                provider_count=1,
+                judgement=LLMJudgement(
+                    is_spam=outcome_kind == "spam",
+                    confidence=0.96,
+                    category="ads" if outcome_kind == "spam" else "benign",
+                ),
+            )
+
+    async def get_me():
+        return SimpleNamespace(id=7777)
+
+    async def get_chat(_user_id):
+        return SimpleNamespace(bio=None)
+
+    text = "这是宏观经济讨论的引用背景。" * 60 + "\n兼职与赚钱 https://example.org/article"
+    db = _db(tmp_path)
+    try:
+        db.allow_chat(-1001, "t", added_by_user_id=None)
+        message = SimpleNamespace(
+            message_id=100,
+            chat=SimpleNamespace(id=-1001, type="supergroup", title="t"),
+            from_user=SimpleNamespace(
+                id=42, is_bot=False, username="member", first_name="Member", last_name=None,
+            ),
+            text=text,
+            bot=SimpleNamespace(get_me=get_me, get_chat=get_chat),
+        )
+        features = build_message_features(message)
+        if source == "repeated_open_vote":
+            db.create_vote_session(
+                features,
+                LocalDecision(DecisionAction.WITHDRAW_VOTE, "known_fingerprint", 0.8),
+                timeout_seconds=60,
+            )
+        elif source == "repeated_senders":
+            for user_id in (10, 11):
+                prior = build_message_features(
+                    SimpleNamespace(
+                        message_id=user_id,
+                        chat=message.chat,
+                        from_user=SimpleNamespace(id=user_id),
+                        text=text,
+                    )
+                )
+                db.record_observation(prior)
+        elif source == "content_fingerprint":
+            db.upsert_fingerprint("content", features.content_hash, 90, "vote_confirmed")
+
+        router = create_router(_settings(), db, llm=Judge())
+        handler = next(item for item in router.message.handlers if not item.filters)
+        asyncio.run(handler.callback(message))
+
+        assert judged == [text]
+        assert len(applied) == 1
+        decision = applied[0]
+        assert decision.action == expected_action
+        assert decision.metadata["local_rule_reason"] == {
+            "body": "hard_spam_message",
+            "repeated_open_vote": "repeated_open_vote_message_same_user",
+            "repeated_senders": "repeated_skeleton_across_senders",
+            "content_fingerprint": "known_high_weight_fingerprint",
+        }[source]
+        assert decision.metadata["llm_outcome"]["status"] == (
+            outcome_kind if outcome_kind in {"failed", "disabled"} else "ok"
+        )
+    finally:
+        db.close()

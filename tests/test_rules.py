@@ -4,6 +4,8 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from telegram_llm_antispam.config import Settings
 from telegram_llm_antispam.features import build_message_features
 from telegram_llm_antispam.models import DecisionAction, FingerprintRecord, UserContext
@@ -556,6 +558,106 @@ def test_bot_contact_plus_payment_code_bans_without_llm():
     assert decision.action == DecisionAction.BAN
     assert decision.reason == "hard_spam_message"
     assert decision.should_call_llm is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["降低几千亿的出口退税", "出口几百万辆汽车"],
+)
+@pytest.mark.parametrize("source", ["body", "preview"])
+def test_generic_amounts_with_citation_do_not_hard_ban(text, source):
+    url = "http://mcrp.macrochina.cn/u/60/archives/2026/4314.html"
+    features = _features(f"{text} {url}" if source == "body" else "原文链接", url)
+    if source == "preview":
+        features.metadata["og_preview"] = {"title": text}
+
+    decision = RuleEngine(_settings()).evaluate(features)
+
+    assert decision.action == DecisionAction.REVIEW
+    assert decision.should_call_llm is True
+
+
+@pytest.mark.parametrize(
+    "length, action",
+    [(499, DecisionAction.BAN), (500, DecisionAction.REVIEW)],
+)
+def test_hard_spam_length_boundary_counts_non_whitespace_characters(length, action):
+    ad = "兼职 https://spam.example"
+    padding = "文" * (length - len("".join(ad.split())))
+    features = _features(f"\n {padding} \n {ad} \n")
+
+    decision = RuleEngine(_settings()).evaluate(features)
+
+    assert decision.action == action
+    assert decision.should_call_llm is (action == DecisionAction.REVIEW)
+    if action == DecisionAction.REVIEW:
+        assert decision.reason == "long_message_needs_llm"
+        assert decision.metadata["local_rule_reason"] == "hard_spam_message"
+        assert decision.metadata["message_length"] == length
+
+
+def test_whitespace_and_zero_width_padding_do_not_make_a_short_ad_long():
+    features = _features(" \n\u200b" * 600 + "@daishx1bot 拿码收钱来")
+
+    decision = RuleEngine(_settings()).evaluate(features)
+
+    assert decision.action == DecisionAction.BAN
+    assert decision.should_call_llm is False
+
+
+def test_long_message_length_threshold_is_configurable():
+    settings = replace(_settings(), long_message_llm_min_chars=20)
+
+    decision = RuleEngine(settings).evaluate(_features("兼职 https://spam.example"))
+
+    assert decision.action == DecisionAction.REVIEW
+    assert decision.reason == "long_message_needs_llm"
+
+
+@pytest.mark.parametrize("kind", ["content", "skeleton", "phrase"])
+def test_long_fingerprint_hits_require_llm_instead_of_local_enforcement(kind):
+    features = _features("宏观经济讨论。" * 100)
+    fingerprint = FingerprintRecord(
+        id=18,
+        fingerprint_type=kind,
+        value=features.content_hash if kind == "content" else features.skeleton_hash,
+        weight=90,
+        hit_count=1,
+        false_positive_count=0,
+        source="vote_confirmed",
+    )
+
+    decision = RuleEngine(_settings()).evaluate(features, fingerprint)
+
+    assert decision.action == DecisionAction.REVIEW
+    assert decision.reason == "long_message_needs_llm"
+    assert decision.should_call_llm is True
+    assert decision.metadata["fingerprint_id"] == 18
+    assert decision.metadata["local_rule_action"] == (
+        "ban" if kind == "content" else "withdraw_vote"
+    )
+
+
+@pytest.mark.parametrize("source", ["preview", "profile", "edited", "obfuscated"])
+def test_long_contextual_rule_hits_require_llm(source):
+    features = _features("宏观经济讨论。" * 100, "https://example.org/article")
+    if source == "preview":
+        features.metadata["og_preview"] = {"title": "成人版 看片"}
+    elif source == "profile":
+        features.metadata["sender_profile"] = {
+            "bio": "日赚过万 https://t.me/spam",
+            "username": "兼职招聘",
+        }
+    elif source == "edited":
+        features.metadata["edited_from"] = {"text": "原来的正常消息"}
+    else:
+        features = _features(features.text + "近裙 @example")
+
+    decision = RuleEngine(_settings()).evaluate(features)
+
+    assert decision.action == DecisionAction.REVIEW
+    assert decision.reason == "long_message_needs_llm"
+    assert decision.should_call_llm is True
 
 
 def test_hard_spam_message_overrides_review_weight_fingerprint():

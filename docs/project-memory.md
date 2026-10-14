@@ -50,3 +50,51 @@
   display name or username may be locally banned. A suspicious Bio without username
   corroboration goes through the LLM; weak patterns such as a personal-channel link or
   `私聊：@xxxbot` do not create a profile-spam decision by themselves.
+
+## Economic-article hard-rule false positive (2026-10-14)
+
+- Reports 19672/19674 used `hard_spam_message`. This is a local keyword rule with
+  fixed confidence 0.96 and `should_call_llm=False`, not an LLM judgement. Replaying
+  the linked MacroChina article (`/u/60/archives/2026/4314.html`) reproduces BAN:
+  `降低几千亿的出口退税` matches `几千`; `出口几百万辆汽车` matches `几百`;
+  the citation URL satisfies the generic carrier check.
+- Notification bodies stop at 800 characters and BAN log snapshots at 500, while
+  these hits occur after character 2600. Future diagnostics should record matched
+  tokens, bounded context windows and carrier type, not only the opening text.
+- Implemented conservative mitigation: remove only `几百`/`几千` from hard tokens.
+  `LONG_MESSAGE_LLM_MIN_CHARS` defaults to 500 non-whitespace/non-zero-width message
+  characters. Long local BAN/WITHDRAW_VOTE hits become `REVIEW` with LLM enabled;
+  benign output releases, spam uses the normal thresholds, and failure/disabled
+  output leaves a logged review without destructive action. Short rules stay intact.
+- Apply the length guard both at RuleEngine's return and after handler repeat
+  shortcuts, before calling the model. This covers content/phrase fingerprints,
+  body/OG/profile rules, suspicious edits and repeats. Preserve original local-rule
+  evidence in metadata when merging the LLM result. Using `WITHDRAW_VOTE` as the
+  long-text fallback would keep a vote even after the model says benign.
+- `WHITELIST_DOMAINS` currently does not bypass hard body/OG rules; the rule engine's
+  `_has_non_whitelisted_link` helper has no callers. A domain setting alone is not
+  a fix for this incident. Attribution or message length must not grant blanket immunity.
+
+## Windows test runtime
+
+- Use `.venv/Scripts/python.exe` and `.venv/Scripts/ruff.exe`. In the restricted
+  Windows sandbox, async tests can hang before executing their coroutine because
+  `asyncio`'s event-loop `socketpair()` blocks in `socket.accept()`. A pytest
+  `faulthandler_timeout` identifies this; run the mocked test suite outside the
+  sandbox instead of changing application/event-loop code to work around it.
+
+## Production deployment
+
+- SSH alias: `OP-JP-Own` in `C:/Users/1/.ssh/config` (root, port 22). It uses
+  `C:/Users/1/.ssh/op_jp_own_ed25519` and an explicit Ncat SOCKS5 ProxyCommand via
+  `127.0.0.1:2235`. Use the existing alias; do not restore global proxy variables.
+- Application: `/opt/telegram-llm-antispam-bot`; service/user:
+  `telegram-llm-antispam-bot.service` / `antispambot`; production branch: `main`.
+  Check the remote worktree is clean and its HEAD first. Push the intended commit,
+  then run `ssh OP-JP-Own "sudo bash /opt/telegram-llm-antispam-bot/deploy/install.sh update"`.
+  This keeps `.env`, skips reinstall when the committed dependency fingerprint is
+  unchanged, initializes the database and restarts systemd. Verify deployed HEAD,
+  `systemctl is-active`, startup logs and bot polling after the restart.
+- Local Git HTTPS network commands need per-command
+  `git -c http.proxy=http://127.0.0.1:2235 ...`. Keep unrelated JEV files, `.gitignore`,
+  `pyproject.toml` and pre-existing memory edits out of production commits.

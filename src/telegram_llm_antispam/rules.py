@@ -6,7 +6,7 @@ from .config import Settings
 from .fingerprints import LOW_ENTROPY_SKELETON_HASHES, stable_hash
 from .links import is_whitelisted_domain
 from .models import DecisionAction, FingerprintRecord, LocalDecision, MessageFeatures
-from .text import normalize_text
+from .text import normalize_text, strip_zero_width
 
 
 # stable_hash("") — any fingerprint stored under this value is a universal trap
@@ -37,6 +37,14 @@ class RuleEngine:
         self._settings = settings
 
     def evaluate(
+        self,
+        features: MessageFeatures,
+        fingerprint: FingerprintRecord | None = None,
+    ) -> LocalDecision:
+        decision = self._evaluate(features, fingerprint)
+        return route_long_message_to_llm(self._settings, features, decision)
+
+    def _evaluate(
         self,
         features: MessageFeatures,
         fingerprint: FingerprintRecord | None = None,
@@ -185,6 +193,41 @@ class RuleEngine:
         return False
 
 
+def route_long_message_to_llm(
+    settings: Settings,
+    features: MessageFeatures,
+    decision: LocalDecision,
+) -> LocalDecision:
+    """Require contextual review before enforcing a local hit on a long message."""
+    if decision.action not in {DecisionAction.BAN, DecisionAction.WITHDRAW_VOTE}:
+        return decision
+
+    # Count visible content, including numbers; whitespace/zero-width padding must
+    # not move an otherwise short ad onto the long-message path.
+    text_length = len("".join(strip_zero_width(features.text).split()))
+    if text_length < max(1, settings.long_message_llm_min_chars):
+        return decision
+
+    metadata = dict(decision.metadata)
+    metadata.update(
+        {
+            "local_rule_reason": decision.reason,
+            "local_rule_action": decision.action.value,
+            "local_rule_confidence": decision.confidence,
+            "message_length": text_length,
+        }
+    )
+    # REVIEW lets the LLM release legitimate quotations. If the model is disabled
+    # or fails, log the suspicion without deleting, banning or opening a vote.
+    return LocalDecision(
+        action=DecisionAction.REVIEW,
+        reason="long_message_needs_llm",
+        confidence=decision.confidence,
+        should_call_llm=True,
+        metadata=metadata,
+    )
+
+
 # Hard signals split into two tiers:
 #
 # STRONG tokens almost only appear in ads / fraud / 引流 copy. In a Bio they are
@@ -210,8 +253,6 @@ _STRONG_SPAM_TOKENS = (
     "兼职",
     "赚钱",
     "几分钟赚",
-    "几百",
-    "几千",
     "成人版",
     "成人片",
     "裸聊",

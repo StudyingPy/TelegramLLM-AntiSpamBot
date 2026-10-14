@@ -112,6 +112,8 @@ class Settings:
     profile_bio_fetch_enabled: bool
     profile_bio_cache_ttl_seconds: int
 
+    long_message_llm_min_chars: int = 500
+
     @property
     def has_newapi(self) -> bool:
         return bool(self.newapi_base_url and self.newapi_api_key and self.newapi_model)
@@ -175,4 +177,5 @@ class Settings:
             og_fetch_max_redirects=_env_int("OG_FETCH_MAX_REDIRECTS", 3),
             profile_bio_fetch_enabled=_env_bool("PROFILE_BIO_FETCH_ENABLED", True),
             profile_bio_cache_ttl_seconds=_env_int("PROFILE_BIO_CACHE_TTL_SECONDS", 604_800),
+            long_message_llm_min_chars=_env_int("LONG_MESSAGE_LLM_MIN_CHARS", 500),
         )
