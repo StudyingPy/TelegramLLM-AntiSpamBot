@@ -74,6 +74,15 @@
 
 ## Phase Status
 
+The optional Jev observation implementation defaults to disabled. Its default
+`JEV_MODE=off` creates no observation database or requests. Opt-in `shadow` freezes
+the existing model payload, runs Jev first, then the existing LLM with the same
+content. Only the existing LLM result reaches decision merging, reputation rewards
+and fingerprint learning. A separate expiring SQLite sidecar stores input snapshots,
+model results, final action links and explicit human annotations. Jev has no
+enforcement mode. See [Jev observation](jev-online-observation.md) for configuration,
+failure behavior, reporting and the limits of accuracy claims.
+
 - Phase 0 is wired: bot runner, SQLite schema, permission checks, message pipeline.
 - Phase 1 is wired: local extraction and hard rules.
 - Phase 2 is wired: `llm.py` calls OpenAI-compatible NewAPI gateways when `NEWAPI_*`

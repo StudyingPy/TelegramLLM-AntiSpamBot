@@ -24,6 +24,7 @@ from .features import build_message_features
 from .fingerprint_audit import REVIEW_PREFIX, handle_review_callback, show_reviews
 from .fingerprints import is_low_entropy_skeleton
 from .llm import LLMJudge, NullLLMJudge, decision_from_llm
+from .jev_observation import JevObserver
 from .models import (
     DecisionAction,
     LLMJudgement,
@@ -68,7 +69,10 @@ _BOT_ONLY_MESSAGE_RE = re.compile(
 _BOT_MENTION_RE = re.compile(rf"@({_BOT_USERNAME})", re.IGNORECASE)
 
 
-def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None) -> Router:
+def create_router(
+    settings: Settings, db: Database, llm: LLMJudge | None = None,
+    jev_observer: JevObserver | None = None,
+) -> Router:
     router = Router(name="moderation")
     rule_engine = RuleEngine(settings)
     llm_judge = llm or NullLLMJudge()
@@ -506,10 +510,14 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
         local_decision = decision
 
         confirmed_normal = False
+        observation_id = None
 
         if decision.should_call_llm:
             try:
-                outcome = await llm_judge.judge(features)
+                if jev_observer is not None:
+                    outcome, observation_id = await jev_observer.compare(features, decision, llm_judge)
+                else:
+                    outcome = await llm_judge.judge(features)
             except Exception as exc:  # defense-in-depth: judge() should not raise.
                 logger.warning("LLM judgement raised unexpectedly, treating as failure: %s", exc)
                 outcome = LLMOutcome(
@@ -534,6 +542,13 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
                         )
                 decision = _merge_llm_decision(decision, outcome.judgement, features, settings)
             decision = _annotate_with_llm_outcome(decision, outcome)
+        elif jev_observer is not None:
+            # Optional measurement of rules that bypass the original model;
+            # never manufacture an original-model judgement for these messages.
+            try:
+                _, observation_id = await jev_observer.compare(features, decision, llm_judge)
+            except Exception as exc:
+                logger.warning("Jev bypass observation failed (%s)", type(exc).__name__)
 
         metadata = dict(decision.metadata)
         metadata.setdefault("local_rule_reason", local_decision.metadata.get(
@@ -541,6 +556,8 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
         ))
         metadata["user_trust"] = features.metadata["user_trust"]
         metadata["update_type"] = update_type
+        if observation_id is not None:
+            metadata["jev_observation_id"] = observation_id
         if fingerprint is not None:
             metadata.setdefault("fingerprint_id", fingerprint.id)
             metadata.setdefault("fingerprint_type", fingerprint.fingerprint_type)
@@ -579,6 +596,11 @@ def create_router(settings: Settings, db: Database, llm: LLMJudge | None = None)
             decision = replace(decision, metadata=metadata)
 
         result = await actions.apply(message, features, decision)
+        if jev_observer is not None:
+            try:
+                jev_observer.record_final(observation_id, decision, result)
+            except Exception as exc:
+                logger.warning("Jev final observation failed (%s)", type(exc).__name__)
         if not is_edit and update_type == "message":
             db.record_message_seen(
                 features, reputation_delta=reputation_reward, confirmed_normal=confirmed_normal

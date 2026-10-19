@@ -163,6 +163,7 @@ class LLMOutcome:
     provider_count: int = 0
     judgement: LLMJudgement | None = None
     error: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_spam(self) -> bool:

@@ -604,6 +604,9 @@ class ModerationActions:
             original_message_ids = _unique_ints((*original_message_ids, *additional_message_ids))
 
         metadata["related_vote_session_ids"] = [session.id for session in sessions]
+        # Persist the actual human click target. List order and sibling statuses
+        # are not evidence that each individual message was reviewed.
+        metadata["primary_vote_session_id"] = primary_session_id
         metadata["deleted_original_message_ids"] = []
         metadata["deleted_vote_message_ids"] = []
         metadata["delete_errors"] = []

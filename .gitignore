@@ -32,6 +32,8 @@ env/
 # ============================================================================
 .env
 .env.local
+.env.bak-*
+.env.jev-next
 data/
 *.db
 *.db-journal
@@ -39,6 +41,15 @@ data/
 *.db-shm
 logs/
 *.log
+
+# Offline Jev evaluation outputs may contain real Telegram messages.
+jev-eval-output/
+jev-eval-live*/
+jev-audit-output/
+eval-output/
+dataset.jsonl
+predictions.jsonl
+comparison.csv
 
 # 部署私有覆盖配置（settings.local.yaml / persona.local.yaml 等）
 # 跟 .env / .env.local 一个套路：默认值随仓库走，私有覆盖 VPS 各自维护

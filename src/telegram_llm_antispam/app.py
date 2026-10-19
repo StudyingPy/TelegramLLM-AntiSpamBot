@@ -14,6 +14,7 @@ from .config import Settings
 from .db import Database
 from .handlers import create_router
 from .llm import create_llm_judge
+from .jev_observation import create_jev_observer
 from .fingerprint_audit import sweep_fingerprints
 from .logging_config import configure_logging
 
@@ -38,7 +39,8 @@ async def run() -> None:
     )
     dispatcher = Dispatcher()
     judge = create_llm_judge(settings)
-    dispatcher.include_router(create_router(settings, db, llm=judge))
+    jev_observer = create_jev_observer(settings)
+    dispatcher.include_router(create_router(settings, db, llm=judge, jev_observer=jev_observer))
     await bot.set_my_commands(
         [
             BotCommand(command="start", description="显示帮助"),
@@ -66,6 +68,8 @@ async def run() -> None:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         db.close()
+        if jev_observer is not None:
+            jev_observer.store.close()
         await bot.session.close()
 
 

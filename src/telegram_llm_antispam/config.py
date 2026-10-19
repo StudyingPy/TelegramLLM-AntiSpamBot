@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -121,6 +121,19 @@ class Settings:
     fingerprint_audit_batch_size: int = 10
     fingerprint_review_user_id: int = 5439265612
 
+    jev_mode: str = "off"
+    jev_api_key: str | None = field(default=None, repr=False)
+    jev_model: str = "jev-1.13.0"
+    jev_proxy_url: str | None = None
+    jev_timeout_seconds: float = 3.0
+    jev_chat_ids: tuple[int, ...] = ()
+    jev_sample_rate: float = 0.1
+    jev_max_concurrent: int = 2
+    jev_max_calls_per_day: int = 200
+    jev_retention_days: int = 7
+    jev_observe_local_bypass: bool = False
+    jev_observation_path: Path = Path("data/jev-observations.db")
+
     @property
     def has_newapi(self) -> bool:
         return bool(self.newapi_base_url and self.newapi_api_key and self.newapi_model)
@@ -192,4 +205,16 @@ class Settings:
             fingerprint_audit_max_per_run=_env_int("FINGERPRINT_AUDIT_MAX_PER_RUN", 1000),
             fingerprint_audit_batch_size=_env_int("FINGERPRINT_AUDIT_BATCH_SIZE", 10),
             fingerprint_review_user_id=_env_int("FINGERPRINT_REVIEW_USER_ID", 5439265612),
+            jev_mode=os.getenv("JEV_MODE", "off").strip().lower(),
+            jev_api_key=os.getenv("JEV_API_KEY") or os.getenv("TYPESAFE_API_KEY") or None,
+            jev_model=os.getenv("JEV_MODEL", "jev-1.13.0"),
+            jev_proxy_url=os.getenv("JEV_PROXY_URL") or None,
+            jev_timeout_seconds=_env_float("JEV_TIMEOUT_SECONDS", 3.0),
+            jev_chat_ids=_env_int_tuple("JEV_CHAT_IDS"),
+            jev_sample_rate=_env_float("JEV_SAMPLE_RATE", 0.1),
+            jev_max_concurrent=_env_int("JEV_MAX_CONCURRENT", 2),
+            jev_max_calls_per_day=_env_int("JEV_MAX_CALLS_PER_DAY", 200),
+            jev_retention_days=_env_int("JEV_RETENTION_DAYS", 7),
+            jev_observe_local_bypass=_env_bool("JEV_OBSERVE_LOCAL_BYPASS", False),
+            jev_observation_path=Path(os.getenv("JEV_OBSERVATION_PATH", "data/jev-observations.db")),
         )

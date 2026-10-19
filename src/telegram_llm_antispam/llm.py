@@ -54,6 +54,9 @@ class NullLLMJudge:
     async def audit_fingerprints(self, payloads: list[dict]) -> FingerprintAuditOutcome:
         return FingerprintAuditOutcome(status=LLMOutcomeStatus.DISABLED)
 
+    async def judge_payload(self, feature_payload: dict[str, object]) -> LLMOutcome:
+        return LLMOutcome(status=LLMOutcomeStatus.DISABLED, provider_count=0)
+
 
 @dataclass(frozen=True, slots=True)
 class NewAPIProvider:
@@ -117,15 +120,19 @@ class NewAPIJudge:
         return FingerprintAuditOutcome(status=LLMOutcomeStatus.FAILED, error=error)
 
     async def judge(self, features: MessageFeatures) -> LLMOutcome:
-        feature_payload = _feature_payload(features)
+        return await self.judge_payload(_feature_payload(features))
+
+    async def judge_payload(self, feature_payload: dict[str, object]) -> LLMOutcome:
+        """Use the exact frozen input shared with the optional Jev observer."""
         last_error: str | None = None
         for index, provider in enumerate(self._providers, start=1):
-            judgement, error = await self._judge_with_provider(provider, feature_payload, index)
+            judgement, error, metadata = await self._judge_with_provider(provider, feature_payload, index)
             if judgement is not None:
                 return LLMOutcome(
                     status=LLMOutcomeStatus.OK,
                     provider_count=len(self._providers),
                     judgement=judgement,
+                    metadata=metadata,
                 )
             if error is not None:
                 last_error = error
@@ -144,7 +151,7 @@ class NewAPIJudge:
         provider: NewAPIProvider,
         feature_payload: dict[str, object],
         index: int,
-    ) -> tuple[LLMJudgement | None, str | None]:
+    ) -> tuple[LLMJudgement | None, str | None, dict]:
         # Per-call client mirrors Telegram-PresenceD vision.py: small create+close cost
         # in exchange for sidestepping every long-lived-session pitfall (stale
         # connections, DNS cache poisoning, pool exhaustion). Reverse-cost-benefit
@@ -170,7 +177,7 @@ class NewAPIJudge:
                 provider.base_url,
             )
             await _safe_close(client)
-            return None, f"timeout after {elapsed:.1f}s (limit {self._timeout:.1f}s)"
+            return None, f"timeout after {elapsed:.1f}s (limit {self._timeout:.1f}s)", {}
         except APIConnectionError as exc:
             elapsed = time.monotonic() - start
             logger.warning(
@@ -181,7 +188,7 @@ class NewAPIJudge:
                 exc,
             )
             await _safe_close(client)
-            return None, f"connection_error after {elapsed:.1f}s: {exc}"
+            return None, f"connection_error after {elapsed:.1f}s: {exc}", {}
         except OpenAIError as exc:
             elapsed = time.monotonic() - start
             logger.warning(
@@ -192,7 +199,7 @@ class NewAPIJudge:
                 exc,
             )
             await _safe_close(client)
-            return None, f"api_error after {elapsed:.1f}s: {type(exc).__name__}: {exc}"
+            return None, f"api_error after {elapsed:.1f}s: {type(exc).__name__}: {exc}", {}
         except Exception as exc:  # defense in depth: SDK must never crash the bot loop
             elapsed = time.monotonic() - start
             logger.warning(
@@ -203,7 +210,7 @@ class NewAPIJudge:
                 exc,
             )
             await _safe_close(client)
-            return None, f"unexpected_error after {elapsed:.1f}s: {type(exc).__name__}: {exc}"
+            return None, f"unexpected_error after {elapsed:.1f}s: {type(exc).__name__}: {exc}", {}
 
         content = _extract_message_content(response)
         await _safe_close(client)
@@ -214,11 +221,19 @@ class NewAPIJudge:
                 index,
                 provider.base_url,
             )
-            return None, "empty content"
+            return None, "empty content", {}
 
         try:
             data = _loads_json_object(content)
-            return _parse_judgement(data), None
+            usage = getattr(response, "usage", None)
+            return _parse_judgement(data), None, {
+                "requested_model": provider.model,
+                "resolved_model": getattr(response, "model", None) or provider.model,
+                "provider_index": index,
+                "elapsed_ms": round((time.monotonic() - start) * 1000, 2),
+                "usage": {key: getattr(usage, key, None) for key in
+                          ("prompt_tokens", "completion_tokens", "total_tokens")},
+            }
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             logger.warning(
                 "NewAPI provider %s returned invalid judgement JSON (%s): %s",
@@ -226,7 +241,7 @@ class NewAPIJudge:
                 provider.base_url,
                 exc,
             )
-            return None, f"parse_error: {type(exc).__name__}: {exc}"
+            return None, f"parse_error: {type(exc).__name__}: {exc}", {}
 
     def _build_client(self, provider: NewAPIProvider) -> AsyncOpenAI:
         # aiapi.fengshengxiu.club blocks the SDK's default AsyncOpenAI UA.
