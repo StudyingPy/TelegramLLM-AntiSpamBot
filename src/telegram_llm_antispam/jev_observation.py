@@ -317,13 +317,15 @@ def create_jev_observer(settings: Settings) -> JevObserver | None:
         )
         store = None
     logger.info(
-        "Jev %s enabled: model=%s chats=%s sample_rate=%s daily_limit=%s timeout=%ss",
+        "Jev %s enabled: model=%s chats=%s sample_rate=%s daily_limit=%s timeout=%ss policy=%s questions_hash=%s",
         settings.jev_mode,
         settings.jev_model,
         "all_moderated_model_requests" if settings.jev_mode == "review" else settings.jev_chat_ids,
         1 if settings.jev_mode == "review" else settings.jev_sample_rate,
         "none" if settings.jev_mode == "review" else settings.jev_max_calls_per_day,
         settings.jev_timeout_seconds,
+        POLICY_VERSION,
+        QUESTIONS_HASH,
     )
     return JevObserver(
         settings,

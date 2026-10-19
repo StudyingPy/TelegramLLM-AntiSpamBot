@@ -151,10 +151,24 @@ def test_separate_database_and_secret_repr(tmp_path):
 
 def test_questions_preserve_original_chinese_boundaries():
     for question in QUESTIONS.values():
-        assert "近裙" in question["instructions"]
         assert "personal_chat" in question["instructions"]
-        assert "空正文不能仅凭 Bio" in question["instructions"]
+        assert "仅广告Bio不能把正常正文或空正文判为广告" in question["instructions"]
+        assert "引用举报或玩笑不算" in question["instructions"]
         assert "JSON schema" not in question["instructions"]
+
+
+def test_production_questions_match_evaluated_short_zh_full():
+    from telegram_llm_antispam.jev import LEGACY_QUESTIONS, QUESTIONS_HASH
+    from telegram_llm_antispam.jev_prompt_lab import VARIANTS
+
+    assert QUESTIONS == VARIANTS["short_zh_full"]["questions"]
+    assert VARIANTS["short_zh_full"]["input"] == "full"
+    assert QUESTIONS_HASH != digest(LEGACY_QUESTIONS)
+    assert QUESTIONS_HASH == "c6163e85797b1001f9dd2d6a1aa8fd776f31fe22ce2294093ac8c6d3d343cbdd"
+    assert (
+        digest(LEGACY_QUESTIONS)
+        == "cc20caa12b86126ea7ee313ef3ad7f073044bec337992a7d0f3765c512f3a677"
+    )
 
 
 @pytest.mark.parametrize(

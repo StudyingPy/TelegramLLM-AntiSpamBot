@@ -77,9 +77,13 @@ flowchart TD
 `{model, state, questions}`，没有使用 OpenAI Chat Completions 模拟。
 默认固定 `jev-1.13.0`；配置要求精确版本，禁止 `jev-latest` 漂移。
 
-Questions 对所有样本一致。以现有中文 `_SYSTEM_PROMPT` 的语义规则为基础，去掉原 JSON 输出格式要求，
-补充不可信输入及“账号资料有广告不等于本条消息有广告”的边界。保留隐晦推广、混淆字符、
-OG、个人频道、空正文/Bio 和普通讨论等现有政策。
+Questions 对所有样本一致。2026-10-20 用户授权切换为实验 `short_zh_full` 的原样 Questions：
+`telegram-message-short-zh-v2`，SHA-256 为
+`c6163e85797b1001f9dd2d6a1aa8fd776f31fe22ce2294093ac8c6d3d343cbdd`。
+中文短问题聚焦当前消息的主动推广/招揽意图，保留普通讨论、引用、玩笑、Bio 不能单独定罪和不可信输入边界。
+完整正文、Bio、OG、个人频道、编辑前文等输入不删减，MiMo 仍使用原 `_SYSTEM_PROMPT` 独立复核。
+旧长政策以 `LEGACY_QUESTIONS` 保留，实验中的原方案对照不会因部署而悄悄改成新提示词。
+新旧 Questions 哈希分别统计，不把实验小样本中的分数提升视为已验证的真实正确率提升。
 
 - `is_spam`：Noul，判断当前消息主动广告或商业引流，主判断取 Noul ≥0.5。
 - `category`：Choice，`ads/scam/porn/gambling/crypto/traffic_diversion/mass_mention/benign/unknown`。
