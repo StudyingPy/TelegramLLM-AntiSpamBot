@@ -541,6 +541,11 @@ def create_router(
                             count_hit=False,
                         )
                 decision = _merge_llm_decision(decision, outcome.judgement, features, settings)
+            elif jev_observer is not None and jev_observer.requires_review:
+                decision = replace(
+                    decision, action=DecisionAction.REVIEW, reason="mimo_review_unavailable",
+                    should_call_llm=False,
+                )
             decision = _annotate_with_llm_outcome(decision, outcome)
         elif jev_observer is not None:
             # Optional measurement of rules that bypass the original model;
@@ -1236,6 +1241,8 @@ def _annotate_with_llm_outcome(decision: LocalDecision, outcome: LLMOutcome) -> 
         "provider_count": outcome.provider_count,
         "error": outcome.error,
     }
+    if "model_chain" in outcome.metadata:
+        metadata["model_chain"] = outcome.metadata["model_chain"]
     if outcome.judgement is not None:
         metadata["llm_outcome"].update(
             {

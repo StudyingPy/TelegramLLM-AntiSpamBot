@@ -499,7 +499,10 @@ def test_report_separates_versions_and_profile_tasks(tmp_path):
 
 
 @pytest.mark.parametrize("baseline_spam", [False, True])
-def test_real_handler_actions_reputation_and_learning_use_baseline_only(tmp_path, baseline_spam):
+@pytest.mark.parametrize("mode", ["shadow", "review", "review_failure"])
+def test_real_handler_actions_reputation_and_learning_use_baseline_only(
+    tmp_path, baseline_spam, mode, monkeypatch
+):
     from telegram_llm_antispam.db import Database
     from telegram_llm_antispam.handlers import create_router
 
@@ -508,6 +511,19 @@ def test_real_handler_actions_reputation_and_learning_use_baseline_only(tmp_path
     db.migrate()
     ob = observer(tmp_path, Client(p=0.01 if baseline_spam else 0.99))
     base = Baseline(spam=baseline_spam)
+    if mode.startswith("review"):
+        ob.settings = replace(ob.settings, jev_mode="review", jev_chat_ids=(), jev_sample_rate=0.01)
+    if mode == "review_failure":
+        base = Baseline(status=LLMOutcomeStatus.FAILED)
+        from telegram_llm_antispam.rules import RuleEngine
+
+        monkeypatch.setattr(
+            RuleEngine,
+            "evaluate",
+            lambda *args, **kwargs: LocalDecision(
+                DecisionAction.BAN, "local_hit_needs_model", 0.96, True
+            ),
+        )
     calls = []
 
     async def get_me():
@@ -575,13 +591,35 @@ def test_real_handler_actions_reputation_and_learning_use_baseline_only(tmp_path
             learned = conn.execute("SELECT COUNT(*) FROM fingerprints").fetchone()[0]
         rows, _ = read_observations(ob.settings.jev_observation_path)
         assert len(rows) == len(base.inputs) == 1
-        assert rows[0]["final"]["action"] == ("ban" if baseline_spam else "allow")
+        expected = "review" if mode == "review_failure" else "ban" if baseline_spam else "allow"
+        assert rows[0]["final"]["action"] == expected
         assert json.loads(actions[0]["metadata_json"])["jev_observation_id"] == rows[0]["id"]
-        if baseline_spam:
+        if mode == "review_failure":
+            assert not calls and not learned and context.reputation_score == 50
+            assert rows[0]["final"]["reason"] == "mimo_review_unavailable"
+        elif baseline_spam:
             assert "ban" in calls and context.reputation_score <= 50 and learned > 0
         else:
             assert calls == [] and learned == 0
             assert context.reputation_score == 50 + ob.settings.normal_message_reputation_reward
+        if mode.startswith("review"):
+            chain = json.loads(actions[0]["metadata_json"])["model_chain"]
+            assert chain["primary"] == "jev" and chain["reviewer"] == "mimo"
+            assert chain["decision_source"] == (
+                "pending_review" if mode == "review_failure" else "mimo_review"
+            )
+            from telegram_llm_antispam.notifications import _format_llm_section
+
+            shown = _format_llm_section(
+                LocalDecision(
+                    DecisionAction.REVIEW,
+                    "test",
+                    0,
+                    metadata=json.loads(actions[0]["metadata_json"]),
+                )
+            )
+            assert "Jev初审" in shown and "MiMo复核" in shown
+            assert ("复核未完成" if mode == "review_failure" else "结论不一致") in shown
     finally:
         ob.store.close()
         db.close()
@@ -680,3 +718,100 @@ def test_frozen_baseline_payload_preserves_sdk_contract_and_model_usage(tmp_path
     assert result.metadata["resolved_model"] == "actual-model-version"
     assert result.metadata["usage"]["total_tokens"] == 120
     assert client.closed
+
+
+def test_review_routes_all_requests_without_sampling_cache_or_daily_skips(tmp_path):
+    ob = observer(tmp_path, jev_max_calls_per_day=1)
+    ob.settings = replace(ob.settings, jev_mode="review", jev_chat_ids=(), jev_sample_rate=0.00001)
+    base = Baseline()
+
+    async def run():
+        for _ in range(3):
+            await ob.compare(features(), LOCAL, base)
+
+    try:
+        asyncio.run(run())
+        assert len(ob.client.inputs) == len(base.inputs) == 3
+        rows, _ = read_observations(ob.settings.jev_observation_path)
+        assert all(r["sampling_probability"] == 1 and r["mode"] == "review" for r in rows)
+        assert all(r["jev"]["api_attempted"] for r in rows)
+    finally:
+        ob.close()
+
+
+def test_review_queues_when_full_and_waits_before_mimo(tmp_path):
+    sequence = []
+
+    class Queued(Client):
+        async def decide(self, state):
+            sequence.append(("jev", state["raw_text"]))
+            assert ob._active == 1
+            await asyncio.sleep(0.01)
+            return await super().decide(state)
+
+    class Reviewer(Baseline):
+        async def judge_payload(self, payload):
+            sequence.append(("mimo", payload["raw_text"]))
+            return await super().judge_payload(payload)
+
+    ob = observer(tmp_path, Queued(), jev_max_concurrent=1)
+    ob.settings = replace(ob.settings, jev_mode="review")
+    base = Reviewer()
+
+    async def run():
+        await asyncio.gather(*(ob.compare(features(str(i)), LOCAL, base) for i in range(3)))
+
+    try:
+        asyncio.run(run())
+        assert len(ob.client.inputs) == len(base.inputs) == 3
+        for i in range(3):
+            assert sequence.index(("jev", str(i))) < sequence.index(("mimo", str(i)))
+        rows, _ = read_observations(ob.settings.jev_observation_path)
+        assert all(r["jev"]["status"] == "ok" and r["jev"]["queue_ms"] >= 0 for r in rows)
+    finally:
+        ob.close()
+
+
+@pytest.mark.parametrize("storage", ["closed", "missing"])
+def test_review_storage_failure_does_not_remove_primary(tmp_path, storage):
+    ob = observer(tmp_path)
+    ob.settings = replace(ob.settings, jev_mode="review")
+    ob.store.close()
+    if storage == "missing":
+        ob.store = None
+    base = Baseline()
+    outcome, oid = asyncio.run(ob.compare(features(), LOCAL, base))
+    assert len(ob.client.inputs) == len(base.inputs) == 1 and oid is None
+    assert outcome.metadata["model_chain"]["decision_source"] == "mimo_review"
+
+
+def test_review_primary_failure_still_requires_independent_reviewer(tmp_path):
+    ob = observer(tmp_path, Client(fail=TimeoutError()))
+    ob.settings = replace(ob.settings, jev_mode="review")
+    base = Baseline()
+    try:
+        outcome, _ = asyncio.run(ob.compare(features(), LOCAL, base))
+        assert len(base.inputs) == 1
+        assert outcome.judgement == base.outcome.judgement
+        assert outcome.metadata["model_chain"]["primary_result"]["status"] == "failed"
+        assert outcome.metadata["model_chain"]["agreement"] is None
+    finally:
+        ob.close()
+
+
+def test_review_factory_requires_reviewer_and_accepts_no_observation_store(tmp_path, monkeypatch):
+    import telegram_llm_antispam.jev_observation as module
+
+    s = replace(settings(tmp_path), jev_mode="review", jev_chat_ids=(), jev_max_calls_per_day=0)
+    with pytest.raises(ValueError, match="reviewer"):
+        create_jev_observer(s)
+    s = replace(
+        s,
+        newapi_base_url="https://test.invalid",
+        newapi_api_key="fake",
+        newapi_model="mimo-v2.6-flash",
+    )
+    monkeypatch.setattr(module, "ObservationStore", lambda *args: (_ for _ in ()).throw(OSError()))
+    ob = create_jev_observer(s)
+    assert ob.requires_review and ob.store is None
+    ob.close()

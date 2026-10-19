@@ -87,6 +87,7 @@ def paired(row: dict) -> bool:
 def cohort(row: dict) -> dict:
     baseline = row["baseline"].get("metadata") or {}
     return {
+        "mode": row.get("mode", "shadow"),
         "requested_jev_model": row["requested_model"],
         "resolved_jev_model": row["jev"].get("model"),
         "questions_hash": row["questions_hash"],
@@ -164,6 +165,7 @@ def summarize(rows: list[dict], annotations: list[dict], input_price: float | No
             confidence_bins["<0.5" if c < 0.5 else "0.5-0.85" if c < 0.85 else ">=0.85"] += 1
     return {
         "observations": len(rows),
+        "modes": Counter(r.get("mode", "shadow") for r in rows),
         "stages": Counter(r["stage"] for r in rows),
         "jev_status": Counter(r["jev"].get("status") for r in rows),
         "jev_skips": Counter(
@@ -340,7 +342,7 @@ def export_report(
     lines = [
         "# Jev 在线观察报告",
         "",
-        "模式为shadow：原LLM决定实际审核。模型一致率不等于正确率，未标注样本不算正确或错误。",
+        "shadow是抽样观察，review是Jev全量初审→MiMo复核，均等待原模型结论执行。模型一致率不等于正确率。",
         "只有两名独立标注者对同一输入确认一致且证据充分、两个模型均成功的消息才进入同分母指标。",
         "资料/账户/行为标签单列；空正文无OG、截断、入群资料检查不计消息指标。",
         "抽样来自已允许的群和模型审核环节；硬规则旁路是否覆盖取决于配置，不能归功于模型。",

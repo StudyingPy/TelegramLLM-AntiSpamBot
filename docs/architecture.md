@@ -83,6 +83,14 @@ model results, final action links and explicit human annotations. Jev has no
 enforcement mode. See [Jev observation](jev-online-observation.md) for configuration,
 failure behavior, reporting and the limits of accuracy claims.
 
+`JEV_MODE=review` routes every message-model request through Jev first and the
+configured MiMo reviewer second. It ignores shadow sampling, group restrictions,
+cache and daily caps, and queues at the Jev concurrency limit. MiMo alone supplies
+the reviewed outcome for existing thresholds and learning; unavailable review
+leaves the message pending without model-driven punishment. Observation storage
+failure does not bypass the primary request. Local rule-only paths and the
+separate fingerprint quality audit retain their existing structure.
+
 - Phase 0 is wired: bot runner, SQLite schema, permission checks, message pipeline.
 - Phase 1 is wired: local extraction and hard rules.
 - Phase 2 is wired: `llm.py` calls OpenAI-compatible NewAPI gateways when `NEWAPI_*`

@@ -69,7 +69,7 @@ async def run() -> None:
                 await task
         db.close()
         if jev_observer is not None:
-            jev_observer.store.close()
+            jev_observer.close()
         await bot.session.close()
 
 

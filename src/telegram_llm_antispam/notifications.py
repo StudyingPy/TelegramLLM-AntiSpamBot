@@ -367,6 +367,25 @@ def _status_label(status: str) -> str:
 
 
 def _format_llm_section(decision: LocalDecision) -> str:
+    legacy = _format_legacy_llm_section(decision)
+    chain = decision.metadata.get("model_chain")
+    if not isinstance(chain, dict) or chain.get("mode") != "review":
+        return legacy
+    primary = chain.get("primary_result") or {}
+    if primary.get("status") == "ok":
+        text = (f"\nJev初审：广告概率 {float(primary['noul']):.0%}"
+                f" / {_esc(str(primary.get('category') or 'unknown'))}")
+    else:
+        text = f"\nJev初审：调用失败 / {_esc(str(primary.get('error') or 'unknown'))}"
+    text += legacy.replace("\nLLM：", "\nMiMo复核：", 1)
+    if chain.get("decision_source") == "pending_review":
+        text += "\n复核未完成，保持待复核"
+    elif chain.get("agreement") is False:
+        text += "\n初审与复核结论不一致，采用MiMo复核结论"
+    return text
+
+
+def _format_legacy_llm_section(decision: LocalDecision) -> str:
     """Render the LLM hop section. Always emits a line when the LLM was attempted.
 
     Three shapes:
