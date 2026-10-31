@@ -428,6 +428,29 @@ def test_llm_spam_feedback_creates_medium_weight_fingerprints(tmp_path):
         db.close()
 
 
+def test_llm_summary_signal_is_not_persisted_as_phrase_fingerprint(tmp_path):
+    db = _db(tmp_path)
+    settings = _settings()
+    features = _features("点击进群领取资料 @helperbot https://spam.example")
+    try:
+        record_llm_spam_feedback(
+            db,
+            features,
+            LLMJudgement(
+                is_spam=True,
+                confidence=0.95,
+                category="ads",
+                signal_phrases=("这是广告", "引流到个人频道"),
+            ),
+            settings,
+        )
+
+        assert db.get_fingerprint(phrase_fingerprint_value("这是广告") or "") is None
+        assert db.get_fingerprint(phrase_fingerprint_value("引流到个人频道") or "") is None
+    finally:
+        db.close()
+
+
 def test_phrase_fingerprints_are_used_in_lookup(tmp_path):
     """LLM signal phrases of 3+ CJK chars are persisted and later matched.
 

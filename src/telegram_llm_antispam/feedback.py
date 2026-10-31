@@ -144,16 +144,12 @@ def record_llm_spam_feedback(
         # judgement was — they will collide with every innocent message.
         if not _is_allowed_phrase_carrier(phrase) or not _phrase_passes_min_length(phrase):
             continue
-        preview = features.metadata.get("og_preview")
-        public_context = features.clean_text
-        if isinstance(preview, dict):
-            public_context += " " + normalize_text(" ".join(
-                str(preview.get(key) or "")
-                for key in ("title", "description", "site_name", "image_alt", "text")
-            ))
-        if normalize_text(phrase) not in public_context:
-            # Profile/personal-channel text is transient context, not a source of
-            # newly persisted readable group-message fingerprints.
+        if not _phrase_appears_in_public_source(phrase, features):
+            # signal_phrases are model-selected hints, not source text. A model may
+            # summarize a message as "引流广告" or "联系方式"; only a phrase that
+            # actually occurs in the group message or its OG preview may become a
+            # persistent fingerprint. Profile/personal-channel text is transient
+            # context and can never create readable group-message fingerprints.
             continue
         value = phrase_fingerprint_value(phrase)
         if _is_meaningful_fingerprint_value(value):
@@ -165,6 +161,27 @@ def record_llm_spam_feedback(
                 pattern_text=phrase,
             )
             db.add_fingerprint_evidence(value, features, "llm_spam")
+
+
+def _phrase_appears_in_public_source(phrase: str, features: MessageFeatures) -> bool:
+    """Return whether a model-selected phrase is present in public message input.
+
+    Check each source independently. Joining message and OG text before checking
+    would allow a phrase to be assembled across the boundary and would make the
+    provenance of a learned fingerprint ambiguous.
+    """
+
+    normalized_phrase = normalize_text(phrase)
+    if not normalized_phrase:
+        return False
+    sources = [features.clean_text]
+    preview = features.metadata.get("og_preview")
+    if isinstance(preview, dict):
+        sources.extend(
+            str(preview.get(key) or "")
+            for key in ("title", "description", "site_name", "image_alt", "text")
+        )
+    return any(normalized_phrase in normalize_text(source) for source in sources if source)
 
 
 def record_vote_spam_feedback(db: Database, session: VoteSession, settings: Settings) -> None:

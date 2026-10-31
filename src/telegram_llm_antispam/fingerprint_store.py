@@ -54,6 +54,42 @@ CREATE INDEX IF NOT EXISTS idx_fingerprint_evidence_id ON fingerprint_evidence(f
 """
 
 
+# Reviewer quality actions: action -> (required review status, resulting status).
+# Shared by the private-chat callbacks and the WebUI so both enforce one state machine.
+REVIEW_TRANSITIONS = {
+    "disable": ("pending", "disabled"),
+    "keep": ("pending", "kept"),
+    "restore": ("disabled", "restored"),
+}
+
+
+def apply_review_transition(conn, row, action, user_id, now) -> bool:
+    """Apply one reviewer action inside the caller's transaction.
+
+    Returns False without writing when the review or fingerprint is no longer in the
+    state the action requires. The caller owns the lock and the commit.
+    """
+    required, status = REVIEW_TRANSITIONS[action]
+    if row["status"] != required:
+        return False
+    fp = conn.execute("SELECT enabled FROM fingerprints WHERE id=?",
+                      (row["fingerprint_id"],)).fetchone()
+    if fp is None or (action == "restore" and fp["enabled"]):
+        return False
+    conn.execute(
+        "UPDATE fingerprint_reviews SET status=?,resolved_at=?,resolved_by=? WHERE id=?",
+        (status, now, user_id, row["id"]),
+    )
+    if action != "keep":
+        conn.execute("UPDATE fingerprints SET enabled=? WHERE id=?",
+                     (int(action == "restore"), row["fingerprint_id"]))
+    conn.execute(
+        "INSERT INTO fingerprint_review_actions(review_id,action,user_id,created_at) "
+        "VALUES (?,?,?,?)", (row["id"], action, user_id, now),
+    )
+    return True
+
+
 def _metadata(value: str) -> dict[str, Any]:
     try:
         data = json.loads(value)
@@ -114,6 +150,9 @@ class FingerprintStore:
             "SELECT 1 FROM maintenance_marks WHERE name='fingerprint_evidence_v1'"
         ).fetchone() is None:
             fingerprints = {r["value"]: dict(r) for r in conn.execute("SELECT * FROM fingerprints")}
+            fingerprints_by_id = {
+                r["id"]: dict(r) for r in conn.execute("SELECT * FROM fingerprints")
+            }
             for row in conn.execute(
                 "SELECT * FROM action_log WHERE metadata_json LIKE '%signal_phrases%' "
                 "OR metadata_json LIKE '%fingerprint_id%' ORDER BY id"
@@ -122,6 +161,8 @@ class FingerprintStore:
                 outcome = meta.get("llm_outcome") or {}
                 if not isinstance(outcome, dict):
                     outcome = {}
+                text = str(meta.get("text_snapshot") or "")
+                normalized_text = normalize_text(text)
                 phrases = []
                 for data, key in ((meta, "signal_phrases"), (meta, "llm_signal_phrases"),
                                   (outcome, "signal_phrases")):
@@ -129,6 +170,11 @@ class FingerprintStore:
                         phrases.extend(p for p in data[key] if isinstance(p, str))
                 matched = set()
                 for phrase in phrases:
+                    # Historical action metadata contains model-selected phrases,
+                    # which may be a summary rather than a literal source span.
+                    # Restore only phrases that are present in the original message.
+                    if not normalized_text or normalize_text(phrase) not in normalized_text:
+                        continue
                     fp = fingerprints.get(stable_hash(f"phrase:{normalize_text(phrase)}"))
                     if fp and fp["fingerprint_type"] == "phrase":
                         conn.execute(
@@ -136,7 +182,6 @@ class FingerprintStore:
                             (phrase[:4000], fp["id"]),
                         )
                         matched.add(fp["id"])
-                text = str(meta.get("text_snapshot") or "")
                 for kind, value, pattern in (
                     ("content", stable_hash(normalize_text(text)), normalize_text(text)),
                     ("skeleton", stable_hash(skeletonize(text)), skeletonize(text)),
@@ -149,7 +194,11 @@ class FingerprintStore:
                         )
                         matched.add(fp["id"])
                 if isinstance(meta.get("fingerprint_id"), int):
-                    matched.add(meta["fingerprint_id"])
+                    fp = fingerprints_by_id.get(meta["fingerprint_id"])
+                    if fp and fp["fingerprint_type"] != "phrase":
+                        matched.add(meta["fingerprint_id"])
+                    elif fp and normalized_text and normalize_text(fp.get("pattern_text") or "") in normalized_text:
+                        matched.add(meta["fingerprint_id"])
                 is_spam = outcome.get("is_spam", meta.get("llm_is_spam"))
                 label = "llm_benign" if is_spam is False else (
                     "llm_spam" if is_spam is True else "local_hit"
@@ -159,6 +208,29 @@ class FingerprintStore:
                                   text, label, row["created_at"])
             conn.execute("INSERT INTO maintenance_marks VALUES ('fingerprint_evidence_v1')")
             conn.execute("UPDATE fingerprints SET enabled=0 WHERE source='disabled_false_positive'")
+
+        if conn.execute(
+            "SELECT 1 FROM maintenance_marks WHERE name='phrase_source_guard_v1'"
+        ).fetchone() is None:
+            # Clean legacy phrase rows that cannot be anchored to any stored source
+            # message. These are the rows most likely to be model summaries or
+            # reviewer prose accidentally persisted as signal phrases.
+            rows = conn.execute(
+                "SELECT id, pattern_text FROM fingerprints "
+                "WHERE fingerprint_type='phrase' AND source='llm_spam_phrase'"
+            ).fetchall()
+            for row in rows:
+                pattern = normalize_text(row["pattern_text"] or "")
+                evidence = conn.execute(
+                    "SELECT text FROM fingerprint_evidence WHERE fingerprint_id=?",
+                    (row["id"],),
+                ).fetchall()
+                anchored = bool(pattern) and any(
+                    pattern in normalize_text(item["text"] or "") for item in evidence
+                )
+                if not anchored:
+                    conn.execute("DELETE FROM fingerprints WHERE id=?", (row["id"],))
+            conn.execute("INSERT INTO maintenance_marks VALUES ('phrase_source_guard_v1')")
 
         if conn.execute(
             "SELECT 1 FROM maintenance_marks WHERE name='phrase_ham_feedback_v1'"
@@ -363,28 +435,13 @@ class FingerprintStore:
         return last is None or int(time.time()) - last >= 86400
 
     def resolve_fingerprint_review(self, review_id, action, user_id):
-        required = "disabled" if action == "restore" else "pending"
-        status = {"disable": "disabled", "keep": "kept", "restore": "restored"}.get(action)
-        if status is None:
+        if action not in REVIEW_TRANSITIONS:
             return False
         with self._locked_conn() as conn:
             row = conn.execute("SELECT * FROM fingerprint_reviews WHERE id=?", (review_id,)).fetchone()
-            if row is None or row["status"] != required:
+            if row is None or not apply_review_transition(
+                conn, row, action, user_id, int(time.time())
+            ):
                 return False
-            fp = conn.execute("SELECT enabled FROM fingerprints WHERE id=?",
-                              (row["fingerprint_id"],)).fetchone()
-            if fp is None or (action == "restore" and fp["enabled"]):
-                return False
-            conn.execute(
-                "UPDATE fingerprint_reviews SET status=?,resolved_at=?,resolved_by=? WHERE id=?",
-                (status, int(time.time()), user_id, review_id),
-            )
-            if action != "keep":
-                conn.execute("UPDATE fingerprints SET enabled=? WHERE id=?",
-                             (int(action == "restore"), row["fingerprint_id"]))
-            conn.execute(
-                "INSERT INTO fingerprint_review_actions(review_id,action,user_id,created_at) "
-                "VALUES (?,?,?,?)", (review_id, action, user_id, int(time.time())),
-            )
             conn.commit()
             return True

@@ -9,6 +9,7 @@ from typing import Any
 
 from .config import Settings
 from .fingerprint_store import FingerprintStore
+from .webui_store import FingerprintWebStore
 from .models import (
     AdminNotification,
     FingerprintRecord,
@@ -207,7 +208,7 @@ CREATE INDEX IF NOT EXISTS idx_bot_only_messages_time
 """
 
 
-class Database(FingerprintStore):
+class Database(FingerprintStore, FingerprintWebStore):
     def __init__(
         self, path: Path, default_reputation: float = 50,
         fingerprint_false_positive_penalty: float = 30,
@@ -241,6 +242,7 @@ class Database(FingerprintStore):
             conn.executescript(SCHEMA_SQL)
             self._ensure_columns(conn)
             self._migrate_fingerprint_store(conn)
+            self._migrate_webui_store(conn)
             conn.commit()
 
     def _ensure_columns(self, conn: sqlite3.Connection) -> None:
@@ -849,26 +851,39 @@ class Database(FingerprintStore):
         fingerprint_type: str | None = None,
         min_weight: float = 0.0,
         limit: int = 50,
+        offset: int = 0,
     ) -> tuple[dict[str, Any], ...]:
         params: list[Any] = [min_weight]
         type_clause = ""
         if fingerprint_type:
             type_clause = " AND fingerprint_type = ?"
             params.append(fingerprint_type)
-        params.append(limit)
+        params.extend((max(1, limit), max(0, offset)))
         with self._locked_conn() as conn:
             rows = conn.execute(
                 f"""
                 SELECT id, fingerprint_type, value, weight, hit_count, false_positive_count,
-                    source, last_hit_at, created_at
+                    source, last_hit_at, created_at, pattern_text, enabled
                 FROM fingerprints
                 WHERE weight >= ?{type_clause}
-                ORDER BY weight DESC, hit_count DESC, id ASC
-                LIMIT ?
+                ORDER BY enabled DESC, weight DESC, hit_count DESC, id ASC
+                LIMIT ? OFFSET ?
                 """,
                 tuple(params),
             ).fetchall()
         return tuple(dict(row) for row in rows)
+
+    def count_fingerprints(self) -> int:
+        with self._locked_conn() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM fingerprints").fetchone()[0])
+
+    def get_fingerprint_by_id(self, fingerprint_id: int) -> dict[str, Any] | None:
+        with self._locked_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM fingerprints WHERE id = ?",
+                (fingerprint_id,),
+            ).fetchone()
+        return None if row is None else dict(row)
 
     def delete_fingerprint(self, fingerprint_id: int) -> bool:
         with self._locked_conn() as conn:

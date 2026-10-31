@@ -71,6 +71,9 @@
     historical phrases, keeps three bounded message samples, and proposes high-confidence
     retirements. Only user 5439265612 receives the daily digest and can keep, disable or
     restore entries. Disabled entries do not match and cannot be re-enabled by learning.
+15. An optional Telegram Mini App (`WEBUI_ENABLED`, off by default) runs inside the bot process
+    and offers the same keep/disable/restore actions plus library search and deletion, with
+    version-checked, idempotent writes. See `WEBUI_IMPLEMENTATION_NOTE.md`.
 
 ## Phase Status
 

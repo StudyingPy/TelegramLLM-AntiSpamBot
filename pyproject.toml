@@ -12,6 +12,8 @@ dependencies = [
     "aiogram>=3.28,<4",
     "openai>=1.40",
     "httpx>=0.27,<1",
+    # Already required by aiogram; listed because the fingerprint WebUI imports it directly.
+    "aiohttp>=3.9,<4",
 ]
 
 [project.optional-dependencies]
@@ -28,6 +30,9 @@ antispam-jev-live = "telegram_llm_antispam.jev_live_report:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"telegram_llm_antispam.webui" = ["static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

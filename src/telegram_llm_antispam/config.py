@@ -41,6 +41,14 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_https_url(name: str) -> str | None:
+    """Return an https URL with a trailing slash, or None when unset/invalid."""
+    value = os.getenv(name, "").strip()
+    if not value.lower().startswith("https://"):
+        return None
+    return value if value.endswith("/") else value + "/"
+
+
 def _env_list(name: str) -> tuple[str, ...]:
     value = os.getenv(name, "")
     return tuple(part.strip().lower() for part in value.split(",") if part.strip())
@@ -120,6 +128,15 @@ class Settings:
     fingerprint_audit_max_per_run: int = 1000
     fingerprint_audit_batch_size: int = 10
     fingerprint_review_user_id: int = 5439265612
+
+    # Telegram Mini App for fingerprint review (embedded HTTP server, off by default).
+    webui_enabled: bool = False
+    webui_host: str = "127.0.0.1"
+    webui_port: int = 8088
+    webui_public_url: str | None = None
+    webui_init_data_max_age_seconds: int = 600
+    webui_session_ttl_seconds: int = 1800
+    webui_menu_button: bool = True
 
     jev_mode: str = "off"
     jev_api_key: str | None = field(default=None, repr=False)
@@ -210,6 +227,13 @@ class Settings:
             fingerprint_audit_max_per_run=_env_int("FINGERPRINT_AUDIT_MAX_PER_RUN", 1000),
             fingerprint_audit_batch_size=_env_int("FINGERPRINT_AUDIT_BATCH_SIZE", 10),
             fingerprint_review_user_id=_env_int("FINGERPRINT_REVIEW_USER_ID", 5439265612),
+            webui_enabled=_env_bool("WEBUI_ENABLED", False),
+            webui_host=os.getenv("WEBUI_HOST", "127.0.0.1").strip() or "127.0.0.1",
+            webui_port=_env_int("WEBUI_PORT", 8088),
+            webui_public_url=_env_https_url("WEBUI_PUBLIC_URL"),
+            webui_init_data_max_age_seconds=_env_int("WEBUI_INIT_DATA_MAX_AGE_SECONDS", 600),
+            webui_session_ttl_seconds=_env_int("WEBUI_SESSION_TTL_SECONDS", 1800),
+            webui_menu_button=_env_bool("WEBUI_MENU_BUTTON", True),
             jev_mode=os.getenv("JEV_MODE", "off").strip().lower(),
             jev_api_key=os.getenv("JEV_API_KEY") or os.getenv("TYPESAFE_API_KEY") or None,
             jev_model=os.getenv("JEV_MODEL", "jev-1.13.0"),

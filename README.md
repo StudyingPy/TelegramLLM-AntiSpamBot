@@ -76,6 +76,9 @@ URL、key、model 会按位置配对；只有一个 key 或 model 时会复用�
 选择“停用”“保留”，以及恢复已停用指纹。其他用户不能操作；停用不会丢失记录，也不会被
 模型重新学习自动恢复。扫描和通知失败可重试，进度持久化；同一未决或已人工保留的相同证据
 不重复催审。可通过 `.env.example` 中的 `FINGERPRINT_AUDIT_*` 配置调整扫描预算或停用后台任务。
+私聊发送 `/fingerprint_library` 可直接分页浏览指纹，进入详情后确认删除；`/fingerprints` 页面
+也提供相同入口。模型返回的 `signal_phrases` 只有在原始群消息或 OG 预览中确实出现时才会
+沉淀为短语指纹，历史迁移会清理无法找到原文锚点的旧短语。
 
 指纹匹配本身只计命中次数；模型确认广告后才加权。人工放行会对实际命中的短语指纹进行
 幂等降权，历史遗漏一次性补记；投票超时不作为人工正常证据。
@@ -114,6 +117,27 @@ antispam-bot
 ```
 
 机器人需要在目标群组拥有删除消息权限；如果要自动封禁，还需要封禁/限制成员权限。
+
+## 指纹复核台（Telegram Mini App）
+
+复核台把 `/fingerprints` 与 `/fingerprint_library` 的功能搬进一个网页：待复核 / 已保留 /
+已停用 / 指纹库四个视图，支持搜索和筛选、查看证据样本、逐条或勾选批量停用 / 保留 / 恢复，
+以及二次确认后删除指纹。原有私聊按钮流程保持不变，可以并行使用。
+
+默认关闭。启用方式：
+
+```env
+WEBUI_ENABLED=true
+WEBUI_HOST=127.0.0.1
+WEBUI_PORT=8088
+WEBUI_PUBLIC_URL=https://review.example.com/
+```
+
+机器人进程内会监听 `WEBUI_HOST:WEBUI_PORT`（纯 HTTP），需要由 Caddy / nginx 等反向代理提供
+HTTPS 并转发到该端口；Telegram 只会打开 `https://` 地址。配置 `WEBUI_PUBLIC_URL` 后，复核人
+私聊的菜单按钮、`/fingerprints`、`/fingerprint_library` 和每日摘要都会出现“打开复核台”按钮。
+只有 `FINGERPRINT_REVIEW_USER_ID` 能登录，服务端校验 Telegram 签名的 `initData`。
+部署、接口和安全说明见 [WEBUI_IMPLEMENTATION_NOTE.md](WEBUI_IMPLEMENTATION_NOTE.md)。
 
 ## Linux 一键部署
 

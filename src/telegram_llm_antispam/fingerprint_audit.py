@@ -5,13 +5,43 @@ import html
 import json
 import logging
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonWebApp, WebAppInfo
 
 from .models import FingerprintAuditResult, LLMOutcomeStatus
 
 
 logger = logging.getLogger(__name__)
 REVIEW_PREFIX = "fp_review"
+LIBRARY_PAGE_SIZE = 8
+WEBUI_BUTTON_TEXT = "打开复核台"
+
+
+def webui_url(settings):
+    """Public Mini App URL when the WebUI is enabled and an https URL is configured."""
+    if not getattr(settings, "webui_enabled", False):
+        return None
+    return getattr(settings, "webui_public_url", None)
+
+
+def _webui_row(url):
+    # web_app buttons only work in private chats; every caller here is reviewer-only DM.
+    return [InlineKeyboardButton(text=WEBUI_BUTTON_TEXT, web_app=WebAppInfo(url=url))]
+
+
+async def set_review_menu_button(bot, settings):
+    """Pin the Mini App to the reviewer's private-chat menu button only."""
+    url = webui_url(settings)
+    if not url or not getattr(settings, "webui_menu_button", True):
+        return False
+    try:
+        await bot.set_chat_menu_button(
+            chat_id=settings.fingerprint_review_user_id,
+            menu_button=MenuButtonWebApp(text="复核台", web_app=WebAppInfo(url=url)),
+        )
+    except Exception as exc:
+        logger.warning("Failed to set fingerprint review menu button: %s", exc)
+        return False
+    return True
 
 
 class FingerprintAuditor:
@@ -95,11 +125,14 @@ class FingerprintAuditor:
         text += "\n\n模型仅建议停用；确认后才停止匹配，可恢复。"
         try:
             me = await bot.get_me()
-            markup = InlineKeyboardMarkup(inline_keyboard=[[
+            keyboard = [[
                 InlineKeyboardButton(
                     text="查看待复核", url=f"https://t.me/{me.username}?start={REVIEW_PREFIX}"
                 )
-            ]])
+            ]]
+            if url := webui_url(self.settings):
+                keyboard.insert(0, _webui_row(url))
+            markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
             await bot.send_message(self.settings.fingerprint_review_user_id, text,
                                    reply_markup=markup)
         except Exception as exc:
@@ -120,12 +153,12 @@ async def sweep_fingerprints(settings, bot, db, judge):
         await asyncio.sleep(300)
 
 
-def review_list(db, *, disabled=False, offset=0):
+def review_list(db, *, disabled=False, offset=0, webui=None):
     rows = db.pending_fingerprint_reviews(disabled=disabled, offset=offset, limit=10)
     count = db.count_fingerprint_reviews(disabled=disabled)
     title = "已停用指纹" if disabled else "待复核指纹"
     lines = [f"{title}：{count} 条"]
-    buttons = []
+    buttons = [_webui_row(webui)] if webui else []
     for row in rows:
         name = str(row["pattern_text"] or "无法恢复原文")[:80]
         lines.append(f"• {html.escape(name)} / {row['confidence']:.0%}")
@@ -139,7 +172,83 @@ def review_list(db, *, disabled=False, offset=0):
         text="待复核" if disabled else "已停用 / 恢复",
         callback_data=f"fp:list:{int(not disabled)}:0",
     )])
+    buttons.append([InlineKeyboardButton(
+        text="管理指纹库（查看 / 删除）", callback_data="fp:library:0",
+    )])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def library_list(db, *, offset=0, webui=None):
+    rows = db.list_fingerprints(limit=LIBRARY_PAGE_SIZE, offset=offset)
+    total = db.count_fingerprints()
+    lines = [f"指纹库：{total} 条（按权重排序）"]
+    buttons = [_webui_row(webui)] if webui else []
+    for row in rows:
+        pattern = str(row.get("pattern_text") or "")
+        label = pattern[:34] if pattern else f"{row['fingerprint_type']} / {row['value'][:12]}…"
+        state = "启用" if row.get("enabled", 1) else "停用"
+        lines.append(
+            f"• #{row['id']} {html.escape(label)} · {state} · "
+            f"权重 {row['weight']:.0f} · 命中 {row['hit_count']}"
+        )
+        buttons.append([InlineKeyboardButton(
+            text=f"查看 #{row['id']}", callback_data=f"fp:libdetail:{row['id']}"
+        )])
+    if not rows:
+        lines.append("暂无指纹。")
+    navigation = []
+    if offset > 0:
+        navigation.append(InlineKeyboardButton(
+            text="上一页", callback_data=f"fp:library:{max(0, offset - LIBRARY_PAGE_SIZE)}"
+        ))
+    if offset + LIBRARY_PAGE_SIZE < total:
+        navigation.append(InlineKeyboardButton(
+            text="下一页", callback_data=f"fp:library:{offset + LIBRARY_PAGE_SIZE}"
+        ))
+    if navigation:
+        buttons.append(navigation)
+    buttons.append([InlineKeyboardButton(text="返回复核列表", callback_data="fp:list:0:0")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def library_detail(db, fingerprint_id):
+    row = db.get_fingerprint_by_id(fingerprint_id)
+    if row is None:
+        return "指纹不存在，可能已被删除。", None
+    pattern = str(row.get("pattern_text") or "无法恢复原文")
+    state = "启用" if row.get("enabled", 1) else "停用"
+    text = (
+        f"指纹 #{row['id']}\n"
+        f"模式：<code>{html.escape(pattern[:1200])}</code>\n"
+        f"类型：{html.escape(row['fingerprint_type'])} / {state}\n"
+        f"权重：{row['weight']:.0f} / 命中：{row['hit_count']} / "
+        f"误判：{row['false_positive_count']}\n"
+        f"来源：{html.escape(row['source'])}\n"
+        f"值：<code>{html.escape(row['value'])}</code>"
+    )
+    payload = db.fingerprint_audit_payload(fingerprint_id)
+    if payload:
+        for sample in payload.get("samples", ()):
+            body = html.escape(str(sample.get("text") or "")[:400])
+            text += f"\n样本（{html.escape(str(sample.get('label') or ''))}）：<blockquote>{body}</blockquote>"
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="删除此指纹", callback_data=f"fp:libdelete_confirm:{fingerprint_id}")],
+        [InlineKeyboardButton(text="返回指纹库", callback_data="fp:library:0")],
+    ])
+    return text, markup
+
+
+def library_delete_confirm(db, fingerprint_id):
+    row = db.get_fingerprint_by_id(fingerprint_id)
+    if row is None:
+        return "指纹不存在，可能已被删除。", None
+    pattern = html.escape(str(row.get("pattern_text") or row["value"])[:500])
+    text = f"确定删除这个指纹吗？\n\n模式：<code>{pattern}</code>\n删除后将停止匹配，历史证据也会随之清理。"
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="确认删除", callback_data=f"fp:libdelete:{fingerprint_id}"),
+         InlineKeyboardButton(text="取消", callback_data=f"fp:libdetail:{fingerprint_id}")],
+    ])
+    return text, markup
 
 
 def review_detail(db, review_id):
@@ -179,7 +288,17 @@ async def show_reviews(message, settings, db):
             or message.from_user.id != settings.fingerprint_review_user_id):
         await message.answer("仅指定复核人可在私聊中查看指纹复核。")
         return
-    text, markup = review_list(db)
+    text, markup = review_list(db, webui=webui_url(settings))
+    await message.answer(text, reply_markup=markup)
+
+
+async def show_library(message, settings, db):
+    if (getattr(message.chat.type, "value", message.chat.type) != "private"
+            or not message.from_user
+            or message.from_user.id != settings.fingerprint_review_user_id):
+        await message.answer("仅指定复核人可在私聊中管理指纹库。")
+        return
+    text, markup = library_list(db, webui=webui_url(settings))
     await message.answer(text, reply_markup=markup)
 
 
@@ -196,7 +315,20 @@ async def handle_review_callback(callback, settings, db):
         if action == "list":
             disabled = int(parts[2]) == 1
             offset = max(0, int(parts[3]))
-            text, markup = review_list(db, disabled=disabled, offset=offset)
+            text, markup = review_list(db, disabled=disabled, offset=offset,
+                                       webui=webui_url(settings))
+        elif action == "library":
+            text, markup = library_list(db, offset=max(0, int(parts[2])),
+                                        webui=webui_url(settings))
+        elif action == "libdetail":
+            text, markup = library_detail(db, int(parts[2]))
+        elif action == "libdelete_confirm":
+            text, markup = library_delete_confirm(db, int(parts[2]))
+        elif action == "libdelete":
+            if not db.delete_fingerprint(int(parts[2])):
+                await callback.answer("指纹不存在或已删除。", show_alert=True)
+                return
+            text, markup = library_list(db, offset=0, webui=webui_url(settings))
         else:
             rid = int(parts[2])
             if action != "detail":

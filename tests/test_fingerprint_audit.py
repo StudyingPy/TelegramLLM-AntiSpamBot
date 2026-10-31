@@ -12,7 +12,8 @@ from telegram_llm_antispam.db import Database, SCHEMA_SQL
 from telegram_llm_antispam.features import build_message_features
 from telegram_llm_antispam.feedback import phrase_fingerprint_value, record_vote_ham_feedback
 from telegram_llm_antispam.fingerprint_audit import (
-    FingerprintAuditor, handle_review_callback, review_detail, show_reviews,
+    FingerprintAuditor, handle_review_callback, library_list, review_detail, review_list,
+    set_review_menu_button, show_reviews,
 )
 from telegram_llm_antispam.llm import NewAPIJudge, _parse_fingerprint_audit
 from telegram_llm_antispam.models import (
@@ -113,6 +114,34 @@ def test_legacy_phrase_recovery_and_missed_feedback_are_idempotent(tmp_path):
         payload = db.fingerprint_audit_payload(9055)
         assert payload["pattern_text"] == "机器人"
         assert len(payload["samples"]) <= 3
+    finally:
+        db.close()
+
+
+def test_legacy_model_summary_phrase_is_removed_when_not_in_source(tmp_path):
+    path = tmp_path / "legacy-summary.sqlite"
+    conn = sqlite3.connect(path)
+    conn.executescript(SCHEMA_SQL)
+    value = phrase_fingerprint_value("这是广告")
+    conn.execute(
+        "INSERT INTO fingerprints(fingerprint_type,value,weight,source,created_at) "
+        "VALUES ('phrase',?,60,'llm_spam_phrase',1)",
+        (value,),
+    )
+    conn.execute(
+        "INSERT INTO action_log(chat_id,message_id,user_id,action,reason,confidence,metadata_json,created_at) "
+        "VALUES (-1001,1,42,'withdraw_vote','llm_spam',0.95,?,2)",
+        (json.dumps({"llm_outcome": {"signal_phrases": ["这是广告"], "is_spam": True},
+                     "text_snapshot": "点击进群领取资料 @helperbot"}, ensure_ascii=False),),
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(path)
+    db.connect()
+    try:
+        db.migrate()
+        assert db.get_fingerprint(value) is None
     finally:
         db.close()
 
@@ -258,6 +287,45 @@ def test_authorized_callback_is_idempotent_and_escapes_samples(tmp_path):
         db.close()
 
 
+def test_authorized_library_delete_requires_confirmation_and_removes_row(tmp_path):
+    db = _db(tmp_path)
+    edited = []
+
+    async def answer(*args, **kwargs):
+        pass
+
+    async def edit_text(text, **kwargs):
+        edited.append(text)
+
+    try:
+        fp = _seed(db, "删除测试")
+        text, markup = library_list(db)
+        assert "删除测试" in text
+        assert any(
+            button.callback_data == f"fp:libdetail:{fp.id}"
+            for row in markup.inline_keyboard
+            for button in row
+            if button.callback_data
+        )
+        message = SimpleNamespace(chat=SimpleNamespace(type="private"), edit_text=edit_text)
+        confirm = SimpleNamespace(
+            from_user=SimpleNamespace(id=5439265612),
+            data=f"fp:libdelete_confirm:{fp.id}", answer=answer, message=message,
+        )
+        asyncio.run(handle_review_callback(confirm, _settings(), db))
+        assert db.get_fingerprint_by_id(fp.id) is not None
+
+        delete = SimpleNamespace(
+            from_user=SimpleNamespace(id=5439265612),
+            data=f"fp:libdelete:{fp.id}", answer=answer, message=message,
+        )
+        asyncio.run(handle_review_callback(delete, _settings(), db))
+        assert db.get_fingerprint_by_id(fp.id) is None
+        assert len(edited) == 2
+    finally:
+        db.close()
+
+
 def test_newapi_audit_falls_back_after_bad_id_and_closes_clients(monkeypatch):
     settings = replace(_settings(), newapi_base_url="https://one.example,https://two.example",
                        newapi_api_key="dummy", newapi_model="model")
@@ -304,3 +372,64 @@ def test_timeout_release_is_not_ham_feedback_and_low_confidence_is_not_a_proposa
         assert db.get_fingerprint(fp.value).enabled
     finally:
         db.close()
+
+
+def _webui_settings(**overrides):
+    return replace(_settings(), webui_enabled=True,
+                   webui_public_url="https://review.example.com/", **overrides)
+
+
+def test_webui_entry_buttons_appear_only_when_configured(tmp_path):
+    db = _db(tmp_path)
+    sent = []
+
+    async def get_me():
+        return SimpleNamespace(username="testbot")
+
+    async def send_message(user_id, text, **kwargs):
+        sent.append((user_id, kwargs["reply_markup"]))
+
+    try:
+        fp = _seed(db)
+        _propose(db, fp.id)
+        for builder in (review_list, library_list):
+            _, plain = builder(db)
+            assert not any(getattr(b, "web_app", None) for row in plain.inline_keyboard for b in row)
+            _, markup = builder(db, webui="https://review.example.com/")
+            assert markup.inline_keyboard[0][0].web_app.url == "https://review.example.com/"
+
+        auditor = FingerprintAuditor(_webui_settings(), db, None)
+        asyncio.run(auditor.notify_ready(SimpleNamespace(get_me=get_me, send_message=send_message)))
+        user_id, markup = sent[0]
+        assert user_id == 5439265612
+        assert markup.inline_keyboard[0][0].web_app.url == "https://review.example.com/"
+        assert markup.inline_keyboard[1][0].url == "https://t.me/testbot?start=fp_review"
+        # The WebUI button does not change the one-digest / no-duplicate rules.
+        assert not db.pending_fingerprint_reviews(unnotified=True)
+        asyncio.run(auditor.notify_ready(SimpleNamespace(get_me=get_me, send_message=send_message)))
+        assert len(sent) == 1
+    finally:
+        db.close()
+
+
+def test_review_menu_button_targets_only_the_reviewer_chat():
+    calls = []
+
+    async def set_chat_menu_button(**kwargs):
+        calls.append(kwargs)
+
+    async def broken(**kwargs):
+        raise RuntimeError("Telegram unavailable")
+
+    assert asyncio.run(set_review_menu_button(
+        SimpleNamespace(set_chat_menu_button=set_chat_menu_button), _webui_settings()))
+    assert calls[0]["chat_id"] == 5439265612
+    assert calls[0]["menu_button"].web_app.url == "https://review.example.com/"
+    assert not asyncio.run(set_review_menu_button(
+        SimpleNamespace(set_chat_menu_button=broken), _webui_settings()))
+    assert not asyncio.run(set_review_menu_button(
+        SimpleNamespace(set_chat_menu_button=set_chat_menu_button), _settings()))
+    assert not asyncio.run(set_review_menu_button(
+        SimpleNamespace(set_chat_menu_button=set_chat_menu_button),
+        _webui_settings(webui_menu_button=False)))
+    assert len(calls) == 1

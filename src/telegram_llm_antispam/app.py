@@ -15,7 +15,7 @@ from .db import Database
 from .handlers import create_router
 from .llm import create_llm_judge
 from .jev_observation import create_jev_observer
-from .fingerprint_audit import sweep_fingerprints
+from .fingerprint_audit import set_review_menu_button, sweep_fingerprints
 from .logging_config import configure_logging
 
 
@@ -58,8 +58,10 @@ async def run() -> None:
         _sweep_expired_votes(settings, bot, ModerationActions(settings, db))
     )
     fingerprint_sweeper = asyncio.create_task(sweep_fingerprints(settings, bot, db, judge))
+    webui_server = None
 
     try:
+        webui_server = await _start_webui(settings, bot, db)
         await dispatcher.start_polling(bot)
     finally:
         for task in (vote_sweeper, fingerprint_sweeper):
@@ -67,6 +69,9 @@ async def run() -> None:
         for task in (vote_sweeper, fingerprint_sweeper):
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        if webui_server is not None:
+            # Stop accepting WebUI requests before the shared database closes.
+            await webui_server.close()
         db.close()
         if jev_observer is not None:
             jev_observer.close()
@@ -75,6 +80,29 @@ async def run() -> None:
 
 def main() -> None:
     asyncio.run(run())
+
+
+async def _start_webui(settings: Settings, bot: Bot, db: Database):
+    """Start the optional fingerprint review Mini App; never blocks bot startup."""
+    if not settings.webui_enabled:
+        return None
+    try:
+        # Imported lazily so deployments without the WebUI never load the HTTP layer.
+        from .webui.server import start_webui
+
+        server = await start_webui(settings, db)
+    except Exception:
+        logger.exception("Fingerprint review WebUI failed to start; bot continues without it")
+        return None
+    if server is None:
+        return None
+    if settings.webui_public_url is None:
+        logger.warning(
+            "WEBUI_PUBLIC_URL is unset or not https://; Telegram entry buttons are disabled"
+        )
+    elif await set_review_menu_button(bot, settings):
+        logger.info("Fingerprint review menu button set for reviewer chat")
+    return server
 
 
 async def _sweep_expired_votes(

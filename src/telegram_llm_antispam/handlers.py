@@ -21,7 +21,7 @@ from .feedback import (
     record_llm_spam_feedback,
 )
 from .features import build_message_features
-from .fingerprint_audit import REVIEW_PREFIX, handle_review_callback, show_reviews
+from .fingerprint_audit import REVIEW_PREFIX, handle_review_callback, show_library, show_reviews
 from .fingerprints import is_low_entropy_skeleton
 from .llm import LLMJudge, NullLLMJudge, decision_from_llm
 from .jev_observation import JevObserver
@@ -130,7 +130,9 @@ def create_router(
             "/deny_chat 禁用当前群组\n"
             "/whitelist <user_id> [备注] 加入全局白名单（仅全局管理员）\n"
             "/unwhitelist <user_id> 移出全局白名单（仅全局管理员）\n"
-            "/list_whitelist 查看全局白名单（仅全局管理员）"
+            "/list_whitelist 查看全局白名单（仅全局管理员）\n"
+            "/fingerprints 查看待复核及指纹库\n"
+            "/fingerprint_library 直接管理指纹库"
         )
 
     async def _handle_review_deeplink(message: Message, payload: str) -> None:
@@ -281,6 +283,10 @@ def create_router(
     @router.message(Command("fingerprints"))
     async def on_fingerprint_reviews(message: Message) -> None:
         await show_reviews(message, settings, db)
+
+    @router.message(Command("fingerprint_library"))
+    async def on_fingerprint_library(message: Message) -> None:
+        await show_library(message, settings, db)
 
     @router.callback_query(F.data.startswith("fp:"))
     async def on_fingerprint_review_action(callback: CallbackQuery) -> None:
