@@ -463,3 +463,20 @@
   inside the event loop before the coroutine runs. Framework-free `tests/test_webui.py` remains
   the reliable local validation; run the real aiohttp listener and Telegram Mini App checks on a
   normal Linux deployment or a real Telegram client.
+
+## Production WebUI deployment (2026-10-31)
+
+- Production host `OP-JP-Own` runs the bot with systemd as `antispambot`; the WebUI binds
+  only to `127.0.0.1:8088`. The public endpoint is
+  `https://tganitspambotui.fengshengxiu.club/`, terminated by the Cloudflare origin
+  certificate stored in Baota's `/www/server/panel/vhost/ssl/fengshengxiu.club/`.
+- Baota's active nginx is `/www/server/nginx/sbin/nginx` with config
+  `/www/server/nginx/conf/nginx.conf`; `nginx.service` is inactive, so use the exact Baota
+  binary with `-t -c ...` and `-s reload -c ...`. Testing `/etc/nginx/nginx.conf` is insufficient.
+- `antispam-admin` loads `.env` relative to the current directory. Run it with `cd
+  /opt/telegram-llm-antispam-bot` as `antispambot`; otherwise migrations fail with a permission
+  error against `/root/.env` or another working directory.
+- The production checkout's GitHub SSH deploy key was unavailable during this rollout. A verified
+  source archive over the existing SSH path was used, and the pre-deployment backup is retained at
+  `/opt/telegram-llm-antispam-bot/data/backups/pre-webui-20261031-182157/`. Preserve unrelated
+  production files before replacing source when using an archive deployment.
