@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -342,6 +343,40 @@ def test_recent_skeleton_senders_counts_distinct_users(tmp_path):
 
         assert db.count_recent_skeleton_senders(features.skeleton_hash, 300) == 2
         assert db.count_recent_skeleton_senders(features.skeleton_hash, 300, exclude_user_id=42) == 1
+    finally:
+        db.close()
+
+
+def test_recent_user_message_context_prefers_same_cluster_and_expires(tmp_path):
+    db = _db(tmp_path)
+    try:
+        first = replace(_features("来做单 收钱 https://spam.example/a"), message_id=1)
+        second = replace(_features("来做单 收钱 https://spam.example/b"), message_id=2)
+        current = replace(_features("来做单 收钱 https://spam.example/c"), message_id=3)
+        db.record_recent_user_message(first, retention_seconds=1000, max_chars=800)
+        db.record_recent_user_message(second, retention_seconds=1000, max_chars=800)
+
+        rows = db.get_recent_user_message_context(
+            current.chat_id,
+            current.user_id,
+            message_id=current.message_id,
+            skeleton_hash=current.skeleton_hash,
+            simhash=current.simhash,
+            limit=2,
+            candidate_limit=5,
+        )
+        assert [row["message_id"] for row in rows] == [2, 1]
+        assert all(row["same_skeleton"] for row in rows)
+        assert all("text_snapshot" in row for row in rows)
+
+        assert db.purge_expired_recent_user_messages(now=10**12) == 2
+        assert db.get_recent_user_message_context(
+            current.chat_id,
+            current.user_id,
+            message_id=current.message_id,
+            skeleton_hash=current.skeleton_hash,
+            simhash=current.simhash,
+        ) == ()
     finally:
         db.close()
 

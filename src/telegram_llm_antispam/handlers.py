@@ -434,6 +434,24 @@ def create_router(
             features.metadata["user_trust"]["is_trusted"] = False
             features.metadata["user_trust"]["tier"] = "bot"
         db.purge_expired_edit_watch_snapshots()
+        db.purge_expired_recent_user_messages()
+        recent_messages = db.get_recent_user_message_context(
+            features.chat_id,
+            features.user_id,
+            message_id=features.message_id,
+            skeleton_hash=features.skeleton_hash,
+            simhash=features.simhash,
+            limit=settings.recent_context_max_messages,
+            candidate_limit=settings.recent_context_candidate_limit,
+        )
+        features.metadata["recent_messages"] = recent_messages
+        features.metadata["recent_message_cluster"] = {
+            "count": len(recent_messages),
+            "same_skeleton_count": sum(
+                1 for item in recent_messages if item.get("same_skeleton")
+            ),
+            "message_ids": [int(item["message_id"]) for item in recent_messages],
+        }
         edit_snapshot = None
         if is_edit:
             edit_snapshot = db.get_edit_watch_snapshot(
@@ -560,6 +578,7 @@ def create_router(
             "local_rule_reason", local_decision.reason
         ))
         metadata["user_trust"] = features.metadata["user_trust"]
+        metadata["recent_message_cluster"] = features.metadata["recent_message_cluster"]
         metadata["update_type"] = update_type
         if observation_id is not None:
             metadata["jev_observation_id"] = observation_id
@@ -611,6 +630,12 @@ def create_router(
                 features, reputation_delta=reputation_reward, confirmed_normal=confirmed_normal
             )
         db.record_observation(features)
+        db.record_recent_user_message(
+            features,
+            retention_seconds=settings.recent_context_retention_seconds,
+            max_chars=settings.recent_context_max_chars,
+            max_messages=settings.recent_context_candidate_limit,
+        )
         if sender_profile.is_bot:
             db.delete_edit_watch_snapshot(features.chat_id, features.message_id)
         elif is_edit and edit_snapshot is not None:

@@ -134,6 +134,11 @@ class Settings:
     jev_observe_local_bypass: bool = False
     jev_observation_path: Path = Path("data/jev-observations.db")
 
+    recent_context_retention_seconds: int = 86_400
+    recent_context_max_messages: int = 6
+    recent_context_candidate_limit: int = 24
+    recent_context_max_chars: int = 800
+
     @property
     def has_newapi(self) -> bool:
         return bool(self.newapi_base_url and self.newapi_api_key and self.newapi_model)
@@ -217,4 +222,10 @@ class Settings:
             jev_retention_days=_env_int("JEV_RETENTION_DAYS", 7),
             jev_observe_local_bypass=_env_bool("JEV_OBSERVE_LOCAL_BYPASS", False),
             jev_observation_path=Path(os.getenv("JEV_OBSERVATION_PATH", "data/jev-observations.db")),
+            recent_context_retention_seconds=_env_int(
+                "RECENT_CONTEXT_RETENTION_SECONDS", 86_400
+            ),
+            recent_context_max_messages=_env_int("RECENT_CONTEXT_MAX_MESSAGES", 6),
+            recent_context_candidate_limit=_env_int("RECENT_CONTEXT_CANDIDATE_LIMIT", 24),
+            recent_context_max_chars=_env_int("RECENT_CONTEXT_MAX_CHARS", 800),
         )

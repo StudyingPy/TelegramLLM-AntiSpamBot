@@ -415,6 +415,35 @@ def test_feature_payload_contains_bounded_personal_chat_context():
     }
 
 
+def test_feature_payload_contains_bounded_recent_message_cluster():
+    message = SimpleNamespace(
+        message_id=1,
+        chat=SimpleNamespace(id=-1001),
+        from_user=SimpleNamespace(id=42),
+        text="当前消息",
+    )
+    context = UserContext(chat_id=-1001, user_id=42, reputation_score=50, messages_seen=2)
+    features = build_message_features(message, context)
+    features.metadata["recent_messages"] = [
+        {
+            "text_snapshot": "历史消息" * 500,
+            "clean_text": "历史消息",
+            "age_seconds": 30,
+            "same_skeleton": True,
+            "simhash_distance": 4,
+            "link_domains": ["example.com"],
+        },
+        {"text_snapshot": "ignored", "not_a_dict": True},
+    ]
+
+    payload = _feature_payload(features)
+
+    assert len(payload["recent_messages"]) == 2
+    assert len(payload["recent_messages"][0]["text"]) == 800
+    assert payload["recent_messages"][0]["same_skeleton"] is True
+    assert payload["recent_messages"][1]["text"] == "ignored"
+
+
 def test_llm_spam_at_ban_threshold_bans_for_normal_reputation():
     message = SimpleNamespace(
         message_id=1,

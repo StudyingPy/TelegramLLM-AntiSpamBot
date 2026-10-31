@@ -140,6 +140,23 @@ CREATE TABLE IF NOT EXISTS message_observations (
     created_at INTEGER NOT NULL
 );
 
+-- Short-lived message bodies used only to provide bounded same-user context to
+-- the moderation model.  Hashes alone support repeat detection but cannot show
+-- the model what the user's earlier messages said.
+CREATE TABLE IF NOT EXISTS recent_user_messages (
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    text_snapshot TEXT NOT NULL,
+    clean_text TEXT NOT NULL,
+    skeleton_hash TEXT NOT NULL,
+    simhash TEXT NOT NULL,
+    link_domains_json TEXT NOT NULL DEFAULT '[]',
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, message_id)
+);
+
 -- Only messages from new / low-reputation users are retained here.  Telegram's
 -- edited_message update contains the new body, not the previous revision, so a
 -- short-lived baseline is required to tell an innocent edit from an edit that
@@ -177,6 +194,10 @@ CREATE INDEX IF NOT EXISTS idx_admin_notifications_vote_session
     ON admin_notifications(vote_session_id);
 CREATE INDEX IF NOT EXISTS idx_observations_skeleton_time
     ON message_observations(skeleton_hash, created_at);
+CREATE INDEX IF NOT EXISTS idx_recent_user_messages_time
+    ON recent_user_messages(chat_id, user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_recent_user_messages_expiry
+    ON recent_user_messages(expires_at);
 CREATE INDEX IF NOT EXISTS idx_edit_watch_expiry
     ON edit_watch_messages(expires_at);
 CREATE INDEX IF NOT EXISTS idx_bot_only_messages_caller
@@ -532,6 +553,141 @@ class Database(FingerprintStore):
                     str(features.simhash),
                     json.dumps(list(features.link_domains), ensure_ascii=False),
                     _now(),
+                ),
+            )
+            conn.commit()
+
+    def purge_expired_recent_user_messages(self, *, now: int | None = None) -> int:
+        """Delete expired same-user context snapshots."""
+        cutoff = _now() if now is None else now
+        with self._locked_conn() as conn:
+            cursor = conn.execute(
+                "DELETE FROM recent_user_messages WHERE expires_at <= ?",
+                (cutoff,),
+            )
+            conn.commit()
+        return int(cursor.rowcount)
+
+    def get_recent_user_message_context(
+        self,
+        chat_id: int,
+        user_id: int | None,
+        *,
+        message_id: int | None = None,
+        skeleton_hash: str,
+        simhash: int,
+        limit: int = 6,
+        candidate_limit: int = 24,
+        now: int | None = None,
+    ) -> tuple[dict[str, Any], ...]:
+        """Return bounded recent messages ranked by same-skeleton/simhash proximity."""
+        if user_id is None or limit <= 0 or candidate_limit <= 0:
+            return ()
+        cutoff = _now() if now is None else now
+        with self._locked_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT message_id, text_snapshot, clean_text, skeleton_hash, simhash,
+                    link_domains_json, created_at
+                FROM recent_user_messages
+                WHERE chat_id = ? AND user_id = ?
+                    AND expires_at > ? AND (? IS NULL OR message_id != ?)
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (chat_id, user_id, cutoff, message_id, message_id, max(1, candidate_limit)),
+            ).fetchall()
+
+        ranked: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                previous_simhash = int(item["simhash"])
+            except (TypeError, ValueError):
+                previous_simhash = 0
+            item["simhash_distance"] = (simhash ^ previous_simhash).bit_count()
+            item["same_skeleton"] = item["skeleton_hash"] == skeleton_hash
+            item["age_seconds"] = max(0, cutoff - int(item["created_at"]))
+            try:
+                domains = json.loads(item.pop("link_domains_json") or "[]")
+            except json.JSONDecodeError:
+                domains = []
+            item["link_domains"] = [str(domain) for domain in domains] if isinstance(domains, list) else []
+            item.pop("skeleton_hash", None)
+            item.pop("simhash", None)
+            ranked.append(item)
+
+        ranked.sort(
+            key=lambda item: (
+                not item["same_skeleton"],
+                int(item["simhash_distance"]),
+                -int(item["created_at"]),
+            )
+        )
+        return tuple(ranked[:limit])
+
+    def record_recent_user_message(
+        self,
+        features: MessageFeatures,
+        *,
+        retention_seconds: int = 86_400,
+        max_chars: int = 800,
+        max_messages: int = 24,
+    ) -> None:
+        """Store a bounded, expiring body for future same-user clustering."""
+        if features.user_id is None or not features.text.strip():
+            return
+        now = _now()
+        text = features.text[: max(1, max_chars)]
+        clean_text = features.clean_text[: max(1, max_chars)]
+        with self._locked_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO recent_user_messages (
+                    chat_id, user_id, message_id, text_snapshot, clean_text,
+                    skeleton_hash, simhash, link_domains_json, created_at, expires_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, message_id) DO UPDATE SET
+                    user_id = excluded.user_id,
+                    text_snapshot = excluded.text_snapshot,
+                    clean_text = excluded.clean_text,
+                    skeleton_hash = excluded.skeleton_hash,
+                    simhash = excluded.simhash,
+                    link_domains_json = excluded.link_domains_json,
+                    created_at = excluded.created_at,
+                    expires_at = excluded.expires_at
+                """,
+                (
+                    features.chat_id,
+                    features.user_id,
+                    features.message_id,
+                    text,
+                    clean_text,
+                    features.skeleton_hash,
+                    str(features.simhash),
+                    json.dumps(list(features.link_domains), ensure_ascii=False),
+                    now,
+                    now + max(1, retention_seconds),
+                ),
+            )
+            conn.execute(
+                """
+                DELETE FROM recent_user_messages
+                WHERE chat_id = ? AND user_id = ?
+                    AND message_id NOT IN (
+                        SELECT message_id FROM recent_user_messages
+                        WHERE chat_id = ? AND user_id = ?
+                        ORDER BY created_at DESC
+                        LIMIT ?
+                    )
+                """,
+                (
+                    features.chat_id,
+                    features.user_id,
+                    features.chat_id,
+                    features.user_id,
+                    max(1, max_messages),
                 ),
             )
             conn.commit()

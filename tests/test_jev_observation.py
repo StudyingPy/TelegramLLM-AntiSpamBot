@@ -605,12 +605,18 @@ def test_real_handler_actions_reputation_and_learning_use_baseline_only(
             learned = conn.execute("SELECT COUNT(*) FROM fingerprints").fetchone()[0]
         rows, _ = read_observations(ob.settings.jev_observation_path)
         assert len(rows) == len(base.inputs) == 1
-        expected = "review" if mode == "review_failure" else "ban" if baseline_spam else "allow"
+        expected = "ban" if mode == "review_failure" else "ban" if baseline_spam else "allow"
         assert rows[0]["final"]["action"] == expected
         assert json.loads(actions[0]["metadata_json"])["jev_observation_id"] == rows[0]["id"]
         if mode == "review_failure":
-            assert not calls and not learned and context.reputation_score == 50
-            assert rows[0]["final"]["reason"] == "mimo_review_unavailable"
+            assert "ban" in calls
+            assert learned == (0 if baseline_spam else 1)
+            assert context.messages_seen == 1
+            assert rows[0]["final"]["reason"] in {
+                "llm_spam_high_confidence",
+                "llm_spam_high_confidence_low_reputation",
+                    "local_hit_needs_model",
+            }
         elif baseline_spam:
             assert "ban" in calls and context.reputation_score <= 50 and learned > 0
         else:
@@ -620,20 +626,21 @@ def test_real_handler_actions_reputation_and_learning_use_baseline_only(
             chain = json.loads(actions[0]["metadata_json"])["model_chain"]
             assert chain["primary"] == "jev" and chain["reviewer"] == "mimo"
             assert chain["decision_source"] == (
-                "pending_review" if mode == "review_failure" else "mimo_review"
+                "jev_only" if mode == "review_failure"
+                else "mimo_review"
             )
             from telegram_llm_antispam.notifications import _format_llm_section
 
             shown = _format_llm_section(
                 LocalDecision(
-                    DecisionAction.REVIEW,
+                    DecisionAction.BAN if mode == "review_failure" else DecisionAction.REVIEW,
                     "test",
                     0,
                     metadata=json.loads(actions[0]["metadata_json"]),
                 )
             )
             assert "Jev初审" in shown and "MiMo复核" in shown
-            assert ("复核未完成" if mode == "review_failure" else "结论不一致") in shown
+            assert ("Jev单独判定" if mode == "review_failure" else "结论不一致") in shown
     finally:
         ob.store.close()
         db.close()

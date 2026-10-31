@@ -1,4 +1,4 @@
-"""Jev-first routing with mandatory independent reviewer before model enforcement."""
+"""Jev-first routing with an independent reviewer when available."""
 
 from __future__ import annotations
 
@@ -24,7 +24,14 @@ from .jev import (
 )
 from .jev_store import ObservationStore
 from .llm import LLMJudge, _feature_payload
-from .models import ActionResult, LLMOutcome, LLMOutcomeStatus, LocalDecision, MessageFeatures
+from .models import (
+    ActionResult,
+    LLMJudgement,
+    LLMOutcome,
+    LLMOutcomeStatus,
+    LocalDecision,
+    MessageFeatures,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -184,8 +191,16 @@ class JevObserver:
                 "source_text_length": len(features.text),
                 "text_truncated_for_models": len(features.text) > 4000,
                 "context_availability": {
-                    key: payload.get(key) is not None
-                    for key in ("sender_profile", "og_preview", "personal_chat", "edited_from")
+                    key: bool(payload.get(key))
+                    if key == "recent_messages"
+                    else payload.get(key) is not None
+                    for key in (
+                        "sender_profile",
+                        "og_preview",
+                        "personal_chat",
+                        "edited_from",
+                        "recent_messages",
+                    )
                 },
                 "original_models_requested": self.settings.newapi_model,
                 "local_decision": {
@@ -235,6 +250,21 @@ class JevObserver:
                 )
             }
             primary_spam = result.get("noul", 0) >= 0.5 if result.get("status") == "ok" else None
+            reviewer_ok = outcome.status == LLMOutcomeStatus.OK and outcome.judgement is not None
+            if not reviewer_ok and result.get("status") == "ok":
+                # MiMo is unavailable, but Jev did return a validated Noul/Choice
+                # result. Treat this as a one-model review instead of discarding the
+                # primary answer and leaving the message in an un-actionable REVIEW.
+                outcome = LLMOutcome(
+                    status=LLMOutcomeStatus.OK,
+                    provider_count=1,
+                    judgement=LLMJudgement(
+                        is_spam=bool(primary_spam),
+                        confidence=float(result.get("noul", 0.0)),
+                        category=str(result.get("category") or "unknown"),
+                    ),
+                    metadata={**outcome.metadata, "jev_only": True},
+                )
             outcome = replace(
                 outcome,
                 metadata={
@@ -248,9 +278,13 @@ class JevObserver:
                         "agreement": primary_spam == outcome.judgement.is_spam
                         if primary_spam is not None and outcome.judgement is not None
                         else None,
-                        "decision_source": "mimo_review"
-                        if outcome.status == LLMOutcomeStatus.OK and outcome.judgement is not None
-                        else "pending_review",
+                        "decision_source": (
+                            "jev_only"
+                            if outcome.metadata.get("jev_only")
+                            else "mimo_review"
+                            if outcome.status == LLMOutcomeStatus.OK and outcome.judgement is not None
+                            else "pending_review"
+                        ),
                     },
                 },
             )

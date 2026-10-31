@@ -439,6 +439,7 @@ def _feature_payload(features: MessageFeatures) -> dict[str, object]:
         "personal_chat": _personal_chat_payload(features.metadata.get("personal_chat")),
         "og_preview": features.metadata.get("og_preview"),
         "edited_from": _edited_from_payload(features.metadata.get("edited_from")),
+        "recent_messages": _recent_messages_payload(features.metadata.get("recent_messages")),
     }
 
 
@@ -463,6 +464,28 @@ def _edited_from_payload(value: object) -> dict[str, object] | None:
         "text": str(value.get("text") or "")[:4000],
         "content_hash": str(value.get("content_hash") or "")[:128] or None,
     }
+
+
+def _recent_messages_payload(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    result: list[dict[str, object]] = []
+    for item in value[:6]:
+        if not isinstance(item, dict):
+            continue
+        result.append(
+            {
+                "text": str(item.get("text_snapshot") or "")[:800],
+                "clean_text": str(item.get("clean_text") or "")[:800],
+                "age_seconds": max(0, int(item.get("age_seconds") or 0)),
+                "same_skeleton": bool(item.get("same_skeleton")),
+                "simhash_distance": max(0, int(item.get("simhash_distance") or 0)),
+                "link_domains": [str(domain) for domain in item.get("link_domains", [])][:8]
+                if isinstance(item.get("link_domains"), (list, tuple))
+                else [],
+            }
+        )
+    return result
 
 
 def _extract_message_content(response: object) -> str | None:
@@ -592,6 +615,7 @@ _SYSTEM_PROMPT = """你是 Telegram 群组反广告审核器。你的目标是�
 - 低信誉、外链、预览卡、联系方式、诱导私聊、博彩/色情/返利/空投/刷单等都是信号，但不是单独定罪理由。
 - @xxx、@xxxbot、t.me、telegram 这类联系方式同时搭配“加群、拿码、收钱、赚钱、做单、刷单、看片、成人、调教、博彩”等词时，应判为明确广告。
 - 注意规避词和同音字：近裙/进裙/今群通常在表达“进群”，裙常代替群，壹常代替一，sou款常代替收款。此类变形若与 @用户名、链接或私聊引导同时出现，是高风险引流信号；应按还原后的语义判断，不能因字面不完全匹配而视为正常消息。
+- 乱码、谐音字、异常分隔符或中英混写本身只是信号；结合上下文时应尝试还原其可能语义，并与招募、赚钱、联系方式或导流载体一起判断。
 - 正文为空或只有标点但 preview/OG 文案含色情、博彩、刷单、导流等内容时，应按预览内容判为广告。
 - 用户名、昵称、bio 都是用户可控的弱信号；个人频道链接、AFF/推广介绍、或“私聊：@xxxbot”这类防骚扰说明，单独都不能判广告。只有群消息正文、按钮/链接、行为信号与 Bio 相互印证时，才提高置信度；空正文不能仅凭 Bio 自动封禁。
 - personal_chat 是该用户当前主动挂在个人资料页的频道及其最近消息。群消息若只有含糊的金额、招募、演员结算、换资或码商话术，必须结合 personal_chat 判断：两侧语义相互印证为招揽、交易或导流时应判为广告并给高置信度；个人频道存在本身、或频道内容与群消息无关时不能定罪。

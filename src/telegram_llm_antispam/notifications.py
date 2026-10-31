@@ -377,6 +377,8 @@ def _format_llm_section(decision: LocalDecision) -> str:
                 f" / {_esc(str(primary.get('category') or 'unknown'))}")
     else:
         text = f"\nJev初审：调用失败 / {_esc(str(primary.get('error') or 'unknown'))}"
+    if chain.get("decision_source") == "jev_only":
+        return text + "\nMiMo复核：不可用，采用Jev单独判定"
     text += legacy.replace("\nLLM：", "\nMiMo复核：", 1)
     if chain.get("decision_source") == "pending_review":
         text += "\n复核未完成，保持待复核"

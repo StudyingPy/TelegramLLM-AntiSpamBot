@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import time
 
 from .config import Settings
 from .db import Database
 from .logging_config import configure_logging
 from .llm import newapi_provider_count
+from .metrics import collect_moderation_metrics, format_metrics
 
 
 def main() -> None:
@@ -13,6 +15,14 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("init-db", help="Create or migrate the SQLite database.")
     subparsers.add_parser("show-config", help="Print effective non-secret configuration.")
+
+    metrics = subparsers.add_parser(
+        "moderation-metrics",
+        help="Print read-only moderation funnel and observable miss-proxy metrics.",
+    )
+    metrics.add_argument(
+        "--hours", type=int, default=24, help="Look back this many hours (default: 24)."
+    )
 
     list_fp = subparsers.add_parser(
         "list-fingerprints",
@@ -111,6 +121,18 @@ def main() -> None:
 
     if args.command == "show-config":
         _print_config(settings)
+        return
+
+    if args.command == "moderation-metrics":
+        if args.hours <= 0:
+            raise SystemExit("--hours must be positive")
+        until = int(time.time())
+        metrics = collect_moderation_metrics(
+            settings.database_path,
+            since=until - args.hours * 3600,
+            until=until,
+        )
+        print(format_metrics(metrics))
         return
 
     if args.command == "list-fingerprints":
@@ -296,3 +318,7 @@ def _print_config(settings: Settings) -> None:
     print(f"NEWAPI_MODEL={settings.newapi_model}")
     print(f"OG_FETCH_ENABLED={settings.og_fetch_enabled}")
     print(f"PROFILE_BIO_FETCH_ENABLED={settings.profile_bio_fetch_enabled}")
+    print(f"RECENT_CONTEXT_RETENTION_SECONDS={settings.recent_context_retention_seconds}")
+    print(f"RECENT_CONTEXT_MAX_MESSAGES={settings.recent_context_max_messages}")
+    print(f"RECENT_CONTEXT_CANDIDATE_LIMIT={settings.recent_context_candidate_limit}")
+    print(f"RECENT_CONTEXT_MAX_CHARS={settings.recent_context_max_chars}")

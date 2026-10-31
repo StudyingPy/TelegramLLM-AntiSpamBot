@@ -29,6 +29,10 @@ CATEGORIES = {
 POLICY = (
     _SYSTEM_PROMPT.split("JSON schema：", 1)[0]
     .replace("- 你只输出 JSON，不输出解释文本。", "")
+    .replace(
+        "- 乱码、谐音字、异常分隔符或中英混写本身只是信号；结合上下文时应尝试还原其可能语义，并与招募、赚钱、联系方式或导流载体一起判断。\n",
+        "",
+    )
     .strip()
 )
 QUESTION_POLICY = (
