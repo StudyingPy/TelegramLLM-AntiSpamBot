@@ -78,6 +78,7 @@ _BOT_MENTION_RE = re.compile(rf"@({_BOT_USERNAME})", re.IGNORECASE)
 def create_router(
     settings: Settings, db: Database, llm: LLMJudge | None = None,
     jev_observer: JevObserver | None = None,
+    vision_shadow: Any | None = None,
 ) -> Router:
     router = Router(name="moderation")
     rule_engine = RuleEngine(settings)
@@ -695,6 +696,11 @@ def create_router(
                 features,
                 ttl_seconds=EDIT_WATCH_TTL_SECONDS,
             )
+        if vision_shadow is not None:
+            try:
+                vision_shadow.submit(message, features, decision)
+            except Exception as exc:
+                logger.warning("Visual shadow enqueue failed (%s)", type(exc).__name__)
         await notify_admins(message.bot, db, settings, features, decision, result)
 
     @router.callback_query(F.data.startswith("vote:"))

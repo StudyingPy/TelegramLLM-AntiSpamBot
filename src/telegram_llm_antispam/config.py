@@ -157,6 +157,21 @@ class Settings:
     recent_context_max_chars: int = 800
     recruitment_repeat_window_seconds: int = 21_600
     recruitment_repeat_min_messages: int = 3
+    vision_mode: str = "off"
+    vision_chat_ids: tuple[int, ...] = ()
+    vision_observation_path: Path = Path("data/vision-observations.db")
+    vision_proxy_url: str | None = None
+    vision_font_path: str | None = None
+    vision_timeout_seconds: float = 60.0
+    vision_queue_size: int = 8
+    vision_max_concurrent: int = 2
+    vision_max_calls_per_day: int = 50
+    vision_max_assets: int = 32
+    vision_max_images: int = 12
+    vision_max_frames: int = 4
+    vision_max_download_bytes: int = 4 * 1024 * 1024
+    vision_profile_ttl_seconds: int = 300
+    vision_retention_days: int = 7
 
     @property
     def has_newapi(self) -> bool:
@@ -256,4 +271,19 @@ class Settings:
             recent_context_max_messages=_env_int("RECENT_CONTEXT_MAX_MESSAGES", 6),
             recent_context_candidate_limit=_env_int("RECENT_CONTEXT_CANDIDATE_LIMIT", 24),
             recent_context_max_chars=_env_int("RECENT_CONTEXT_MAX_CHARS", 800),
+            vision_mode=os.getenv("VISION_MODE", "off").strip().lower(),
+            vision_chat_ids=_env_int_tuple("VISION_CHAT_IDS"),
+            vision_observation_path=Path(os.getenv("VISION_OBSERVATION_PATH", "data/vision-observations.db")),
+            vision_proxy_url=os.getenv("VISION_PROXY_URL") or None,
+            vision_font_path=os.getenv("VISION_FONT_PATH") or None,
+            vision_timeout_seconds=_env_float("VISION_TIMEOUT_SECONDS", 60),
+            vision_queue_size=_env_int("VISION_QUEUE_SIZE", 8),
+            vision_max_concurrent=_env_int("VISION_MAX_CONCURRENT", 2),
+            vision_max_calls_per_day=_env_int("VISION_MAX_CALLS_PER_DAY", 50),
+            vision_max_assets=_env_int("VISION_MAX_ASSETS", 32),
+            vision_max_images=_env_int("VISION_MAX_IMAGES", 12),
+            vision_max_frames=_env_int("VISION_MAX_FRAMES", 4),
+            vision_max_download_bytes=_env_int("VISION_MAX_DOWNLOAD_BYTES", 4 * 1024 * 1024),
+            vision_profile_ttl_seconds=_env_int("VISION_PROFILE_TTL_SECONDS", 300),
+            vision_retention_days=_env_int("VISION_RETENTION_DAYS", 7),
         )

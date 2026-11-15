@@ -17,6 +17,7 @@ from .llm import create_llm_judge
 from .jev_observation import create_jev_observer
 from .fingerprint_audit import set_review_menu_button, sweep_fingerprints
 from .logging_config import configure_logging
+from .vision_shadow import create_vision_shadow
 
 
 logger = logging.getLogger(__name__)
@@ -40,7 +41,6 @@ async def run() -> None:
     dispatcher = Dispatcher()
     judge = create_llm_judge(settings)
     jev_observer = create_jev_observer(settings)
-    dispatcher.include_router(create_router(settings, db, llm=judge, jev_observer=jev_observer))
     await bot.set_my_commands(
         [
             BotCommand(command="start", description="显示帮助"),
@@ -54,6 +54,10 @@ async def run() -> None:
             BotCommand(command="fingerprints", description="指纹复核（仅指定复核人）"),
         ]
     )
+    vision_shadow = create_vision_shadow(settings)
+    dispatcher.include_router(create_router(
+        settings, db, llm=judge, jev_observer=jev_observer, vision_shadow=vision_shadow,
+    ))
     vote_sweeper = asyncio.create_task(
         _sweep_expired_votes(settings, bot, ModerationActions(settings, db))
     )
@@ -64,6 +68,8 @@ async def run() -> None:
         webui_server = await _start_webui(settings, bot, db)
         await dispatcher.start_polling(bot)
     finally:
+        if vision_shadow is not None:
+            await vision_shadow.close()
         for task in (vote_sweeper, fingerprint_sweeper):
             task.cancel()
         for task in (vote_sweeper, fingerprint_sweeper):
