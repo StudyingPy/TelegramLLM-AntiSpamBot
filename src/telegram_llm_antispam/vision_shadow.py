@@ -16,7 +16,7 @@ from pathlib import Path
 
 import httpx
 
-from .llm import _feature_payload, _newapi_providers_from_settings
+from .llm import _feature_payload, _loads_json_object, _newapi_providers_from_settings
 from .reputation import is_trusted_sender
 from .models import DecisionAction, LLMJudgement, LLMOutcome, LLMOutcomeStatus
 from .vision_collect import VisualCollector, VisualRequest, request_from_message
@@ -33,7 +33,8 @@ body_layout保留了正文中自定义emoji的相对位置与换行；布局只�
 区分message_is_promotional与profile_has_advertising。只有资料广告而当前正文是普通聊天、数字、抽奖口令或举报引用时，前者不能仅凭资料广告为true。
 会员身份、普通头像、品牌标志和普通贴纸本身不是广告。结合招揽、导流、联系方式和行为上下文判断。
 输出JSON：{"message_is_promotional":布尔,"profile_has_advertising":布尔,"confidence":0到1,
-"evidence":[{"source":"与输入来源一致","text":"实际可见的有界原文"}],"uncertainty":"缺失或模糊的内容"}。
+"evidence":[{"source":"与输入来源一致","text":"实际可见的原文，每项最多120字"}],"uncertainty":"缺失或模糊的内容"}。
+evidence最多6项，uncertainty最多120字。只输出完整JSON对象，不输出Markdown代码围栏或解释。
 来源仅可为avatar,status_emoji,body_emoji,body_layout,photo,sticker,animation,video,premium_animation,body_text,profile_bio,profile_name。"""
 
 
@@ -261,15 +262,58 @@ class VisionShadow:
                          "User-Agent": "TelegramLLMAntiSpamBot/0.1"},
                 json={"model": provider.model, "messages": [
                     {"role": "system", "content": PROMPT}, {"role": "user", "content": blocks}],
-                    "temperature": 0, "max_tokens": 1200,
+                    "temperature": 0, "max_tokens": 2400,
                     "response_format": {"type": "json_object"}},
             )
         if response.status_code != 200:
             return {"status": "failed", "http_status": response.status_code}
-        body = response.json()
-        judgement = parse_visual_result(json.loads(body["choices"][0]["message"]["content"]))
+        response_info = {"http_status": response.status_code,
+                         "response_bytes": len(response.content),
+                         "elapsed_ms": round((time.monotonic() - started) * 1000)}
+        try:
+            body = response.json()
+            choice = body["choices"][0]
+            message = choice["message"]
+        except (ValueError, TypeError, KeyError, IndexError):
+            return {**response_info, "status": "failed", "error_type": "invalid_api_response"}
+        finish = choice.get("finish_reason")
+        response_info["finish_reason"] = finish if finish in {
+            "stop", "length", "content_filter", "tool_calls", "function_call",
+        } else "unknown"
+        response_info["refusal_present"] = bool(message.get("refusal"))
+        content = message.get("content")
+        if isinstance(content, list):
+            content = "".join(item["text"] for item in content
+                              if isinstance(item, dict) and isinstance(item.get("text"), str))
+        if not isinstance(content, str):
+            content = ""
+        response_info.update(content_chars=len(content),
+                             content_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                             content_shape="empty" if not content.strip() else "markdown_fence"
+                             if content.lstrip().startswith("```") else "json_like"
+                             if content.lstrip().startswith("{") else "other")
+        usage = body.get("usage") or {}
+        if isinstance(usage, dict):
+            response_info["usage"] = {key: usage[key] for key in ("prompt_tokens", "completion_tokens")
+                                      if type(usage.get(key)) is int}
+        if response_info["refusal_present"] or finish == "content_filter":
+            return {**response_info, "status": "failed", "error_type": "refusal"
+                    if response_info["refusal_present"] else "content_filter"}
+        if finish == "length":
+            return {**response_info, "status": "failed", "error_type": "truncated_response"}
+        if not content.strip():
+            return {**response_info, "status": "failed", "error_type": "refusal"
+                    if response_info["refusal_present"] else "empty_content"}
+        try:
+            data = _loads_json_object(content)
+        except (ValueError, TypeError):
+            return {**response_info, "status": "failed", "error_type": "json_parse_error"}
+        try:
+            judgement = parse_visual_result(data)
+        except (ValueError, TypeError):
+            return {**response_info, "status": "failed", "error_type": "schema_error"}
         return {"status": "ok", "model": provider.model, "judgement": judgement,
-                "elapsed_ms": round((time.monotonic() - started) * 1000)}
+                **response_info}
 
     async def _process(self, job: Job) -> dict:
         prepared = await self.collector.prepare(job.bot, job.request)

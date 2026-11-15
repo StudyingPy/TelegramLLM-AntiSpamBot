@@ -320,6 +320,12 @@ def _notification_text(
     if decision.metadata.get("giveaway_reply"):
         trust_text += "\n活动口令：匹配已验证来源的抽奖通知"
     visual = decision.metadata.get("visual_review")
+    corroborated = decision.metadata.get("corroborated_recruitment")
+    if isinstance(corroborated, dict):
+        trust_text += (
+            f"\n代收招揽双模型印证：Jev {corroborated['jev_noul']:.0%}"
+            f" / MiMo {corroborated['mimo_confidence']:.0%}"
+        )
     if isinstance(visual, dict):
         trust_text += f"\n视觉审核：{_esc(str(visual.get('status', 'unknown')))}"
         for item in (visual.get("evidence") or [])[:2]:

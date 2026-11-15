@@ -15,6 +15,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from .actions import ModerationActions
 from .admin import ChatAdminCache, can_manage_chat, is_chat_allowed, is_global_admin
 from .config import Settings
+from .corroboration import corroborated_financial_recruitment
 from .db import Database
 from .feedback import (
     _EMPTY_TEXT_HASH,
@@ -625,6 +626,7 @@ def create_router(
             except Exception as exc:
                 logger.warning("Jev bypass observation failed (%s)", type(exc).__name__)
 
+        decision = corroborated_financial_recruitment(features, decision)
         metadata = dict(decision.metadata)
         metadata.setdefault("local_rule_reason", local_decision.metadata.get(
             "local_rule_reason", local_decision.reason
