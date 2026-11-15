@@ -69,6 +69,8 @@ def test_live_review_uses_existing_thresholds_and_profile_only_vote(
         if not body:
             msg.photo = []
         features = build_message_features(msg)
+        if not body:
+            features.metadata["sender_profile"] = {"display_name": "群发服务"}
         features.metadata["user_trust"] = {"is_trusted": trusted}
         local = LocalDecision(DecisionAction.REVIEW, "unmatched", 0, True)
         binding = await service.bind(msg, features, local)
@@ -102,6 +104,7 @@ def test_numeric_body_cannot_turn_status_ad_into_body_ban(tmp_path):
         msg.text = "1"
         msg.photo = []
         features = build_message_features(msg)
+        features.metadata["sender_profile"] = {"display_name": "飞机群发"}
         binding = await service.bind(msg, features, LocalDecision(DecisionAction.REVIEW, "x", 0))
         outcome = await binding.judge_payload(_feature_payload(features))
         result = binding.annotate(decision_from_llm(outcome.judgement, features, config(tmp_path)))

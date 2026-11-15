@@ -30,3 +30,7 @@
 `short_zh_full` Questions，保留 Jev 全量初审→MiMo 独立复核。版本及 Questions 哈希写入观察记录和启动日志。
 `production_replay` 与 `long_compact` 两个实验名固定引用旧的 `LEGACY_QUESTIONS`，用于复现首轮控制组；
 它们在本工具中不跟随当前生产默认提示词变化。
+
+2026-11-15 用户要求润色提示词后，增加 `evidence_zh_full`（v3，原完整输入）。
+`short_zh_full` 继续保留 v2 原问题，不跟随 v3 变化；新旧策略可在同一固定输入上比较。
+视觉素材选择与新策略边界见 [visual-routing-and-jev-v3.md](visual-routing-and-jev-v3.md)。

@@ -17,9 +17,9 @@ from pathlib import Path
 import httpx
 
 from .llm import _feature_payload, _loads_json_object, _newapi_providers_from_settings
-from .reputation import is_trusted_sender
 from .models import DecisionAction, LLMJudgement, LLMOutcome, LLMOutcomeStatus
 from .vision_collect import VisualCollector, VisualRequest, request_from_message
+from .vision_routing import profile_inspection_reason
 
 
 logger = logging.getLogger(__name__)
@@ -139,11 +139,13 @@ class VisionShadow:
         if (self.closed or self.settings.vision_mode != "enforce"
                 or features.chat_id not in self.settings.vision_chat_ids or features.user_id is None):
             return None
-        request = request_from_message(
-            message, features.user_id,
-            inspect_profile=not is_trusted_sender(features) or len(features.clean_text) <= 8,
-        )
+        profile_reason = profile_inspection_reason(features)
+        request = request_from_message(message, features.user_id,
+                                       inspect_profile=profile_reason is not None)
         required = bool(request.files or any(run.emoji_id for run in request.document.runs))
+        features.metadata["visual_routing"] = {
+            "body_media": required, "profile_reason": profile_reason,
+        }
         if not required and not request.inspect_profile:
             return None
         await self.live_slots.acquire()
@@ -170,7 +172,8 @@ class VisionShadow:
                       "message_id": features.message_id, "user_id": features.user_id,
                       "status": "prepared", "local_decision": {
                           "action": local.action.value, "reason": local.reason},
-                      "visual": prepared.manifest(), "input_parity": "reviewer_has_visual_context"}
+                      "visual": prepared.manifest(), "routing": features.metadata["visual_routing"],
+                      "input_parity": "reviewer_has_visual_context"}
             fresh = self.store.begin(key, record, self.settings.vision_retention_days)
             features.metadata["reviewer_system_prompt_hash"] = hashlib.sha256(PROMPT.encode()).hexdigest()
             cached = None
@@ -214,7 +217,7 @@ class VisionShadow:
                 or features.user_id is None or self.queue.full()):
             return False
         request = request_from_message(message, features.user_id,
-                                       inspect_profile=not is_trusted_sender(features))
+                                       inspect_profile=profile_inspection_reason(features) is not None)
         if not request.files and not request.inspect_profile and not any(
             run.emoji_id for run in request.document.runs
         ):

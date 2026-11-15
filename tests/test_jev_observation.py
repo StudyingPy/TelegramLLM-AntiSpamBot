@@ -157,14 +157,16 @@ def test_questions_preserve_original_chinese_boundaries():
         assert "JSON schema" not in question["instructions"]
 
 
-def test_production_questions_match_evaluated_short_zh_full():
-    from telegram_llm_antispam.jev import LEGACY_QUESTIONS, QUESTIONS_HASH
+def test_production_questions_use_evidence_v3_and_keep_frozen_controls():
+    from telegram_llm_antispam.jev import LEGACY_QUESTIONS, QUESTIONS_HASH, SHORT_ZH_QUESTIONS
     from telegram_llm_antispam.jev_prompt_lab import VARIANTS
 
-    assert QUESTIONS == VARIANTS["short_zh_full"]["questions"]
-    assert VARIANTS["short_zh_full"]["input"] == "full"
+    assert QUESTIONS == VARIANTS["evidence_zh_full"]["questions"]
+    assert VARIANTS["evidence_zh_full"]["input"] == "full"
+    assert SHORT_ZH_QUESTIONS == VARIANTS["short_zh_full"]["questions"]
+    assert digest(SHORT_ZH_QUESTIONS) == "c6163e85797b1001f9dd2d6a1aa8fd776f31fe22ce2294093ac8c6d3d343cbdd"
     assert QUESTIONS_HASH != digest(LEGACY_QUESTIONS)
-    assert QUESTIONS_HASH == "c6163e85797b1001f9dd2d6a1aa8fd776f31fe22ce2294093ac8c6d3d343cbdd"
+    assert QUESTIONS_HASH == "ac682b0592b43d4c76e63fa836fd6d02f7f0079f564764275efce0543b843558"
     assert (
         digest(LEGACY_QUESTIONS)
         == "cc20caa12b86126ea7ee313ef3ad7f073044bec337992a7d0f3765c512f3a677"
