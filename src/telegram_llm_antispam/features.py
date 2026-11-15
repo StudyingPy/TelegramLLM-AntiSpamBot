@@ -46,6 +46,11 @@ def build_message_features(
         "link_count": len(links),
         "domains": list(extract_domains(links)),
     }
+    for entity in (*(_field(message, "entities") or ()), *(_field(message, "caption_entities") or ())):
+        kind = _field(entity, "type")
+        if getattr(kind, "value", kind) in {"blockquote", "expandable_blockquote", "pre", "code"}:
+            metadata["quoted_or_code_message"] = True
+            break
     if sender_profile is not None:
         metadata["sender_profile"] = sender_profile.to_payload()
     if user_context is not None:

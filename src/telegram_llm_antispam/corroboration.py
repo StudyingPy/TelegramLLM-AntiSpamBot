@@ -43,6 +43,7 @@ def corroborated_financial_recruitment(
         or features.user_id is None
         or is_trusted_sender(features)
         or features.metadata.get("giveaway_reply")
+        or features.metadata.get("quoted_or_code_message")
     ):
         return decision
     amount = financial_collection_offer(features.text)

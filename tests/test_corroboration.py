@@ -197,3 +197,18 @@ def test_router_applies_corroboration_after_models_before_moderation(tmp_path, m
         assert applied[0].reason == "corroborated_financial_recruitment"
     finally:
         db.close()
+
+
+def test_telegram_blockquote_entities_do_not_get_automatic_policy_upgrade():
+    current = build_message_features(
+        SimpleNamespace(
+            message_id=1,
+            chat=SimpleNamespace(id=-1001),
+            from_user=SimpleNamespace(id=42),
+            text="微信帮我收资 一天5ooo",
+            entities=[{"type": "blockquote", "offset": 0, "length": 15}],
+        )
+    )
+    original = decision()
+    assert current.metadata["quoted_or_code_message"] is True
+    assert corroborated_financial_recruitment(current, original) is original
