@@ -1214,7 +1214,7 @@ def _same_user_open_vote_repeat_decision(
     matching_session_ids = [
         session.id
         for session in sessions
-        if (
+        if session.reason != "visual_profile_advertising" and (
             (feature_content and session.content_hash == feature_content)
             or (feature_skeleton and session.skeleton_hash == feature_skeleton)
         )

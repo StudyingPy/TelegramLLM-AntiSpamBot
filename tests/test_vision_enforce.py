@@ -9,7 +9,7 @@ import pytest
 from telegram_llm_antispam.db import Database
 from telegram_llm_antispam.features import build_message_features
 from telegram_llm_antispam.feedback import record_vote_spam_feedback
-from telegram_llm_antispam.handlers import create_router
+from telegram_llm_antispam.handlers import create_router, _same_user_open_vote_repeat_decision
 from telegram_llm_antispam.llm import _feature_payload, decision_from_llm
 from telegram_llm_antispam.models import ActionResult, DecisionAction, LocalDecision
 from telegram_llm_antispam.vision_collect import PreparedVisuals, VisualImage
@@ -207,5 +207,22 @@ def test_visual_vote_confirmation_does_not_learn_caption_fingerprints(tmp_path):
             DecisionAction.WITHDRAW_VOTE, "visual_profile_advertising", .84), timeout_seconds=60)
         record_vote_spam_feedback(db, db.get_vote_session(session_id), config(tmp_path))
         assert db.count_fingerprints() == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("reason,repeat_ban", [
+    ("visual_profile_advertising", False), ("visual_message_advertising", True),
+])
+def test_profile_only_open_vote_cannot_turn_repeated_greeting_into_ban(tmp_path, reason, repeat_ban):
+    db = Database(tmp_path / "moderation.db")
+    db.connect()
+    db.migrate()
+    features = build_message_features(message())
+    try:
+        db.create_vote_session(features, LocalDecision(
+            DecisionAction.WITHDRAW_VOTE, reason, .8), timeout_seconds=60)
+        decision = _same_user_open_vote_repeat_decision(config(tmp_path), db, replace(features, message_id=11))
+        assert (decision is not None) is repeat_ban
     finally:
         db.close()
