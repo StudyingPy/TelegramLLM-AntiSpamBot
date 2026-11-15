@@ -155,6 +155,8 @@ class Settings:
     recent_context_max_messages: int = 6
     recent_context_candidate_limit: int = 24
     recent_context_max_chars: int = 800
+    recruitment_repeat_window_seconds: int = 21_600
+    recruitment_repeat_min_messages: int = 3
 
     @property
     def has_newapi(self) -> bool:
@@ -194,6 +196,8 @@ class Settings:
             ),
             repeat_window_seconds=_env_int("REPEAT_WINDOW_SECONDS", 300),
             repeat_min_distinct_senders=_env_int("REPEAT_MIN_DISTINCT_SENDERS", 3),
+            recruitment_repeat_window_seconds=_env_int("RECRUITMENT_REPEAT_WINDOW_SECONDS", 21_600),
+            recruitment_repeat_min_messages=_env_int("RECRUITMENT_REPEAT_MIN_MESSAGES", 3),
             fingerprint_review_weight=_env_float("FINGERPRINT_REVIEW_WEIGHT", 40),
             fingerprint_ban_weight=_env_float("FINGERPRINT_BAN_WEIGHT", 85),
             llm_fingerprint_initial_weight=_env_float("LLM_FINGERPRINT_INITIAL_WEIGHT", 50),

@@ -158,6 +158,30 @@ CREATE TABLE IF NOT EXISTS recent_user_messages (
     PRIMARY KEY (chat_id, message_id)
 );
 
+-- Short recruitment candidates only; no message bodies or profile snapshots.
+CREATE TABLE IF NOT EXISTS recruitment_repeats (
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    repeat_key TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_recruitment_repeats_key
+    ON recruitment_repeats(chat_id, repeat_key, created_at);
+CREATE INDEX IF NOT EXISTS idx_recruitment_repeats_expiry ON recruitment_repeats(expires_at);
+
+-- Explicit keywords from verified group activity notices, hashes only.
+CREATE TABLE IF NOT EXISTS giveaway_keywords (
+    chat_id INTEGER NOT NULL,
+    prompt_message_id INTEGER NOT NULL,
+    repeat_key TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, prompt_message_id, repeat_key)
+);
+CREATE INDEX IF NOT EXISTS idx_giveaway_keywords_key ON giveaway_keywords(chat_id, repeat_key);
+
 -- Only messages from new / low-reputation users are retained here.  Telegram's
 -- edited_message update contains the new body, not the previous revision, so a
 -- short-lived baseline is required to tell an innocent edit from an edit that
@@ -983,6 +1007,72 @@ class Database(FingerprintStore, FingerprintWebStore):
             return None
         snap = meta.get("text_snapshot")
         return snap if isinstance(snap, str) else None
+
+    def remember_giveaway_keywords(
+        self, chat_id: int, prompt_message_id: int, keys: tuple[str, ...],
+    ) -> None:
+        now = _now()
+        with self._locked_conn() as conn:
+            conn.execute("DELETE FROM giveaway_keywords WHERE expires_at <= ?", (now,))
+            conn.execute(
+                "DELETE FROM giveaway_keywords WHERE chat_id = ? AND prompt_message_id = ?",
+                (chat_id, prompt_message_id),
+            )
+            conn.executemany(
+                "INSERT INTO giveaway_keywords VALUES (?, ?, ?, ?)",
+                [(chat_id, prompt_message_id, key, now + 7200) for key in keys[:8]],
+            )
+            conn.commit()
+
+    def active_giveaway_prompt(self, chat_id: int, repeat_key: str) -> int | None:
+        with self._locked_conn() as conn:
+            conn.execute("DELETE FROM giveaway_keywords WHERE expires_at <= ?", (_now(),))
+            row = conn.execute(
+                """SELECT prompt_message_id FROM giveaway_keywords
+                WHERE chat_id = ? AND repeat_key = ? ORDER BY expires_at DESC LIMIT 1""",
+                (chat_id, repeat_key),
+            ).fetchone()
+            conn.commit()
+        return int(row[0]) if row else None
+
+    def record_recruitment_repeat(
+        self, features: MessageFeatures, repeat_key: str, *, window_seconds: int,
+    ) -> dict[str, Any]:
+        """Atomically reserve a candidate and count same-chat, distinct messages.
+
+        Called before any model await so concurrent accounts cannot all miss the
+        threshold. Duplicate delivery keeps the original time and counts only once.
+        """
+        now = _now()
+        window = max(1, window_seconds)
+        with self._locked_conn() as conn:
+            conn.execute("DELETE FROM recruitment_repeats WHERE expires_at <= ?", (now,))
+            conn.execute(
+                "INSERT OR IGNORE INTO recruitment_repeats VALUES (?, ?, ?, ?, ?, ?)",
+                (features.chat_id, features.message_id, features.user_id, repeat_key,
+                 now, now + window),
+            )
+            counts = conn.execute(
+                """SELECT COUNT(*) AS message_count, COUNT(DISTINCT user_id) AS distinct_senders,
+                    COALESCE(SUM(user_id = ?), 0) AS same_sender_count
+                FROM recruitment_repeats
+                WHERE chat_id = ? AND repeat_key = ? AND created_at > ?""",
+                (features.user_id, features.chat_id, repeat_key, now - window),
+            ).fetchone()
+            own_ids = conn.execute(
+                """SELECT message_id FROM recruitment_repeats
+                WHERE chat_id = ? AND repeat_key = ? AND user_id = ? AND created_at > ?
+                ORDER BY created_at DESC, message_id DESC LIMIT 30""",
+                (features.chat_id, repeat_key, features.user_id, now - window),
+            ).fetchall()
+            conn.commit()
+        return {
+            "message_count": int(counts["message_count"]),
+            "distinct_senders": int(counts["distinct_senders"]),
+            "same_sender_count": int(counts["same_sender_count"]),
+            "same_sender_message_ids": [int(row["message_id"]) for row in own_ids],
+            "window_seconds": window,
+        }
 
     def count_recent_skeleton_senders(
         self,

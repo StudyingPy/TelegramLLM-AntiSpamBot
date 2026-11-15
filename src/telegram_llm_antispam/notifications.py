@@ -310,6 +310,15 @@ def _notification_text(
         trust_text += f"\n原规则：{_esc(str(original))}"
     if decision.metadata.get("fingerprint_id") is not None:
         trust_text += f"\n命中指纹：{decision.metadata['fingerprint_id']}"
+    repeat = decision.metadata.get("recruitment_repeat")
+    if isinstance(repeat, dict):
+        trust_text += (
+            f"\n重复招揽：本账号 {repeat.get('same_sender_count', 0)} 次"
+            f" / 同群 {repeat.get('distinct_senders', 0)} 个账号"
+            f" / 窗口 {repeat.get('window_seconds', 0)} 秒"
+        )
+    if decision.metadata.get("giveaway_reply"):
+        trust_text += "\n活动口令：匹配已验证来源的抽奖通知"
 
     links = ", ".join(link.url for link in features.links) or "-"
     snapshot = features.text[:800] or "(empty)"

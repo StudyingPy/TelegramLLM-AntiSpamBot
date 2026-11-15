@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 
-from .llm import _SYSTEM_PROMPT
+from .llm import _LEGACY_SYSTEM_PROMPT, _SYSTEM_PROMPT
 
 ENDPOINT = "https://api.typesafe.ai/v1/systemone"
 POLICY_VERSION = "telegram-message-short-zh-v2"
@@ -27,7 +27,7 @@ CATEGORIES = {
 }
 # Reuse every existing semantic rule, replacing only output-format instructions.
 POLICY = (
-    _SYSTEM_PROMPT.split("JSON schema：", 1)[0]
+    _LEGACY_SYSTEM_PROMPT.split("JSON schema：", 1)[0]
     .replace("- 你只输出 JSON，不输出解释文本。", "")
     .replace(
         "- 乱码、谐音字、异常分隔符或中英混写本身只是信号；结合上下文时应尝试还原其可能语义，并与招募、赚钱、联系方式或导流载体一起判断。\n",

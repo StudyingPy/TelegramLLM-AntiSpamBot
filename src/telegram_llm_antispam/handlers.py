@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import logging
 import re
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
@@ -43,6 +44,11 @@ from .og import fetch_og_for_features, should_fetch_og
 from .profile import fetch_personal_chat_for_crosscheck, get_sender_profile
 from .rules import RuleEngine, route_long_message_to_llm, should_crosscheck_personal_channel
 from .reputation import is_trusted_sender, route_trusted_message_to_llm, trust_context
+from .repeats import (
+    giveaway_recruitment_keys, giveaway_reply_matches, recruitment_repeat_key,
+    repeated_recruitment_decision,
+)
+from .links import extract_message_text
 
 
 logger = logging.getLogger(__name__)
@@ -313,6 +319,7 @@ def create_router(
         # submissions — moderating them deletes/bans the group's own channel content
         # (the classic "bot ate the forwarded 端午 promo post" failure). Never touch them.
         if not is_edit and _is_automatic_channel_forward(message):
+            _remember_giveaway_prompt(message, db)
             return
 
         # Whitelisted user IDs (built-in Telegram service accounts + env
@@ -329,8 +336,11 @@ def create_router(
             not new_members and sender_id is not None
             and _is_whitelisted_sender(db, settings, sender_id)
         ):
+            if getattr(message.from_user, "is_bot", False):
+                _remember_giveaway_prompt(message, db)
             return
         if not new_members and _is_anonymous_admin_message(message):
+            _remember_giveaway_prompt(message, db)
             return
         bot_usernames: tuple[str, ...] = ()
         had_ad_invocation = False
@@ -414,11 +424,13 @@ def create_router(
         had_ad_invocation: bool = False,
     ) -> None:
         if is_global_admin(settings, user.id):
+            _remember_giveaway_prompt(message, db)
             return
         admin_status = await admin_cache.is_admin(
             message.bot, message.chat.id, user.id, is_bot=getattr(user, "is_bot", False)
         )
         if admin_status is True:
+            _remember_giveaway_prompt(message, db)
             return
         if update_type == "new_chat_member":
             date = getattr(message, "date", None)
@@ -458,6 +470,20 @@ def create_router(
             ),
             "message_ids": [int(item["message_id"]) for item in recent_messages],
         }
+        if await _verified_giveaway_reply(message, settings, db, admin_cache):
+            features.metadata["giveaway_reply"] = {
+                "prompt_message_id": message.reply_to_message.message_id,
+                "verified_source": True,
+            }
+        elif (repeat_key := recruitment_repeat_key(features.text)) is not None:
+            prompt_id = db.active_giveaway_prompt(features.chat_id, repeat_key)
+            if prompt_id is not None:
+                features.metadata["giveaway_reply"] = {
+                    "prompt_message_id": prompt_id,
+                    "verified_source": True,
+                    "match_type": "active_keyword",
+                }
+        recruitment_repeat = repeated_recruitment_decision(settings, db, features)
         edit_snapshot = None
         if is_edit:
             edit_snapshot = db.get_edit_watch_snapshot(
@@ -523,6 +549,7 @@ def create_router(
         repeat_decision = _repeat_decision(settings, db, features)
         decision = (
             repeated_bot_only_decision
+            or recruitment_repeat
             or same_user_repeat_decision
             or repeat_decision
             or rule_engine.evaluate(features, fingerprint=fingerprint)
@@ -585,6 +612,10 @@ def create_router(
         ))
         metadata["user_trust"] = features.metadata["user_trust"]
         metadata["recent_message_cluster"] = features.metadata["recent_message_cluster"]
+        if "recruitment_repeat" in features.metadata:
+            metadata["recruitment_repeat"] = features.metadata["recruitment_repeat"]
+        if "giveaway_reply" in features.metadata:
+            metadata["giveaway_reply"] = features.metadata["giveaway_reply"]
         metadata["update_type"] = update_type
         if observation_id is not None:
             metadata["jev_observation_id"] = observation_id
@@ -1082,6 +1113,46 @@ def _feature_message_for_user(message: Message, user: Any) -> Any:
     )
 
 
+def _remember_giveaway_prompt(message: Any, db: Database) -> None:
+    keys = giveaway_recruitment_keys(extract_message_text(message))
+    date = getattr(message, "date", None)
+    if hasattr(date, "timestamp") and time.time() - date.timestamp() >= 7200:
+        keys = ()
+    db.remember_giveaway_keywords(
+        message.chat.id, message.message_id, keys,
+    )
+
+
+async def _verified_giveaway_reply(
+    message: Any, settings: Settings, db: Database, admin_cache: ChatAdminCache,
+) -> bool:
+    prompt = getattr(message, "reply_to_message", None)
+    if prompt is None or not giveaway_reply_matches(
+        extract_message_text(message), extract_message_text(prompt),
+    ):
+        return False
+    # Ignore inaccessible/cross-chat reply adapters rather than inferring authority.
+    if getattr(getattr(prompt, "chat", None), "id", None) != message.chat.id:
+        return False
+    date = getattr(prompt, "date", None)
+    if not hasattr(date, "timestamp") or not 0 <= time.time() - date.timestamp() < 7200:
+        return False
+    if _is_anonymous_admin_message(prompt) or _is_automatic_channel_forward(prompt):
+        return True
+    source = getattr(prompt, "from_user", None)
+    if source is None:
+        return False
+    # Only a verified administrator or an explicitly whitelisted giveaway bot
+    # may supply the prompt. A spammer's self-declared "抽奖" is not authority.
+    if is_global_admin(settings, source.id):
+        return True
+    if getattr(source, "is_bot", False) and _is_whitelisted_sender(db, settings, source.id):
+        return True
+    return await admin_cache.is_admin(
+        message.bot, message.chat.id, source.id, is_bot=getattr(source, "is_bot", False),
+    ) is True
+
+
 def _same_user_open_vote_repeat_decision(
     settings: Settings,
     db: Database,
@@ -1180,6 +1251,8 @@ def _merge_llm_decision(
         "message_personal_channel_crosscheck_needs_llm",
         "long_message_needs_llm",
         "trusted_user_needs_llm",
+        "giveaway_keyword_needs_llm",
+        "repeated_recruitment_needs_llm",
     }:
         metadata = dict(local_decision.metadata)
         metadata.update(llm_decision.metadata)

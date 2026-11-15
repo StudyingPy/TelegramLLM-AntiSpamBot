@@ -440,6 +440,8 @@ def _feature_payload(features: MessageFeatures) -> dict[str, object]:
         "og_preview": features.metadata.get("og_preview"),
         "edited_from": _edited_from_payload(features.metadata.get("edited_from")),
         "recent_messages": _recent_messages_payload(features.metadata.get("recent_messages")),
+        "recruitment_repeat": features.metadata.get("recruitment_repeat"),
+        "giveaway_reply": features.metadata.get("giveaway_reply"),
     }
 
 
@@ -607,7 +609,7 @@ _FINGERPRINT_AUDIT_PROMPT = """你是广告指纹质量复核器。判断每项�
 必须为每个输入 ID 返回且仅返回一项，不能添加其他 ID。"""
 
 
-_SYSTEM_PROMPT = """你是 Telegram 群组反广告审核器。你的目标是判断单条消息是否为广告、诈骗、引流、拉人进群、色情/博彩推广或恶意营销。
+_LEGACY_SYSTEM_PROMPT = """你是 Telegram 群组反广告审核器。你的目标是判断单条消息是否为广告、诈骗、引流、拉人进群、色情/博彩推广或恶意营销。
 
 判定原则：
 - 误封真人的代价远高于漏放广告；只有证据明确时才给高置信度。
@@ -632,3 +634,9 @@ JSON schema：
 }
 
 confidence 必须在 0 到 1 之间。signal_phrases 只放实际触发判断的短语或载体信号，最多 10 个。"""
+
+_SYSTEM_PROMPT = _LEGACY_SYSTEM_PROMPT + """
+
+行为上下文：
+- recruitment_repeat 是同群短招揽文案的重复统计（含当前消息），不等于广告定罪。重复招揽若与当前账号自己的简介邀请链接、看主页/私聊导流相互印证，应提高广告置信度；不能把其他账号的资料归到当前发言者。
+- giveaway_reply 表示正文匹配已验证管理员或白名单机器人发布的抽奖关键词通知，可能是回复，也可能是有效期内直接发口令。正常抽奖口令、接龙、签到、复读玩笑不能仅凭重复判广告；自行声称“抽奖”不具有该保护。"""
