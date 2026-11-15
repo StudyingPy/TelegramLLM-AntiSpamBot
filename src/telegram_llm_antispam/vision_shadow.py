@@ -1,4 +1,4 @@
-"""Opt-in visual observation. This module has no moderation action/feedback access."""
+"""Visual material review; returns judgements to the existing moderation pipeline."""
 from __future__ import annotations
 
 import asyncio
@@ -11,13 +11,14 @@ import math
 import os
 import sqlite3
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import httpx
 
 from .llm import _feature_payload, _newapi_providers_from_settings
 from .reputation import is_trusted_sender
+from .models import DecisionAction, LLMJudgement, LLMOutcome, LLMOutcomeStatus
 from .vision_collect import VisualCollector, VisualRequest, request_from_message
 
 
@@ -85,9 +86,11 @@ class VisionStore:
                 (key, now, now + max(1, min(30, retention_days)) * 86400, json.dumps(record)),
             ).rowcount == 1
 
-    def reserve(self, cap: int) -> bool:
-        if cap <= 0:
+    def reserve(self, cap: int, *, unlimited: bool = False) -> bool:
+        if cap <= 0 and not unlimited:
             return False
+        if cap <= 0:
+            cap = 2**63 - 1
         day = time.strftime("%Y-%m-%d", time.gmtime())
         with self.conn:
             self.conn.execute("INSERT OR IGNORE INTO visual_budgets VALUES(?,0)", (day,))
@@ -122,10 +125,87 @@ class VisionShadow:
         self.timeout = max(.01, min(120, settings.vision_timeout_seconds))
         self.tasks: list[asyncio.Task] = []
         self.closed = False
+        self.live_slots = asyncio.Semaphore(max(1, min(2, settings.vision_max_concurrent)))
 
     def start(self):
+        if self.settings.vision_mode != "shadow":
+            return
         self.tasks = [asyncio.create_task(self._worker())
                       for _ in range(max(1, min(2, self.settings.vision_max_concurrent)))]
+
+    async def bind(self, message, features, local):
+        """Collect once, then let Jev run before a single multimodal MiMo reviewer."""
+        if (self.closed or self.settings.vision_mode != "enforce"
+                or features.chat_id not in self.settings.vision_chat_ids or features.user_id is None):
+            return None
+        request = request_from_message(
+            message, features.user_id,
+            inspect_profile=not is_trusted_sender(features) or len(features.clean_text) <= 8,
+        )
+        required = bool(request.files or any(run.emoji_id for run in request.document.runs))
+        if not required and not request.inspect_profile:
+            return None
+        await self.live_slots.acquire()
+        try:
+            prepared = await asyncio.wait_for(self.collector.prepare(message.bot, request), self.timeout)
+            features.metadata["visual_context"] = prepared.manifest()
+            if required and (not any(image.source in {
+                "body_layout", "photo", "sticker", "animation", "video", "premium_animation", "body_emoji",
+            } for image in prepared.images) or any(reason in {
+                "body_emoji_lookup_unavailable", "body_emoji_decode_unavailable", "body_layout_unavailable",
+                "photo_decode_unavailable", "sticker_decode_unavailable", "animation_decode_unavailable",
+                "video_decode_unavailable", "asset_count_truncated", "image_count_truncated",
+            } for reason in prepared.limitations)):
+                features.metadata["visual_required_unavailable"] = True
+            if not prepared.images:
+                features.metadata["visual_required_unavailable"] = required
+                self.live_slots.release()
+                return None
+            key = hashlib.sha256(json.dumps([
+                features.chat_id, features.message_id, asdict(request), prepared.manifest(),
+                self.settings.newapi_model, hashlib.sha256(PROMPT.encode()).hexdigest(),
+            ], sort_keys=True).encode()).hexdigest()
+            record = {"mode": "enforce", "chat_id": features.chat_id,
+                      "message_id": features.message_id, "user_id": features.user_id,
+                      "status": "prepared", "local_decision": {
+                          "action": local.action.value, "reason": local.reason},
+                      "visual": prepared.manifest(), "input_parity": "reviewer_has_visual_context"}
+            fresh = self.store.begin(key, record, self.settings.vision_retention_days)
+            features.metadata["reviewer_system_prompt_hash"] = hashlib.sha256(PROMPT.encode()).hexdigest()
+            cached = None
+            if not fresh:
+                row = self.store.conn.execute(
+                    "SELECT record_json FROM visual_observations WHERE id=?", (key,),
+                ).fetchone()
+                cached = json.loads(row[0]) if row else {"status": "unavailable"}
+            return VisualBinding(self, key, prepared, record, cached)
+        except asyncio.CancelledError:
+            self.live_slots.release()
+            raise
+        except Exception as exc:
+            self.live_slots.release()
+            features.metadata["visual_required_unavailable"] = required
+            features.metadata["visual_context"] = {"limitations": [type(exc).__name__]}
+            logger.warning("Visual collection unavailable (%s)", type(exc).__name__)
+            return None
+
+    def record_final(self, decision, result):
+        key = decision.metadata.get("visual_observation_id")
+        if not key:
+            return
+        try:
+            row = self.store.conn.execute(
+                "SELECT record_json FROM visual_observations WHERE id=?", (key,),
+            ).fetchone()
+            if row:
+                record = json.loads(row[0])
+                record["final"] = {"action": decision.action.value, "reason": decision.reason,
+                                   "action_log_id": result.action_log_id,
+                                   "vote_session_id": result.vote_session_id,
+                                   "deleted": result.deleted, "banned": result.banned}
+                self.store.finish(key, record)
+        except Exception as exc:
+            logger.warning("Visual final record unavailable (%s)", type(exc).__name__)
 
     def submit(self, message, features, decision) -> bool:
         if (self.closed or self.settings.vision_mode != "shadow"
@@ -226,12 +306,112 @@ class VisionShadow:
         self.store.close()
 
 
+class VisualBinding:
+    def __init__(self, service, key, prepared, record, cached=None):
+        self.service, self.key, self.prepared = service, key, prepared
+        self.record, self.cached = record, cached
+        self.released = False
+        self.success = False
+
+    def release(self):
+        if not self.released:
+            self.service.live_slots.release()
+            self.released = True
+
+    async def judge(self, features):
+        return await self.judge_payload(_feature_payload(features))
+
+    async def judge_payload(self, payload):
+        try:
+            if self.cached is not None:
+                result = self.cached
+            elif not self.service.store.reserve(
+                self.service.settings.vision_max_calls_per_day,
+                unlimited=self.service.settings.vision_max_calls_per_day == 0,
+            ):
+                result = {"status": "failed", "error_type": "daily_budget"}
+            else:
+                result = await asyncio.wait_for(
+                    self.service._judge(payload, self.prepared), self.service.timeout,
+                )
+            self.record = {**self.record, **result}
+            if result.get("status") != "ok":
+                return LLMOutcome(LLMOutcomeStatus.FAILED, error="visual_review_unavailable")
+            value = parse_visual_result(result["judgement"])
+            available = {image.source for image in self.prepared.images} | {"body_text"}
+            if payload.get("sender_profile"):
+                available |= {"profile_bio", "profile_name"}
+            if any(item["source"] not in available for item in value["evidence"]):
+                raise ValueError("visual_source_not_supplied")
+            body_evidence = any(item["source"] in {
+                "body_layout", "photo", "sticker", "animation", "video", "premium_animation",
+                "body_emoji", "body_text",
+            } and item["text"].strip() for item in value["evidence"])
+            visual_body = any(image.source in {
+                "body_layout", "photo", "sticker", "animation", "video", "premium_animation", "body_emoji",
+            } for image in self.prepared.images)
+            if not visual_body and str(payload.get("raw_text") or "").strip().isdigit():
+                body_evidence = False
+            if value["message_is_promotional"] and not body_evidence:
+                if not value["profile_has_advertising"]:
+                    raise ValueError("visual_message_evidence_missing")
+                value["message_is_promotional"] = False
+            self.record["judgement"] = value
+            self.success = True
+            profile_only = value["profile_has_advertising"] and not value["message_is_promotional"]
+            confidence = value["confidence"]
+            if profile_only:
+                confidence = min(confidence, max(0, self.service.settings.llm_ban_threshold - .01))
+            return LLMOutcome(
+                LLMOutcomeStatus.OK, provider_count=1,
+                judgement=LLMJudgement(
+                    value["message_is_promotional"] or value["profile_has_advertising"],
+                    confidence, "traffic_diversion" if profile_only else "ads"
+                    if value["message_is_promotional"] else "benign",
+                ),
+                metadata={"visual_review": {**value, "status": "ok"},
+                          "visual_observation_id": self.key,
+                          "input_parity": "reviewer_has_visual_context"},
+            )
+        except Exception as exc:
+            self.record.update(status="failed", error_type=type(exc).__name__)
+            return LLMOutcome(LLMOutcomeStatus.FAILED, error="visual_review_unavailable")
+        finally:
+            try:
+                self.service.store.finish(self.key, self.record)
+            except Exception as exc:
+                logger.warning("Visual review record unavailable (%s)", type(exc).__name__)
+            self.release()
+
+    def annotate(self, decision):
+        metadata = {**decision.metadata, "visual_observation_id": self.key,
+                    "visual_context": self.prepared.manifest(),
+                    "input_parity": "reviewer_has_visual_context"}
+        if self.success:
+            value = self.record["judgement"]
+            metadata["visual_review"] = {**value, "status": "ok"}
+            if decision.action in {DecisionAction.BAN, DecisionAction.WITHDRAW_VOTE} and (
+                value["message_is_promotional"] or value["profile_has_advertising"]
+            ):
+                reason = "visual_message_advertising" if value["message_is_promotional"] \
+                    else "visual_profile_advertising"
+                return replace(decision, reason=reason, metadata=metadata)
+        else:
+            metadata["visual_review"] = {"status": "failed"}
+            if decision.action == DecisionAction.ALLOW:
+                return replace(decision, action=DecisionAction.REVIEW,
+                               reason="visual_review_unavailable", metadata=metadata)
+        return replace(decision, metadata=metadata)
+
+
 def create_vision_shadow(settings) -> VisionShadow | None:
     if settings.vision_mode == "off":
         return None
-    if settings.vision_mode != "shadow" or not settings.vision_chat_ids:
-        logger.warning("Visual shadow requires mode=shadow and explicit VISION_CHAT_IDS")
+    if settings.vision_mode not in {"shadow", "enforce"} or not settings.vision_chat_ids:
+        logger.warning("Visual review requires mode=shadow/enforce and explicit VISION_CHAT_IDS")
         return None
+    if settings.vision_observation_path.resolve() == settings.database_path.resolve():
+        raise ValueError("Visual observations must use a separate database")
     if any(importlib.util.find_spec(name) is None
            for name in ("PIL", "imageio_ffmpeg", "rlottie_python")):
         logger.warning("Visual shadow unavailable: install the optional vision dependencies")
@@ -239,6 +419,9 @@ def create_vision_shadow(settings) -> VisionShadow | None:
     try:
         service = VisionShadow(settings)
         service.start()
+        logger.info("Visual %s enabled: chats=%s frames=%s concurrency=%s daily_cap=%s",
+                    settings.vision_mode, settings.vision_chat_ids, settings.vision_max_frames,
+                    settings.vision_max_concurrent, settings.vision_max_calls_per_day)
         return service
     except Exception as exc:
         logger.warning("Visual shadow startup unavailable (%s)", type(exc).__name__)

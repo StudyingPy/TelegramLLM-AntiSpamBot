@@ -563,13 +563,21 @@ def create_router(
 
         confirmed_normal = False
         observation_id = None
+        visual_binding = None
+        active_judge = llm_judge
+        if decision.should_call_llm and vision_shadow is not None and getattr(
+            vision_shadow, "settings", settings
+        ).vision_mode == "enforce":
+            visual_binding = await vision_shadow.bind(message, features, decision)
+            if visual_binding is not None:
+                active_judge = visual_binding
 
         if decision.should_call_llm:
             try:
                 if jev_observer is not None:
-                    outcome, observation_id = await jev_observer.compare(features, decision, llm_judge)
+                    outcome, observation_id = await jev_observer.compare(features, decision, active_judge)
                 else:
-                    outcome = await llm_judge.judge(features)
+                    outcome = await active_judge.judge(features)
             except Exception as exc:  # defense-in-depth: judge() should not raise.
                 logger.warning("LLM judgement raised unexpectedly, treating as failure: %s", exc)
                 outcome = LLMOutcome(
@@ -577,10 +585,13 @@ def create_router(
                     provider_count=0,
                     error=f"{type(exc).__name__}: {exc}",
                 )
+            if visual_binding is not None:
+                visual_binding.release()
             if outcome.status == LLMOutcomeStatus.OK and outcome.judgement is not None:
                 confirmed_normal = outcome.judgement.is_spam is False
-                record_llm_spam_feedback(db, features, outcome.judgement, settings)
-                if fingerprint is not None:
+                if visual_binding is None:
+                    record_llm_spam_feedback(db, features, outcome.judgement, settings)
+                if fingerprint is not None and visual_binding is None:
                     db.add_fingerprint_evidence(
                         fingerprint.value, features,
                         "llm_benign" if confirmed_normal else "llm_spam",
@@ -599,6 +610,13 @@ def create_router(
                     should_call_llm=False,
                 )
             decision = _annotate_with_llm_outcome(decision, outcome)
+            if visual_binding is not None:
+                decision = visual_binding.annotate(decision)
+                confirmed_normal = confirmed_normal and visual_binding.success
+            if features.metadata.get("visual_required_unavailable") and decision.action == DecisionAction.ALLOW:
+                decision = replace(decision, action=DecisionAction.REVIEW,
+                                   reason="visual_material_unavailable")
+                confirmed_normal = False
         elif jev_observer is not None:
             # Optional measurement of rules that bypass the original model;
             # never manufacture an original-model judgement for these messages.
@@ -618,6 +636,8 @@ def create_router(
         if "giveaway_reply" in features.metadata:
             metadata["giveaway_reply"] = features.metadata["giveaway_reply"]
         metadata["update_type"] = update_type
+        if features.metadata.get("visual_context"):
+            metadata.setdefault("visual_context", features.metadata["visual_context"])
         if observation_id is not None:
             metadata["jev_observation_id"] = observation_id
         if fingerprint is not None:
@@ -658,6 +678,8 @@ def create_router(
             decision = replace(decision, metadata=metadata)
 
         result = await actions.apply(message, features, decision)
+        if vision_shadow is not None and hasattr(vision_shadow, "record_final"):
+            vision_shadow.record_final(decision, result)
         if jev_observer is not None:
             try:
                 jev_observer.record_final(observation_id, decision, result)
@@ -1351,8 +1373,9 @@ def _annotate_with_llm_outcome(decision: LocalDecision, outcome: LLMOutcome) -> 
         "provider_count": outcome.provider_count,
         "error": outcome.error,
     }
-    if "model_chain" in outcome.metadata:
-        metadata["model_chain"] = outcome.metadata["model_chain"]
+    for key in ("model_chain", "visual_review", "visual_observation_id", "input_parity"):
+        if key in outcome.metadata:
+            metadata[key] = outcome.metadata[key]
     if outcome.judgement is not None:
         metadata["llm_outcome"].update(
             {

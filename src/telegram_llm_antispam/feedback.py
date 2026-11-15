@@ -185,6 +185,9 @@ def _phrase_appears_in_public_source(phrase: str, features: MessageFeatures) -> 
 
 
 def record_vote_spam_feedback(db: Database, session: VoteSession, settings: Settings) -> None:
+    if session.reason.startswith("visual_"):
+        # A visual/profile verdict is not a label for the caption's text hash.
+        return
     # Vote-confirmed spam upgrades content/skeleton fingerprints to a high weight (85
     # by default), so a single bad ingest here taints future enforcement. We have
     # only the hash, not the original strings, on a VoteSession — fall back to the

@@ -175,6 +175,8 @@ class JevObserver:
                 if self.requires_review
                 else self.settings.jev_sample_rate,
                 "payload_hash": digest(payload),
+                "input_parity": "reviewer_has_visual_context" if payload.get("visual_context")
+                else "same_text_input",
                 "request_hash": digest(
                     {
                         "state": payload,
@@ -186,7 +188,7 @@ class JevObserver:
                 "questions": QUESTIONS,
                 "questions_hash": QUESTIONS_HASH,
                 "policy_version": POLICY_VERSION,
-                "system_prompt_hash": SYSTEM_PROMPT_HASH,
+                "system_prompt_hash": features.metadata.get("reviewer_system_prompt_hash", SYSTEM_PROMPT_HASH),
                 "requested_model": self.settings.jev_model,
                 "source_text_length": len(features.text),
                 "text_truncated_for_models": len(features.text) > 4000,

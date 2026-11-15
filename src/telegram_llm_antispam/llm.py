@@ -442,6 +442,7 @@ def _feature_payload(features: MessageFeatures) -> dict[str, object]:
         "recent_messages": _recent_messages_payload(features.metadata.get("recent_messages")),
         "recruitment_repeat": features.metadata.get("recruitment_repeat"),
         "giveaway_reply": features.metadata.get("giveaway_reply"),
+        "visual_context": features.metadata.get("visual_context"),
     }
 
 

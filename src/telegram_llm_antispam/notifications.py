@@ -319,6 +319,11 @@ def _notification_text(
         )
     if decision.metadata.get("giveaway_reply"):
         trust_text += "\n活动口令：匹配已验证来源的抽奖通知"
+    visual = decision.metadata.get("visual_review")
+    if isinstance(visual, dict):
+        trust_text += f"\n视觉审核：{_esc(str(visual.get('status', 'unknown')))}"
+        for item in (visual.get("evidence") or [])[:2]:
+            trust_text += f"\n视觉来源 {_esc(str(item.get('source', '')))}：{_esc(str(item.get('text', ''))[:120])}"
 
     links = ", ".join(link.url for link in features.links) or "-"
     snapshot = features.text[:800] or "(empty)"
