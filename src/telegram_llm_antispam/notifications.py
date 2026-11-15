@@ -328,6 +328,13 @@ def _notification_text(
         )
     if isinstance(visual, dict):
         trust_text += f"\n视觉审核：{_esc(str(visual.get('status', 'unknown')))}"
+        if visual.get("status") == "failed":
+            error = str(visual.get("error_type") or "unknown")
+            trust_text += f"\n视觉失败原因：{_esc(error)}"
+            if visual.get("http_status") is not None:
+                trust_text += f" / HTTP {_esc(str(visual['http_status']))}"
+            if visual.get("attempt_count") is not None:
+                trust_text += f" / 已尝试 {_esc(str(visual['attempt_count']))} 次"
         for item in (visual.get("evidence") or [])[:2]:
             trust_text += f"\n视觉来源 {_esc(str(item.get('source', '')))}：{_esc(str(item.get('text', ''))[:120])}"
 
@@ -398,6 +405,9 @@ def _format_llm_section(decision: LocalDecision) -> str:
     else:
         text = f"\nJev初审：调用失败 / {_esc(str(primary.get('error') or 'unknown'))}"
     if chain.get("decision_source") == "jev_only":
+        visual = decision.metadata.get("visual_review")
+        if isinstance(visual, dict) and visual.get("status") == "failed":
+            return text + "\nMiMo视觉复核：未完成，Jev仅为文字初审"
         return text + "\nMiMo复核：不可用，采用Jev单独判定"
     text += legacy.replace("\nLLM：", "\nMiMo复核：", 1)
     if chain.get("decision_source") == "pending_review":

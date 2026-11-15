@@ -237,6 +237,45 @@ class VisionShadow:
             return False
 
     async def _judge(self, payload: dict, prepared) -> dict:
+        # Reuse the original images and independent input. One retry shares the
+        # original deadline; it must not turn an API outage into an unbounded queue.
+        deadline = time.monotonic() + self.timeout * .95
+        attempts = []
+        result = {}
+        for attempt in range(2):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                result = await asyncio.wait_for(
+                    self._judge_once(payload, prepared, max_tokens=3600
+                                     if result.get("error_type") == "truncated_response" else 2400),
+                    min(remaining, self.timeout * .6) if attempt == 0 else remaining,
+                )
+            except TimeoutError:
+                result = {"status": "failed", "error_type": "timeout"}
+            except httpx.TransportError:
+                result = {"status": "failed", "error_type": "transport_error"}
+            attempts.append({key: result[key] for key in (
+                "status", "error_type", "http_status", "finish_reason", "content_chars", "usage",
+            ) if key in result})
+            retryable = result.get("error_type") in {
+                "timeout", "transport_error", "invalid_api_response", "truncated_response",
+                "empty_content", "json_parse_error", "schema_error",
+            } or result.get("http_status") in {408, 429, 500, 502, 503, 504}
+            if result.get("status") == "ok" or not retryable or attempt == 1:
+                break
+            if not self.store.reserve(
+                self.settings.vision_max_calls_per_day,
+                unlimited=self.settings.vision_mode == "enforce"
+                and self.settings.vision_max_calls_per_day == 0,
+            ):
+                result = {**result, "retry_skipped": "daily_budget"}
+                break
+            await asyncio.sleep(min(.25, max(0, deadline - time.monotonic()) * .05))
+        return {**result, "attempt_count": len(attempts), "attempts": attempts}
+
+    async def _judge_once(self, payload: dict, prepared, *, max_tokens: int = 2400) -> dict:
         providers = _newapi_providers_from_settings(self.settings)
         if not providers:
             return {"status": "unavailable", "error_type": "no_provider"}
@@ -262,11 +301,12 @@ class VisionShadow:
                          "User-Agent": "TelegramLLMAntiSpamBot/0.1"},
                 json={"model": provider.model, "messages": [
                     {"role": "system", "content": PROMPT}, {"role": "user", "content": blocks}],
-                    "temperature": 0, "max_tokens": 2400,
+                    "temperature": 0, "max_tokens": max_tokens,
                     "response_format": {"type": "json_object"}},
             )
         if response.status_code != 200:
-            return {"status": "failed", "http_status": response.status_code}
+            return {"status": "failed", "http_status": response.status_code,
+                    "error_type": "http_error"}
         response_info = {"http_status": response.status_code,
                          "response_bytes": len(response.content),
                          "elapsed_ms": round((time.monotonic() - started) * 1000)}
@@ -274,6 +314,8 @@ class VisionShadow:
             body = response.json()
             choice = body["choices"][0]
             message = choice["message"]
+            if not isinstance(choice, dict) or not isinstance(message, dict):
+                raise TypeError("invalid_api_message")
         except (ValueError, TypeError, KeyError, IndexError):
             return {**response_info, "status": "failed", "error_type": "invalid_api_response"}
         finish = choice.get("finish_reason")
@@ -441,7 +483,10 @@ class VisualBinding:
                     else "visual_profile_advertising"
                 return replace(decision, reason=reason, metadata=metadata)
         else:
-            metadata["visual_review"] = {"status": "failed"}
+            metadata["visual_review"] = {"status": "failed", **{
+                key: self.record[key] for key in ("error_type", "http_status", "attempt_count")
+                if key in self.record
+            }}
             if decision.action == DecisionAction.ALLOW:
                 return replace(decision, action=DecisionAction.REVIEW,
                                reason="visual_review_unavailable", metadata=metadata)
